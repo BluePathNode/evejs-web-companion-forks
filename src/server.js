@@ -1,0 +1,18950 @@
+"use strict";
+
+const express = require("express");
+const fs = require("fs");
+const http = require("http");
+const path = require("path");
+// R17 mail: mailMgr.GetBody answers a zlib-DEFLATED buffer, and inflating it is
+// this file's job — see mailBodyText. The browser never sees a compressed byte.
+const zlib = require("zlib");
+const { spawn } = require("child_process");
+const eveStore = require("./eveStore");
+const eveGatewayClient = require("./eveGatewayClient");
+const webAuth = require("./webAuth");
+const staticDataModule = require("./staticData");
+const config = require("./config");
+const botScriptStoreModule = require("./botScriptStore");
+const botHostModule = require("./botHost");
+const { createAccountCache } = require("./accountCache");
+const {
+  isBridgeWritePair,
+  pickSafeBrowserSessionFields,
+} = require("./bridgeCallPolicy");
+const {
+  beginHeldTransition,
+  cancelHeldTransition,
+  markTransitionAccepted,
+  markTransitionFailed,
+  publicTransition,
+  resolveFailedTransition,
+  waitForTransitionReady,
+} = require("./transitionBarrier");
+
+// Map a bot-script store error (it carries a .code) to an HTTP status + envelope.
+const BOTSCRIPT_STATUS = {
+  BOTSCRIPT_INVALID: 400,
+  BOTSCRIPT_TOO_BIG: 413,
+  BOTSCRIPT_LIMIT_REACHED: 409,
+  SCRIPT_REV_CONFLICT: 409,
+  BOTSCRIPT_NOT_FOUND: 404,
+};
+function sendBotScriptError(res, error, next) {
+  const status = error && BOTSCRIPT_STATUS[error.code];
+  if (status) {
+    res.status(status).json({ ok: false, error: error.code, message: error.message });
+    return;
+  }
+  next(error);
+}
+
+function createApp(options = {}) {
+const app = express();
+const store = options.eveStore || eveStore;
+const gateway = options.eveGatewayClient || eveGatewayClient;
+const auth = options.webAuth || webAuth;
+const staticData = options.staticData || staticDataModule;
+// The player Bot Builder library — web-app data in data/bot-scripts.json, keyed
+// per account. Never eve.js's store; this is our own JSON file.
+const botScripts =
+  options.botScriptStore || botScriptStoreModule.createBotScriptStore({ dataDir: config.dataDir });
+// Persistent-session handles (goal R2): webSessionID -> the opaque
+// bridgeSessionID the gateway minted, held server-side only. The browser
+// never sees the handle; it just gets its character/station state back.
+const bridgeSessions = options.bridgeSessionStore || new Map();
+// Fork: remember last fleet location broadcast (SendBroadcast) per fleetID so
+// miner bots can warp-to-broadcast without a GetBroadcast EveJS read.
+const lastFleetBroadcastByFleetID = options.lastFleetBroadcastByFleetID || new Map();
+
+// Short-lived cache for the auth path's account lookup (src/accountCache.js).
+// Without it, every authenticated request costs a second owner call re-reading
+// an unchanged account — half of all measured gateway traffic.
+const accountCache = options.accountCache || createAccountCache();
+const errorLogger = options.errorLogger || ((error) => console.error(error));
+// Server-side bot host (see src/botHost.js): runs the browser bot stack in
+// THIS process, driving the routes below over loopback as just another
+// session, so a bot outlives the tab (or phone) that started it.
+const botHost =
+  options.botHost ||
+  botHostModule.createBotHost({
+    webAuth: auth,
+    baseUrl: options.botHostBaseUrl || `http://127.0.0.1:${config.port}`,
+    // Durable roster: running bots are mirrored here and startServer calls
+    // botHost.resume() once listening, so a BFF restart brings them back.
+    persistPath: path.join(config.dataDir, "server-bots.json"),
+    loadAccount: (username) => store.getAccount(username),
+    loadScript: (accountID, scriptID) => botScripts.get(accountID, scriptID),
+    // ONE HULL, ONE DRIVER, direction 1: a bot may not take a character any
+    // live web session is flying. (Direction 2 — a tab may not take a bot's
+    // character — is the guard in /api/bridge/select.)
+    isCharacterHeld: (characterID) => {
+      for (const held of bridgeSessions.values()) {
+        if (Number(held.characterID) === Number(characterID)) {
+          return true;
+        }
+      }
+      return false;
+    },
+    errorLogger,
+  });
+app.locals.botHost = botHost;
+app.locals.bridgeSessions = bridgeSessions;
+fs.mkdirSync(config.iconCacheDir, { recursive: true });
+
+app.disable("x-powered-by");
+app.use(express.json({ limit: "64kb" }));
+app.use((req, res, next) => {
+  if (req.path.startsWith("/api/")) {
+    res.setHeader("Cache-Control", "no-store");
+  }
+  next();
+});
+
+function parseCookies(header) {
+  const cookies = {};
+  for (const part of String(header || "").split(";")) {
+    const index = part.indexOf("=");
+    if (index < 0) {
+      continue;
+    }
+    const key = part.slice(0, index).trim();
+    const value = part.slice(index + 1).trim();
+    if (key) {
+      cookies[key] = decodeURIComponent(value);
+    }
+  }
+  return cookies;
+}
+
+// --- R42: the login token rides TWO carriers, so tabs stop colliding --------
+//
+// The signed login token used to have exactly one carrier: the httpOnly cookie
+// below, scoped to path "/". A cookie belongs to the BROWSER PROFILE, not to
+// the tab, so a second tab logging in as another account OVERWROTE the first
+// tab's session and every open tab collapsed onto whichever account signed in
+// last. The operator wants ten tabs running ten accounts, so the token now
+// also rides `Authorization: Bearer <token>`, fed from the tab's own
+// `sessionStorage` — which is per-tab by specification. Same token, same
+// `webAuth.verifySessionToken`, same `req.webSessionID`: this changes the
+// CARRIER, not the authentication. The cookie stays for the migration window
+// so nothing that already works breaks.
+//
+// SECURITY TRADE — DELIBERATE, AND LOCAL TO THIS POC. A token the page's own
+// JavaScript can read is a token an XSS bug can steal; `httpOnly` existed to
+// prevent precisely that, and we are giving it up. That is acceptable HERE and
+// only here: this BFF is a companion to a LOCAL DEV EMULATOR whose login
+// accepts ANY password for ANY existing username (see /api/login below, goal
+// R1) — there is no secret left for httpOnly to protect. DO NOT COPY THIS
+// PATTERN into anything reachable from a network. If this app ever grows real
+// credentials, per-tab identity has to be solved some other way (a per-tab
+// path-scoped cookie, or a session id in the URL path) and the token must go
+// back to being httpOnly.
+function setSessionCookie(res, token) {
+  res.cookie(config.sessionCookieName, token, {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: false,
+    maxAge: config.sessionTtlMs,
+    path: "/",
+  });
+}
+
+function clearSessionCookie(res) {
+  res.clearCookie(config.sessionCookieName, {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: false,
+    path: "/",
+  });
+}
+
+function publicAccount(account) {
+  return {
+    username: account.username,
+    accountID: account.accountID,
+    role: account.role,
+    banned: account.banned,
+  };
+}
+
+// The query-string name the SSE stream carries its token under. See
+// requireStreamAuth below for why the stream needs one and every other route
+// refuses it.
+const SESSION_QUERY_PARAM = "access_token";
+
+function readBearerToken(authorizationHeader) {
+  const match = /^Bearer +(\S.*)$/i.exec(String(authorizationHeader || "").trim());
+  return match ? match[1].trim() : "";
+}
+
+// The one place that decides which carrier a request's session token came from.
+// Header first: when a tab has its own token in sessionStorage that is the
+// deliberate identity, and the shared cookie left over from another tab's login
+// must not be able to override it.
+function readSessionToken(req, { allowQueryParam = false } = {}) {
+  const fromHeader = readBearerToken(req.headers.authorization);
+  if (fromHeader) {
+    return fromHeader;
+  }
+  if (allowQueryParam) {
+    const fromQuery = req.query ? req.query[SESSION_QUERY_PARAM] : undefined;
+    if (typeof fromQuery === "string" && fromQuery) {
+      return fromQuery;
+    }
+  }
+  const cookies = parseCookies(req.headers.cookie);
+  return cookies[config.sessionCookieName] || "";
+}
+
+// One implementation, two doors — `requireAuth` for everything, and the
+// query-tolerant variant the SSE route needs. The auth itself is identical;
+// only the accepted carrier set differs.
+function makeRequireAuth({ allowQueryParam = false } = {}) {
+  return async function requireAuthenticatedSession(req, res, next) {
+    const payload = auth.verifySessionToken(readSessionToken(req, { allowQueryParam }));
+    if (!payload) {
+      res.status(401).json({ ok: false, error: "AUTH_REQUIRED" });
+      return;
+    }
+
+    try {
+      // Cached for a few seconds (src/accountCache.js). This lookup used to be
+      // a gateway round trip on EVERY authenticated request — 51% of all owner
+      // calls on a measured two-client run — re-reading a value that had not
+      // changed. Every check below still runs on the resolved account.
+      const account = await accountCache.resolve(
+        payload.username,
+        () => store.getAccount(payload.username),
+      );
+      if (!account || account.accountID !== Number(payload.accountID)) {
+        clearSessionCookie(res);
+        res.status(401).json({ ok: false, error: "ACCOUNT_NOT_FOUND" });
+        return;
+      }
+      if (account.banned) {
+        clearSessionCookie(res);
+        res.status(403).json({ ok: false, error: "ACCOUNT_BANNED" });
+        return;
+      }
+      req.account = account;
+      req.webSessionID = payload.sessionID;
+      next();
+    } catch (error) {
+      next(error);
+    }
+  };
+}
+
+// Every route. Header or cookie only — a token in the query string is REFUSED
+// here, deliberately; see requireStreamAuth.
+const requireAuth = makeRequireAuth();
+
+// The SSE push channel alone. `EventSource` cannot set request headers — the
+// API has no hook for it — so GET /api/bridge/events accepts the token as the
+// `access_token` query parameter. That puts a credential in a URL, which is a
+// real cost: URLs reach browser history, `Referer` headers, and any access log
+// in front of the app. Two things contain it. First, this BFF writes no access
+// log: nothing here logs `req.url`, and the error handler logs the Error alone,
+// so the token is not recorded on this side — keep it that way if request
+// logging is ever added, and redact this parameter if it is. Second, the query
+// carrier is accepted by this route and no other, so a token that leaks through
+// a URL can be used to WATCH a session's stream but never to drive it: every
+// mutating route goes through `requireAuth`, which ignores the query string.
+//
+// A per-tab session whose push channel still rode the shared cookie would be
+// half a feature — tab two would receive tab one's live events — so this is not
+// optional decoration.
+const requireStreamAuth = makeRequireAuth({ allowQueryParam: true });
+
+app.get("/api/health", async (req, res) => {
+  try {
+    const storeStatus = await store.getStatus();
+    res.json({
+      ok: true,
+      eveRoot: config.eveRoot,
+      webUsersConfigured: auth.countConfiguredUsers(),
+      gateway: storeStatus,
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error: error.message,
+      gatewayUrl: process.env.EVEJS_GATEWAY_URL || "http://127.0.0.1:26002/_evejs-web/v1",
+    });
+  }
+});
+
+// Who-cares web login (roadmap section 6, goals R1 + R2): an EveJS account
+// username signs in with ANY password, including an empty one — the password
+// is not checked at all — and an UNKNOWN username is auto-created through the
+// gateway. Both halves deliberately mirror the emulator's retail-path
+// dev flags (devSkipPasswordValidation + devAutoCreateAccounts): the web login
+// behaves exactly like a retail client's first login against this dev server.
+// The gateway owns the auto-create policy — when devAutoCreateAccounts is off
+// it refuses with ACCOUNT_CREATE_DISABLED and unknown usernames keep their
+// clear 401. The scrypt web-password store is BYPASSED, NOT DELETED:
+// src/webAuth.js verifyWebPassword/upsertWebPassword, data/web-users.json, and
+// `npm run webpass` stay in place (data-preservation rule) but are deprecated
+// for login.
+app.post("/api/login", async (req, res, next) => {
+  const username = String(req.body && req.body.username || "").trim();
+  try {
+    // An empty username can never name or create an account; refuse it here
+    // instead of round-tripping the gateway.
+    if (!username) {
+      res.status(401).json({
+        ok: false,
+        error: "UNKNOWN_EVEJS_ACCOUNT",
+        message: "Unknown EveJS account.",
+      });
+      return;
+    }
+    let account = null;
+    let accountCreated = false;
+    try {
+      account = await store.getAccount(username);
+    } catch (error) {
+      if (!(error && error.code === "ACCOUNT_NOT_FOUND")) {
+        throw error;
+      }
+    }
+    if (!account) {
+      try {
+        const outcome = await store.createAccount(username);
+        account = outcome && outcome.account || null;
+        accountCreated = Boolean(outcome && outcome.created);
+      } catch (error) {
+        if (error && error.code === "ACCOUNT_CREATE_DISABLED") {
+          // Auto-create is off server-side: unknown usernames get the same
+          // 401 they always got (the `if (!account)` below).
+        } else if (error && error.code === "ACCOUNT_INVALID") {
+          // The username failed the gateway's charset/length rules — that is
+          // "fix your input", not "unknown account".
+          res.status(400).json({
+            ok: false,
+            error: "ACCOUNT_INVALID",
+            message: error.message || "Account username is invalid.",
+          });
+          return;
+        } else {
+          throw error;
+        }
+      }
+    }
+    if (!account) {
+      res.status(401).json({
+        ok: false,
+        error: "UNKNOWN_EVEJS_ACCOUNT",
+        message: "Unknown EveJS account.",
+      });
+      return;
+    }
+    if (account.banned) {
+      res.status(403).json({ ok: false, error: "ACCOUNT_BANNED" });
+      return;
+    }
+
+    // R42: one token, both carriers. The cookie keeps the pre-R42 client
+    // working; `sessionToken` in the body is what the tab puts in its own
+    // sessionStorage so ten tabs can hold ten different accounts. Read the
+    // security note above setSessionCookie before copying this anywhere.
+    const token = auth.createSessionToken(account);
+    setSessionCookie(res, token);
+    res.json({
+      ok: true,
+      sessionToken: token,
+      account: publicAccount(account),
+      // R2: true exactly when THIS login minted the account, so the UI can say
+      // so (a fresh account also arrives with zero characters, which sends the
+      // client straight into the create-character flow).
+      accountCreated,
+      characters: await store.listCharactersForAccount(account.accountID),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Logging out has to release the session the CALLING TAB holds, so it reads the
+// same carriers as requireAuth: a tab signing out with its own Bearer token
+// must not release whatever session the shared cookie happens to name.
+app.post("/api/logout", async (req, res) => {
+  const payload = auth.verifySessionToken(readSessionToken(req));
+  if (payload && payload.sessionID) {
+    // Logging out closes the client: best-effort release of the persistent
+    // bridge session so the character goes offline (the gateway TTL is the
+    // backstop if this fails).
+    try {
+      await releaseHeldBridgeSession(payload.sessionID);
+    } catch {
+      forgetBridgeSession(payload.sessionID);
+    }
+  }
+  if (payload && payload.username) {
+    // Drop the cached account rather than let a signed-out user's record sit
+    // in the auth cache for the rest of its TTL.
+    accountCache.invalidate(payload.username);
+  }
+  clearSessionCookie(res);
+  res.json({ ok: true });
+});
+
+// A session-changing command is issued once, then its HTTP handler waits for
+// authoritative location/scene/ship readiness. While that observation is
+// pending, no second bridge POST action may slip through another route. GET
+// reads, the policy-read-only generic call, release, and character reselection
+// remain available so the UI can observe or recover the session. Once phase is
+// `ready`, ordinary commands are legal even
+// while retail's separate next-session-mutation cooldown is still running.
+const TRANSITION_GATE_EXEMPT_POST_PATHS = new Set([
+  "/api/bridge/call", // generic seam is read-only by policy
+  "/api/bridge/select",
+  "/api/bridge/release",
+]);
+app.use((req, res, next) => {
+  if (
+    req.method !== "POST" ||
+    !req.path.startsWith("/api/bridge/") ||
+    TRANSITION_GATE_EXEMPT_POST_PATHS.has(req.path)
+  ) {
+    next();
+    return;
+  }
+  const payload = auth.verifySessionToken(readSessionToken(req));
+  const held = payload && payload.sessionID
+    ? bridgeSessions.get(payload.sessionID) || null
+    : null;
+  if (!held || !held.transition || held.transition.phase === "ready") {
+    next();
+    return;
+  }
+  res.status(409).json({
+    ok: false,
+    error: "SESSION_CHANGE_IN_PROGRESS",
+    message: `The ${held.transition.kind} transition is not ready for another command.`,
+    transition: publicTransition(held),
+  });
+});
+
+// Thin bridge proxy for the whitelisted EveJS callMethod path (goal R1).
+// Forwards the retail call tuple (service, method, args, kwargs) to the
+// gateway's POST /_evejs-web/v1/call; the gateway enforces the deny-by-default
+// (service, method) allowlist and materializes the browser-backed session. This
+// generic seam is READ-ONLY: every known mutator must use its purpose-built,
+// confirmation-gated BFF route. The BFF also projects browser session fields
+// onto an explicit presentation-only allowlist; `userid` always comes from the
+// signed login session. Wire contract: docs/bridge-wire-contract.md.
+app.post("/api/bridge/call", requireAuth, async (req, res, next) => {
+  const body = req.body || {};
+  if (isBridgeWritePair(body.service, body.method)) {
+    res.status(403).json({
+      ok: false,
+      error: "BRIDGE_WRITE_REQUIRES_DEDICATED_ROUTE",
+      message: `${body.service}.${body.method} is a write and must use its dedicated confirmation route.`,
+    });
+    return;
+  }
+  const clientSessionFields = pickSafeBrowserSessionFields(body.session);
+  // When this web session holds a persistent bridge session (goal R2), every
+  // bridge call runs on that live session — one web login is one client
+  // session, like retail. A browser-supplied bridgeSessionID is ignored; only
+  // the server-held handle is ever forwarded.
+  const heldBridgeSession = bridgeSessions.get(req.webSessionID) || null;
+  try {
+    const outcome = await gateway.callMethod(
+      body.service,
+      body.method,
+      body.args,
+      body.kwargs,
+      { ...clientSessionFields, userid: Number(req.account.accountID) },
+      heldBridgeSession ? heldBridgeSession.bridgeSessionID : undefined,
+    );
+    res.json({
+      ok: true,
+      service: outcome.service,
+      method: outcome.method,
+      result: outcome.result,
+      notifications: outcome.notifications,
+    });
+  } catch (error) {
+    // The gateway reaped or lost the persistent session (TTL expiry, retail
+    // takeover, restart): drop the stale handle so the next call is stateless
+    // and surface the typed error so the page can return to character select.
+    if (heldBridgeSession && error && error.code === "SESSION_NOT_FOUND") {
+      forgetBridgeSession(req.webSessionID);
+    }
+    next(error);
+  }
+});
+
+// Drop a held bridge session from the BFF's map. Every site that forgets a
+// handle goes through here so the R10 push stream is torn down with it: a
+// gateway WebSocket for a session the BFF no longer holds can never be useful,
+// and attached browsers are told the channel ended rather than being left on a
+// silent stream.
+function forgetBridgeSession(webSessionID) {
+  const held = bridgeSessions.get(webSessionID);
+  if (!held) {
+    return false;
+  }
+  bridgeSessions.delete(webSessionID);
+  publishStreamStatus(held, "ended", "session_released");
+  closeHeldStream(held);
+  for (const subscriber of [...held.streamSubscribers]) {
+    held.streamSubscribers.delete(subscriber);
+    try {
+      subscriber.end();
+    } catch {
+      // The response is already gone.
+    }
+  }
+  return true;
+}
+
+// Best-effort release of the bridge session a web session holds. Returns true
+// when a held session existed. SESSION_NOT_FOUND from the gateway means the
+// TTL (or a takeover) already disconnected it — the handle is just dropped.
+// A TRANSPORT failure is best-effort too: the handle is already forgotten by
+// the time the gateway is asked, so rethrowing a timeout only shows the user a
+// failed logout for a release that probably landed — and when it truly did
+// not, the gateway's own session TTL retires the live session. Log it; never
+// fail the logout over it.
+const RELEASE_BEST_EFFORT_CODES = new Set([
+  "SESSION_NOT_FOUND",
+  "EVE_GATEWAY_TIMEOUT",
+  "EVE_GATEWAY_UNREACHABLE",
+]);
+async function releaseHeldBridgeSession(webSessionID) {
+  const held = bridgeSessions.get(webSessionID);
+  if (!held) {
+    return false;
+  }
+  forgetBridgeSession(webSessionID);
+  try {
+    await gateway.releaseBridgeSession(held.bridgeSessionID, {
+      userid: Number(held.accountID),
+    });
+  } catch (error) {
+    if (!(error && RELEASE_BEST_EFFORT_CODES.has(error.code))) {
+      throw error;
+    }
+    if (error.code !== "SESSION_NOT_FOUND") {
+      errorLogger(error);
+    }
+  }
+  return true;
+}
+
+// --- R10 live event channel (gateway push -> SSE) --------------------------
+// The BFF holds at most ONE gateway WebSocket per held bridge session and
+// republishes it to the browser as Server-Sent Events on GET /api/bridge/events
+// (same-origin, routed to this web session's held bridge session). The
+// bridgeSessionID stays server-side, exactly as on every request route. Since
+// R42 the stream authenticates from the `access_token` query parameter as well
+// as the cookie, because EventSource cannot send a header — see
+// requireStreamAuth for the trade that buys and what bounds it.
+//
+// The stream is opened lazily when a browser attaches and closed when the last
+// one detaches, so a held session with nobody watching costs nothing. The last
+// cursor seen is remembered on the held-session entry, so a gateway reconnect
+// resumes with it and the gateway replays the frames missed in between.
+//
+// Liveness only: every request route still drains notifications onto its
+// response, so a stream that never opens or drops mid-flight degrades to the
+// old poll-based behaviour rather than losing data.
+
+const STREAM_RETRY_MS = 3000;
+const SSE_HEARTBEAT_MS = 25_000;
+
+function writeSseFrame(res, payload) {
+  try {
+    res.write(`data: ${JSON.stringify(payload)}\n\n`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Fan a gateway frame out to every SSE subscriber on this held session, and
+// remember its cursor so a reconnect resumes from it.
+function publishStreamFrame(held, frame) {
+  if (frame && frame.cursor && typeof frame.cursor.epoch === "string") {
+    held.streamCursor = {
+      epoch: frame.cursor.epoch,
+      sequence: Number(frame.cursor.sequence) || 0,
+    };
+  }
+  for (const subscriber of [...held.streamSubscribers]) {
+    if (!writeSseFrame(subscriber, frame)) {
+      held.streamSubscribers.delete(subscriber);
+    }
+  }
+}
+
+function publishStreamStatus(held, state, detail) {
+  publishStreamFrame(held, {
+    source: "evejs-web-bff",
+    type: "stream-status",
+    state,
+    detail: detail === undefined ? null : detail,
+  });
+}
+
+// The push channel's only server-side evidence. Lifecycle strings and a short
+// session-id prefix only — never the full bridgeSessionID and never a token —
+// so a drop, refusal, or reconnect loop is visible in the BFF log instead of
+// leaving nothing to diagnose from.
+function logStreamEvent(held, message) {
+  const sessionTag = String(held.bridgeSessionID || "").slice(0, 8) || "unknown";
+  console.log(
+    `[${new Date().toISOString()}] [bridge-events ${sessionTag}] ${message}`,
+  );
+}
+
+function openHeldStream(webSessionID, held) {
+  if (held.stream || held.streamSubscribers.size === 0) {
+    return;
+  }
+  if (held.streamRetryTimer) {
+    clearTimeout(held.streamRetryTimer);
+    held.streamRetryTimer = null;
+  }
+  held.stream = gateway.openSessionEventStream({
+    bridgeSessionID: held.bridgeSessionID,
+    userid: Number(held.accountID),
+    cursor: held.streamCursor || null,
+    onOpen() {
+      logStreamEvent(held, "gateway stream live");
+      publishStreamStatus(held, "live");
+    },
+    onFrame(frame) {
+      publishStreamFrame(held, frame);
+    },
+    onClose(details) {
+      held.stream = null;
+      const code = Number(details && details.code) || 0;
+      const reason = (details && details.reason) || "";
+      if (held.streamSubscribers.size === 0) {
+        logStreamEvent(
+          held,
+          `gateway stream closed (code=${code} reason=${reason || "none"}); no subscribers, not retrying`,
+        );
+        return;
+      }
+      // Tell the browser the channel is degraded so it leans on its poll, then
+      // retry. A 404 means the gateway no longer knows this bridge session —
+      // retrying cannot fix that, so stop and let the next request route
+      // surface SESSION_NOT_FOUND.
+      const refusal = Number(details && details.refusalStatus) || 0;
+      if (refusal === 404) {
+        logStreamEvent(held, "gateway refused the stream (404); session ended");
+        publishStreamStatus(held, "ended", "session_not_found");
+        return;
+      }
+      logStreamEvent(
+        held,
+        `gateway stream dropped (code=${code} reason=${reason || "none"}` +
+          `${refusal ? ` refusal=${refusal}` : ""}); retrying in ${STREAM_RETRY_MS}ms`,
+      );
+      publishStreamStatus(held, "degraded", reason || null);
+      held.streamRetryTimer = setTimeout(() => {
+        held.streamRetryTimer = null;
+        if (bridgeSessions.get(webSessionID) === held) {
+          openHeldStream(webSessionID, held);
+        }
+      }, STREAM_RETRY_MS);
+      if (typeof held.streamRetryTimer.unref === "function") {
+        held.streamRetryTimer.unref();
+      }
+    },
+  });
+}
+
+function closeHeldStream(held) {
+  if (held.streamRetryTimer) {
+    clearTimeout(held.streamRetryTimer);
+    held.streamRetryTimer = null;
+  }
+  if (held.stream) {
+    held.stream.close();
+    held.stream = null;
+  }
+}
+
+app.get("/api/bridge/events", requireStreamAuth, (req, res) => {
+  const held = bridgeSessions.get(req.webSessionID) || null;
+  if (!held) {
+    res.status(409).json({
+      ok: false,
+      error: "NO_LIVE_SESSION",
+      message: "No character is online; select a character first.",
+    });
+    return;
+  }
+  res.writeHead(200, {
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-store",
+    connection: "keep-alive",
+    // Defeat proxy buffering, which would otherwise hold frames back and
+    // reintroduce exactly the latency this channel removes.
+    "x-accel-buffering": "no",
+  });
+  res.write(": open\n\n");
+  held.streamSubscribers.add(res);
+  publishStreamStatus(held, held.stream ? "live" : "connecting");
+  openHeldStream(req.webSessionID, held);
+
+  // SSE comment heartbeat: keeps intermediaries from reaping an idle stream.
+  const heartbeat = setInterval(() => {
+    try {
+      res.write(": ping\n\n");
+    } catch {
+      // The close handler below owns teardown.
+    }
+  }, SSE_HEARTBEAT_MS);
+  if (typeof heartbeat.unref === "function") {
+    heartbeat.unref();
+  }
+
+  req.on("close", () => {
+    clearInterval(heartbeat);
+    held.streamSubscribers.delete(res);
+    if (held.streamSubscribers.size === 0) {
+      closeHeldStream(held);
+    }
+  });
+});
+
+// Read-only station identity from the local static reference data (allowed by
+// the roadmap: names/SDE stay client-local, exactly as the retail client
+// resolves station names from its static DB).
+function buildStationStatic(stationID) {
+  const numericStationID = Number(stationID) || 0;
+  if (numericStationID <= 0) {
+    return null;
+  }
+  const record = staticData.getStation(numericStationID) || {};
+  const stationTypeID = Number(record.stationTypeID) || null;
+  return {
+    stationID: numericStationID,
+    stationName: String(record.stationName || `Station ${numericStationID}`),
+    solarSystemName: String(record.solarSystemName || ""),
+    regionName: String(record.regionName || ""),
+    stationTypeID,
+    stationTypeName: stationTypeID ? staticData.getTypeName(stationTypeID) : null,
+    operationID: Number(record.operationID) || null,
+    security: Number(record.security) || null,
+  };
+}
+
+// Select a character onto a persistent browser-backed session (goal R2): the
+// BFF forwards the retail tuple SelectCharacterID(charID, secondChoiceID,
+// skipTutorial) to the gateway's session/select route, pins the identity to
+// the signed login session, and keeps the returned bridgeSessionID
+// server-side in its own session store — it must never reach browser JS.
+app.post("/api/bridge/select", requireAuth, async (req, res, next) => {
+  const characterID = Number(req.body && req.body.characterID || 0);
+  try {
+    if (!Number.isSafeInteger(characterID) || characterID <= 0) {
+      res.status(400).json({
+        ok: false,
+        error: "INVALID_CHARACTER",
+        message: "A positive characterID is required.",
+      });
+      return;
+    }
+    const character = await store.getCharacterForAccount(
+      req.account.accountID,
+      characterID,
+    );
+    if (!character) {
+      res.status(404).json({ ok: false, error: "CHARACTER_NOT_FOUND" });
+      return;
+    }
+    // ONE HULL, ONE DRIVER, direction 2: while a server bot claims this
+    // character, a tab selecting it would put two drivers on one ship — the
+    // takeover would kick the bot mid-script. Refused with a plain remedy;
+    // the bot's OWN select passes because its fetch names it. Tab-vs-tab
+    // takeover (desktop to phone) is untouched.
+    const claimingBotID = botHost.claimedBy(characterID);
+    if (claimingBotID !== null && !botHost.authorizesClaim(characterID, req.get(botHostModule.BOT_HEADER))) {
+      res.status(409).json({
+        ok: false,
+        error: "CHARACTER_IN_USE_BY_BOT",
+        message: "A server bot is flying this character. Stop the bot first (Bots tab).",
+      });
+      return;
+    }
+    // One client session per web login: switching characters releases the
+    // previous persistent session (retail semantics live on the gateway side;
+    // the handler's own refusals pass through as CALL_REFUSED).
+    await releaseHeldBridgeSession(req.webSessionID);
+    const outcome = await gateway.selectCharacter(
+      [characterID, null, true],
+      null,
+      {
+        userid: Number(req.account.accountID),
+        userName: String(req.account.username || ""),
+      },
+    );
+    bridgeSessions.set(req.webSessionID, {
+      bridgeSessionID: outcome.bridgeSessionID,
+      characterID: Number(outcome.session.characterID) || characterID,
+      accountID: Number(req.account.accountID),
+      // R55: the character's corporation, so the standings drill-down can pass it
+      // as the composition read's toID (GetStandingCompositions(fromID, corpID)).
+      // Server-held like every other session scalar; never round-trips the browser.
+      corporationID: Number(outcome.session.corporationID) || null,
+      // R3: the docked-entry state the page needs to address inventories/ships
+      // by their game IDs, plus the server-held bound-object handles keyed by a
+      // semantic key (hangar/cargo/ship). Handles live here only — never in
+      // browser JS — exactly like the bridgeSessionID.
+      stationID: Number(outcome.session.stationID) || null,
+      solarSystemID: Number(outcome.session.solarSystemID) || null,
+      activeShipID: Number(outcome.session.shipID) || null,
+      boundHandles: new Map(),
+      // Retail separates the next legal session-mutation cooldown from actual
+      // transition readiness. Epochs invalidate every bound context; the
+      // observed-state barrier below advances phase only after location/scene/
+      // ego/ship postconditions hold.
+      transitionEpoch: 0,
+      transition: null,
+      transitionReservation: null,
+      cooldownUntilMs: 0,
+      // R10 live event channel: the single gateway push WebSocket for this
+      // session (opened lazily when a browser attaches), the SSE responses it
+      // fans out to, and the last cursor seen so a reconnect resumes there.
+      stream: null,
+      streamSubscribers: new Set(),
+      streamCursor: null,
+      streamRetryTimer: null,
+    });
+    res.json({
+      ok: true,
+      character: {
+        characterID: Number(outcome.session.characterID) || characterID,
+        characterName: String(outcome.session.characterName || ""),
+        stationID: outcome.session.stationID === undefined
+          ? null
+          : outcome.session.stationID,
+        structureID: outcome.session.structureID === undefined
+          ? null
+          : outcome.session.structureID,
+        solarSystemID: outcome.session.solarSystemID === undefined
+          ? null
+          : outcome.session.solarSystemID,
+        corporationID: outcome.session.corporationID === undefined
+          ? null
+          : outcome.session.corporationID,
+      },
+      station: buildStationStatic(outcome.session.stationID),
+      notifications: outcome.notifications,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Release the persistent session this web login holds (character goes offline
+// through the same disconnect path a retail socket close runs).
+app.post("/api/bridge/release", requireAuth, async (req, res, next) => {
+  try {
+    const released = await releaseHeldBridgeSession(req.webSessionID);
+    res.json({ ok: true, released });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// --- R3 Inventory & Ship (bound-object bridge) -----------------------------
+// The browser refers to inventories and ships by their GAME IDs; the BFF maps
+// those to bound-object handles it holds server-side and drives the retail
+// two-step (bind then bound method) on the gateway. Handles never reach the
+// browser. Wire contract: docs/bridge-wire-contract.md.
+
+const ITEM_FLAG_HANGAR = 4;
+const ITEM_FLAG_CARGO_HOLD = 5;
+// A placeholder groupStation bind tuple for ship.MachoBindObject; EveJS's ship
+// bind mints an OID and ignores bindParams (the retail moniker is
+// Moniker('ship',(stationID,groupStation))).
+const SHIP_BIND_GROUP_STATION = 5;
+
+function requireHeldBridgeSession(req, res) {
+  const held = bridgeSessions.get(req.webSessionID) || null;
+  if (!held) {
+    res.status(409).json({
+      ok: false,
+      error: "NO_LIVE_SESSION",
+      message: "No character is online; select a character first.",
+    });
+    return null;
+  }
+  return held;
+}
+
+// Bind spec factories for the semantic targets the page addresses.
+function hangarBindSpec(held) {
+  return {
+    key: `hangar:${held.stationID}`,
+    service: "invbroker",
+    method: "GetInventory",
+    args: [held.stationID],
+    kwargs: null,
+  };
+}
+
+function cargoBindSpec(held, shipID) {
+  return {
+    key: `cargo:${shipID}`,
+    service: "invbroker",
+    method: "GetInventoryFromId",
+    args: [shipID],
+    kwargs: { passive: 0 },
+  };
+}
+
+function shipBindSpec(held) {
+  return {
+    key: `ship:${held.stationID}`,
+    service: "ship",
+    method: "MachoBindObject",
+    args: [[held.stationID, SHIP_BIND_GROUP_STATION]],
+    kwargs: null,
+  };
+}
+
+// R4 agent moniker: Moniker('agentMgr', agentID) via MachoBindObject. The bound
+// agent is what DoAction / GetMission* / GetAgentLocationWrap dispatch on.
+function agentBindSpec(agentID) {
+  return {
+    key: `agent:${agentID}`,
+    service: "agentMgr",
+    method: "MachoBindObject",
+    args: [Number(agentID)],
+    kwargs: null,
+  };
+}
+
+// R72 PLUMBING — the four OID-bind gateway specs the Phase-2 bound-read batches
+// hang off (RB-DOGMA / RB-ENTITY / RB-SCAN / RB-FLEET). Each mints a BOUND HANDLE,
+// not entity data; NO bound method is wired here (each Phase-2 bound read is its
+// own batch with its own R63 ownership check). The BFF binds them SESSION-SCOPED
+// — it passes NO caller-supplied target (args: []) so every gateway derives its
+// target from the held session, and the handle stays BFF-side (never browser JS),
+// exactly like every other bind. Mirrors the invbroker/ship/agentMgr shape.
+//
+// dogmaIM binds the active ship's dogma manager; the bound reads resolve the ship
+// from the session, so the (ignored) bind param cannot steer a foreign ship.
+function dogmaBindSpec() {
+  return { key: "dogma", service: "dogmaIM", method: "MachoBindObject", args: [], kwargs: null };
+}
+// entity binds an in-space entity; the handler ignores the bind param and the
+// bound Cmd* orders act on the session's own scene.
+function entityBindSpec() {
+  return { key: "entity", service: "entity", method: "MachoBindObject", args: [], kwargs: null };
+}
+// scanMgr.GetSystemScanMgr returns the bound handle for the session's OWN current
+// system (server-derived) — a GetXxx, not a MachoBindObject, but it returns a real
+// OID substruct so it rides the same /bound/bind two-step.
+function systemScanBindSpec() {
+  return { key: "scanMgr", service: "scanMgr", method: "GetSystemScanMgr", args: [], kwargs: null };
+}
+// ⚠ fleetObjectHandler.MachoBindObject accepts a CALLER fleetID (no membership
+// check) and stores it for the bound reads to honor — a binds-arbitrary-OID
+// gateway (docs/arg-injection-leak-handoff.md). The BFF passes NO fleetID so it
+// binds the session's OWN fleet; the leak risk lives on the Phase-2 bound READ,
+// which must add a hard ownership check. Wired because it is the retail prereq.
+function fleetBindSpec() {
+  return { key: "fleet", service: "fleetObjectHandler", method: "MachoBindObject", args: [], kwargs: null };
+}
+
+// Invite acceptance/rejection and reconnect happen before `session.fleetid`
+// points at the target fleet. Retail binds the fleet id carried by
+// OnFleetInvite (or the saved reconnect record); the bound method then verifies
+// the pending invite/member row.
+function fleetIDBindSpec(fleetID) {
+  return {
+    key: `fleet:${fleetID}`,
+    service: "fleetObjectHandler",
+    method: "MachoBindObject",
+    args: [[fleetID]],
+    kwargs: null,
+  };
+}
+
+// Fleet handles capture a fleet id at bind time. Membership can change without the
+// gateway session changing (create / accept / leave / disband), so treating `fleet`
+// like an ordinary session-lifetime cache can either keep showing FleetNotFound after
+// a join or, worse, keep reading the roster of a fleet the character has left. Drop
+// every fleet-flavoured handle at membership boundaries and before an own-fleet read;
+// the five reads in one batch still share the single in-flight replacement bind.
+function invalidateFleetBoundHandles(held) {
+  for (const key of held.boundHandles.keys()) {
+    if (key === "fleet" || key.startsWith("fleet:") || key.startsWith("fleet-create:")) {
+      held.boundHandles.delete(key);
+    }
+  }
+}
+
+// R77 PLUMBING — the RB-PI planet bind. Retail addresses the planetary-industry
+// bound reads on Moniker("planetMgr", planetID) (eveMoniker.GetPlanet), a genuine
+// bound two-step: planetMgr.MachoBindObject(planetID) mints the OID handle keyed
+// on the planetID, and the reads dispatch as bound methods. The BIND itself is
+// read-safe — a planetID is public celestial geography (the same id
+// GetPlanetsForChar returns), and the handler reads no colony. Binding to the
+// caller's requested planetID also SETS session._planetMgrLastPlanetID, which is
+// how the two {allowArgs:false} reads (GetResourceData, GetProgramResultInfo)
+// recover the planetID when their own args do not carry it. Keyed per planetID so
+// distinct planets get distinct cached handles.
+function planetBindSpec(planetID) {
+  return {
+    key: `planet:${Number(planetID)}`,
+    service: "planetMgr",
+    method: "MachoBindObject",
+    args: [Number(planetID)],
+    kwargs: null,
+  };
+}
+
+// Dispatch a bound method, binding the target on demand and caching the bind
+// under its semantic key. The cache holds the in-flight bind PROMISE, so the
+// concurrent reads of one panel load (List + GetCapacity per container) share a
+// single bind instead of racing to create duplicate OIDs. A reaped OID
+// (BOUND_HANDLE_NOT_FOUND) rebinds once; a lost persistent session drops the
+// whole held session (as /api/bridge/call).
+async function boundCall(held, webSessionID, bindSpec, method, args, kwargs) {
+  const sessionFields = { userid: held.accountID };
+  function ensureHandle(forceRebind) {
+    if (!forceRebind && held.boundHandles.has(bindSpec.key)) {
+      return held.boundHandles.get(bindSpec.key);
+    }
+    const bindPromise = gateway
+      .bindObject(
+        bindSpec.service,
+        bindSpec.method,
+        bindSpec.args,
+        bindSpec.kwargs,
+        sessionFields,
+        held.bridgeSessionID,
+      )
+      .then((bound) => bound.boundHandle)
+      .catch((error) => {
+        // Never cache a failed bind.
+        if (held.boundHandles.get(bindSpec.key) === bindPromise) {
+          held.boundHandles.delete(bindSpec.key);
+        }
+        throw error;
+      });
+    held.boundHandles.set(bindSpec.key, bindPromise);
+    return bindPromise;
+  }
+  try {
+    return await gateway.callBoundMethod(
+      bindSpec.service,
+      method,
+      args,
+      kwargs,
+      sessionFields,
+      held.bridgeSessionID,
+      await ensureHandle(false),
+    );
+  } catch (error) {
+    if (error && error.code === "SESSION_NOT_FOUND") {
+      forgetBridgeSession(webSessionID);
+      throw error;
+    }
+    if (error && error.code === "BOUND_HANDLE_NOT_FOUND") {
+      held.boundHandles.delete(bindSpec.key);
+      return gateway.callBoundMethod(
+        bindSpec.service,
+        method,
+        args,
+        kwargs,
+        sessionFields,
+        held.bridgeSessionID,
+        await ensureHandle(true),
+      );
+    }
+    throw error;
+  }
+}
+
+// Load the full Inventory & Ship panel: station hangar + active-ship cargo,
+// each with its List and GetCapacity. The four reads are INDEPENDENT
+// (Promise.allSettled) so one failed read never blanks the rest (R2's rule).
+app.get("/api/bridge/inventory", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    // Sync held station/ship to the live position first, so the hangar/cargo
+    // binds target the CURRENT station + active ship after a new dock, not the
+    // select-time ones.
+    await readHeldFlight(held, req.webSessionID);
+    const shipID = held.activeShipID;
+    const hangarSpec = hangarBindSpec(held);
+    const cargoSpec = shipID ? cargoBindSpec(held, shipID) : null;
+    const [hangarList, hangarCap, cargoList, cargoCap] = await Promise.allSettled([
+      boundCall(held, req.webSessionID, hangarSpec, "List", [ITEM_FLAG_HANGAR], null),
+      boundCall(held, req.webSessionID, hangarSpec, "GetCapacity", [ITEM_FLAG_HANGAR], null),
+      cargoSpec
+        ? boundCall(held, req.webSessionID, cargoSpec, "List", [ITEM_FLAG_CARGO_HOLD], null)
+        : Promise.reject(Object.assign(new Error("No active ship."), { code: "NO_ACTIVE_SHIP" })),
+      cargoSpec
+        ? boundCall(held, req.webSessionID, cargoSpec, "GetCapacity", [ITEM_FLAG_CARGO_HOLD], null)
+        : Promise.reject(Object.assign(new Error("No active ship."), { code: "NO_ACTIVE_SHIP" })),
+    ]);
+
+    // A lost live session can't be recovered by any read; surface it so the
+    // page returns to character select.
+    for (const settled of [hangarList, hangarCap, cargoList, cargoCap]) {
+      if (settled.status === "rejected" && settled.reason && settled.reason.code === "SESSION_NOT_FOUND") {
+        next(settled.reason);
+        return;
+      }
+    }
+
+    const settledCode = (settled) =>
+      settled.status === "rejected"
+        ? String((settled.reason && settled.reason.code) || "READ_FAILED")
+        : null;
+    const settledValue = (settled) =>
+      settled.status === "fulfilled" ? settled.value.result : null;
+
+    res.json({
+      ok: true,
+      stationID: held.stationID,
+      activeShipID: shipID,
+      hangar: {
+        list: settledValue(hangarList),
+        capacity: settledValue(hangarCap),
+        error: settledCode(hangarList) || settledCode(hangarCap),
+      },
+      cargo: {
+        shipID,
+        list: settledValue(cargoList),
+        capacity: settledValue(cargoCap),
+        error: settledCode(cargoList) || settledCode(cargoCap),
+      },
+      // Per-type VOLUME (m³) for every type in the hangar/cargo, from static
+      // reference data — the SAME read the assets route does, no bridge call and
+      // no new allowlist pair. Volume is a property of the TYPE, not the stack,
+      // so it cannot vary by player. The browser needs it to work out how much of
+      // a stack fits in a hold before it tries the move; absent for a type the
+      // static tables do not know (handled as "unknown", never zero).
+      volumes: {
+        ...readTypeVolumes(settledValue(hangarList)),
+        ...readTypeVolumes(settledValue(cargoList)),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// R72 PLUMBING — reachability probe for the five gateway-bind reads that every
+// Phase-2 bound-read batch hangs off (skills / dogma / entity / system-scan /
+// fleet). It performs each bind on the held session and returns the handle
+// ENVELOPE INTACT — `bound: true/false` for the four OID binds (the boundHandle
+// itself stays BFF-side, never browser JS) and the session-scoped Moniker for the
+// skills gateway — WITHOUT decoding into entity fields and WITHOUT calling any
+// bound method (those are Phase-2). Independent Promise.allSettled: a missing
+// target (no fleet, docked so nothing in space to bind) is empty-but-legitimate
+// and never blanks the rest. NO UI consumes this yet — it is the pipe.
+function decodeGatewaySettled(settled) {
+  if (settled.status === "fulfilled") {
+    return settled.value;
+  }
+  const reason = settled.reason || {};
+  return { bound: false, error: String(reason.code || "BIND_FAILED") };
+}
+
+app.get("/api/bridge/gateway-binds", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const sessionFields = { userid: held.accountID };
+  // One OID bind: mint the handle, keep only the envelope (never the secret
+  // handle string). The service/method echo back so a decoder can confirm the
+  // gateway it addressed. IDs stay as data — nothing here is decoded into fields.
+  const probeBind = (spec) =>
+    gateway
+      .bindObject(spec.service, spec.method, spec.args, spec.kwargs, sessionFields, held.bridgeSessionID)
+      .then((bound) => ({
+        bound: typeof bound.boundHandle === "string" && bound.boundHandle.length > 0,
+        service: bound.service,
+        method: bound.method,
+      }));
+  // The skills gateway is the odd one: GetMySkillHandler returns a Moniker (not an
+  // "N=" OID), so it rides the top-level /call seam. Return the moniker envelope
+  // intact — its service name is what the Phase-2 skills reads address, and its
+  // bind param (the session's OWN characterID) is kept as a STRING (R7d: an id is
+  // data, never coerced into a label).
+  const probeSkillHandler = () =>
+    gateway
+      .callMethod("skillMgr2", "GetMySkillHandler", [], null, sessionFields, held.bridgeSessionID)
+      .then((outcome) => ({ bound: true, moniker: outcome.result === undefined ? null : outcome.result }));
+  try {
+    const [skill, dogma, entityGw, systemScan, fleet] = await Promise.allSettled([
+      probeSkillHandler(),
+      probeBind(dogmaBindSpec()),
+      probeBind(entityBindSpec()),
+      probeBind(systemScanBindSpec()),
+      probeBind(fleetBindSpec()),
+    ]);
+    // A lost live session cannot be recovered by any probe; surface it so the
+    // page returns to character select (matching /api/bridge/inventory).
+    for (const settled of [skill, dogma, entityGw, systemScan, fleet]) {
+      if (settled.status === "rejected" && settled.reason && settled.reason.code === "SESSION_NOT_FOUND") {
+        forgetBridgeSession(req.webSessionID);
+        next(settled.reason);
+        return;
+      }
+    }
+    res.json({
+      ok: true,
+      gateways: {
+        skillHandler: decodeGatewaySettled(skill),
+        dogma: decodeGatewaySettled(dogma),
+        entity: decodeGatewaySettled(entityGw),
+        systemScan: decodeGatewaySettled(systemScan),
+        fleet: decodeGatewaySettled(fleet),
+      },
+    });
+  } catch (error) {
+    if (error && error.code === "SESSION_NOT_FOUND") {
+      forgetBridgeSession(req.webSessionID);
+    }
+    next(error);
+  }
+});
+
+// R73 PLUMBING — the FIRST Phase-2 BOUND-READ batch: the 13 RB-SKILL reads that
+// hang off the R72 skill-handler gateway. skillMgr2.GetMySkillHandler returns
+// Moniker("skillHandler", null, <session charID>, null); because that is a
+// Moniker (not an "N=" OID substruct) the retail client addresses these reads on
+// the ORDINARY top-level /call seam with service "skillHandler" — NOT a bound
+// two-step. So each dispatches as heldTopLevelCall("skillHandler", <method>).
+//
+// ⚠ SESSION-SCOPED. Every one of these 13 derives the character from the SESSION
+// (SkillMgrService._getCharacterId -> getCharacterIDFromSession) and IGNORES any
+// caller-supplied charID; the two arg-taking reads (CheckInjectionConstraints,
+// GetDiminishedSpFromInjectors) take an injector item/type id + counts, not a
+// charID. Verified LIVE cross-account (Farmer 140000005 vs GM Elysian 140000004:
+// injecting Farmer's id returns the caller's OWN skills, never Farmer's) — so the
+// browser-supplied-args risk on /api/bridge/call does not apply here.
+//
+// Independent Promise.allSettled: an empty queue / history / boosters / implants
+// and a REFUSED CheckInjectionConstraints (CALL_REFUSED SkillTradingItemNotFound
+// when no injector is owned) are legitimate states, never a blanking failure —
+// each read carries its own {result} or {error, message}. Returns the raw result
+// envelopes for web/src/bridge/boundSkills.ts; NO UI consumes this yet.
+const SKILL_BOUND_READS = Object.freeze([
+  ["GetSkills", []],
+  ["GetAllSkills", []],
+  ["GetAttributes", []],
+  ["GetSkillHistory", []],
+  ["GetSkillChangesForISIS", []],
+  ["GetRespecInfo", []],
+  ["GetFreeSkillPoints", []],
+  ["GetBoosters", []],
+  ["GetImplants", []],
+  // CheckInjectionConstraints(itemID, quantity) — probed with no owned injector,
+  // so it legitimately refuses; a future UI supplies a real injector itemID.
+  ["CheckInjectionConstraints", [0, 1]],
+  ["GetSkillPoints", []],
+  // GetDiminishedSpFromInjectors(typeID, quantity, nonDiminishingRemaining) —
+  // typeID 0 is not an injector, so it returns 0 (the empty preview).
+  ["GetDiminishedSpFromInjectors", [0, 1, 0]],
+  ["GetSkillQueue", []],
+]);
+
+app.get("/api/bridge/bound-skills", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const settled = await Promise.allSettled(
+      SKILL_BOUND_READS.map(([method, args]) =>
+        heldTopLevelCall(held, req.webSessionID, "skillHandler", method, args, null),
+      ),
+    );
+    // A lost live session cannot be recovered by any read; surface it so the page
+    // returns to character select (matching /api/bridge/inventory).
+    for (const s of settled) {
+      if (s.status === "rejected" && s.reason && s.reason.code === "SESSION_NOT_FOUND") {
+        next(s.reason);
+        return;
+      }
+    }
+    const reads = {};
+    SKILL_BOUND_READS.forEach(([method], index) => {
+      const s = settled[index];
+      if (s.status === "fulfilled") {
+        reads[method] = { result: s.value.result };
+      } else {
+        const reason = s.reason || {};
+        reads[method] = {
+          error: String(reason.code || "READ_FAILED"),
+          message: typeof reason.message === "string" ? reason.message : null,
+        };
+      }
+    });
+    res.json({ ok: true, characterID: held.characterID, reads });
+  } catch (error) {
+    if (error && error.code === "SESSION_NOT_FOUND") {
+      forgetBridgeSession(req.webSessionID);
+    }
+    next(error);
+  }
+});
+
+// R74 PLUMBING — the SECOND Phase-2 BOUND-READ batch: the 11 RB-DOGMA reads that
+// hang off the R72 dogma bind. Unlike R73's skills (a Moniker that rides the
+// TOP-LEVEL /call seam), dogmaIM.MachoBindObject mints an "N=" OID handle, so
+// these ARE the real bound two-step — each dispatches via boundCall against the
+// dogmaBindSpec() handle (both added R72; the invbroker reads are the other
+// reference). The BFF holds the handle; the browser never sees the OID.
+//
+// ⚠ SESSION-SCOPED. Every dogma read resolves its target from the SESSION and
+// IGNORES the bound OID (dogmaService never consults getBoundObjectParams for a
+// read), so bound and top-level dispatch return identical own-ship/char/scene
+// data. The five session-derived reads (GetAllInfo/GetTargeters/
+// GetCharacterAttributes/GetDroneSettingAttributes/GetLocationInfo) take no id;
+// the four item reads (ItemGetInfo/QueryAllAttributesForItem/QueryAttributeValue/
+// FullyDescribeAttribute) COERCE a foreign/unknown itemID to the caller's OWN
+// ship (_findInventoryItemContext rejects a non-owned item, then the context
+// falls back to the session's active ship); GetLayerDamageValuesByItems returns a
+// ZEROED sentinel for a foreign item (explicit ownedByOther guard); and
+// GetRequiredSkillLevels is STATIC public type metadata. Verified LIVE
+// cross-account (Farmer vs Test Two) — foreign itemID never leaks the foreign
+// item. No handoff-doc flag needed.
+//
+// ⚠ GetAllInfo alone fires afterCallResponse side effects (post-GetAllInfo charge
+// refresh / post-undock dogma multi-event / character dogma-state sync) — the
+// routine retail bootstrap recompute; non-destructive and drained into the
+// response notifications. The other ten reads trigger nothing.
+//
+// Independent Promise.allSettled: an empty targeter list (docked, nobody locking
+// you), an empty required-skill dict (typeID 0) and an empty layer-damage dict
+// (no items requested) are legitimate states, never a blanking failure — each
+// read carries its own {result} or {error, message}. Returns the raw result
+// envelopes for web/src/bridge/boundDogma.ts; NO UI consumes this yet.
+const DOGMA_BOUND_READS = Object.freeze([
+  // GetAllInfo(getCharInfo, getShipInfo, getStructureInfo) — the full ship+char+
+  // module snapshot; [] defaults getCharInfo/getShipInfo true (whole bootstrap).
+  ["GetAllInfo", []],
+  // ItemGetInfo(itemID) — [] resolves to the session's OWN active ship (the
+  // handler's _getShipID(session) default); a future UI passes a real itemID.
+  ["ItemGetInfo", []],
+  ["GetTargeters", []],
+  ["GetDroneSettingAttributes", []],
+  ["GetCharacterAttributes", []],
+  // GetRequiredSkillLevels(typeID) — STATIC type metadata; typeID 0 legitimately
+  // returns an empty dict (a UI supplies the inspected type's id).
+  ["GetRequiredSkillLevels", []],
+  // GetLayerDamageValuesByItems([itemIDs]) — [[]] requests no items -> empty dict
+  // (a UI supplies the in-bay drone / module itemIDs).
+  ["GetLayerDamageValuesByItems", [[]]],
+  // QueryAllAttributesForItem(itemID) — [] -> the own active ship's attribute dict.
+  ["QueryAllAttributesForItem", []],
+  // QueryAttributeValue(itemID, attributeID) — [0, 4]: itemID 0 falls back to the
+  // own ship, attribute 4 = mass, so this returns a real scalar float.
+  ["QueryAttributeValue", [0, 4]],
+  // FullyDescribeAttribute(itemID, attributeID, reason) — [0, 4, ""]: own ship,
+  // attribute 4, empty reason -> a human-readable debug string list.
+  ["FullyDescribeAttribute", [0, 4, ""]],
+  ["GetLocationInfo", []],
+]);
+
+app.get("/api/bridge/bound-dogma", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const spec = dogmaBindSpec();
+  try {
+    const settled = await Promise.allSettled(
+      DOGMA_BOUND_READS.map(([method, args]) =>
+        boundCall(held, req.webSessionID, spec, method, args, null),
+      ),
+    );
+    // A lost live session cannot be recovered by any read; surface it so the page
+    // returns to character select (matching /api/bridge/inventory).
+    for (const s of settled) {
+      if (s.status === "rejected" && s.reason && s.reason.code === "SESSION_NOT_FOUND") {
+        next(s.reason);
+        return;
+      }
+    }
+    const reads = {};
+    DOGMA_BOUND_READS.forEach(([method], index) => {
+      const s = settled[index];
+      if (s.status === "fulfilled") {
+        reads[method] = { result: s.value.result };
+      } else {
+        const reason = s.reason || {};
+        reads[method] = {
+          error: String(reason.code || "READ_FAILED"),
+          message: typeof reason.message === "string" ? reason.message : null,
+        };
+      }
+    });
+    res.json({ ok: true, characterID: held.characterID, reads });
+  } catch (error) {
+    if (error && error.code === "SESSION_NOT_FOUND") {
+      forgetBridgeSession(req.webSessionID);
+    }
+    next(error);
+  }
+});
+
+// R75 PLUMBING — the THIRD Phase-2 BOUND-READ batch: the 8 RB-INV reads that hang
+// off the ALREADY-WIRED invbroker bind. Unlike R73's skills (a Moniker on the
+// TOP-LEVEL /call seam), these ARE the real bound two-step — each dispatches via
+// boundCall against the inventory-MANAGER moniker
+// (inventoryManagerBindSpec: invbroker.MachoBindObject[[stationID, groupStation]],
+// the SAME handle TrashItems uses). The BFF holds the handle; the browser never
+// sees the OID. Mirrors /api/bridge/bound-dogma.
+//
+// ⚠ OWNERSHIP is SPLIT for this batch (verified live cross-account, Farmer vs Test
+// Two). The BFF issues SESSION-SCOPED default args here (no caller id), so THIS
+// route never leaks: GetContainerContents/GetItem default to the session's own
+// hangar/item, GetItems/GetDamageForCrystals request nothing (empty). But five of
+// the eight are session-scoped in the HANDLER too (ListDroneBay/ListFighterBay/
+// GetAvailableTurretSlots ignore args → session ship; GetItemDescriptor is a static
+// schema; GetDamageForCrystals drops foreign crystals via an explicit ownerID
+// guard), while GetItem/GetItems/GetContainerContents COPY a caller-supplied item/
+// container's OWN owner/type/location/quantity with no session check — an arg-
+// injection leak reachable via /api/bridge/call (NOT via this route), flagged in
+// docs/arg-injection-leak-handoff.md and kept pre-plumbed (operator flag-only).
+//
+// Independent Promise.allSettled: an empty drone/fighter bay, no crystals, an empty
+// GetItems list are legitimate states, never a blanking failure — each read carries
+// its own {result} or {error, message}. Returns the raw result envelopes for
+// web/src/bridge/boundInventory.ts; NO UI consumes this yet.
+const INVENTORY_BOUND_READS = Object.freeze([
+  // GetContainerContents(containerID, locationID) — [] defaults containerID to the
+  // session's OWN station hangar (Handle default _getStationId(session)); a UI
+  // passes a real container itemID. Rowset of util.Row lines.
+  ["GetContainerContents", []],
+  // GetItem(itemID) — [] resolves to the bound context's inventory (this manager
+  // bind → the station) / the session ship; a UI passes a real itemID. util.Row.
+  ["GetItem", []],
+  // GetItems([itemIDs]) — [[]] requests no items → an empty list (a UI supplies the
+  // itemIDs). {type:"list", items:[util.Row, …]}.
+  ["GetItems", [[]]],
+  // ListDroneBay / ListFighterBay — args are VOIDED; both read the session's active
+  // ship bay. {type:"list", items:[packedrow, …]}; empty is a legitimate state.
+  ["ListDroneBay", []],
+  ["ListFighterBay", []],
+  // GetItemDescriptor() — a STATIC blue.DBRowDescriptor schema (column names +
+  // typecodes); no per-entity data, no args.
+  ["GetItemDescriptor", []],
+  // GetAvailableTurretSlots() — a BARE integer, the session active-ship's free
+  // turret-hardpoint count; args ignored.
+  ["GetAvailableTurretSlots", []],
+  // GetDamageForCrystals([itemIDs]) — [[]] requests no crystals → an empty dict (a
+  // UI supplies the crystal itemIDs). dict[itemID → damageRatio], foreign crystals
+  // dropped by the handler's ownerID guard.
+  ["GetDamageForCrystals", [[]]],
+]);
+
+app.get("/api/bridge/bound-inventory", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    // Sync held station/ship to the live position first, so the manager bind
+    // targets the CURRENT station and the bay reads see the CURRENT active ship
+    // after a new dock (matching /api/bridge/inventory).
+    await readHeldFlight(held, req.webSessionID);
+    const spec = inventoryManagerBindSpec(held);
+    const settled = await Promise.allSettled(
+      INVENTORY_BOUND_READS.map(([method, args]) =>
+        boundCall(held, req.webSessionID, spec, method, args, null),
+      ),
+    );
+    // A lost live session cannot be recovered by any read; surface it so the page
+    // returns to character select (matching /api/bridge/inventory).
+    for (const s of settled) {
+      if (s.status === "rejected" && s.reason && s.reason.code === "SESSION_NOT_FOUND") {
+        next(s.reason);
+        return;
+      }
+    }
+    const reads = {};
+    INVENTORY_BOUND_READS.forEach(([method], index) => {
+      const s = settled[index];
+      if (s.status === "fulfilled") {
+        reads[method] = { result: s.value.result };
+      } else {
+        const reason = s.reason || {};
+        reads[method] = {
+          error: String(reason.code || "READ_FAILED"),
+          message: typeof reason.message === "string" ? reason.message : null,
+        };
+      }
+    });
+    res.json({ ok: true, characterID: held.characterID, reads });
+  } catch (error) {
+    if (error && error.code === "SESSION_NOT_FOUND") {
+      forgetBridgeSession(req.webSessionID);
+    }
+    next(error);
+  }
+});
+
+// R76 PLUMBING — the FOURTH Phase-2 BOUND-READ batch: the 6 RB-CLONE reads (jump-
+// clone state / station+ship clones / structure clone count / install price /
+// install validator) on service "jumpCloneSvc". machoNet keys "jumpCloneSvc" as
+// null (session-global, NOT station-keyed) exactly like R73's "skillHandler", so
+// although JumpCloneService also defines MachoBindObject these reads ride the
+// ORDINARY top-level /call seam — each dispatches as heldTopLevelCall(
+// "jumpCloneSvc", <method>), NOT the bound two-step. Mirrors /api/bridge/bound-
+// skills.
+//
+// ⚠ SESSION-SCOPED — no arg-injection surface. Every one of the 6 handlers takes
+// (args, session) and forwards ONLY session to jumpCloneRuntime; the caller's args
+// are DROPPED server-side. The location filter is the SESSION's OWN docked
+// location (getCurrentDockedLocation(session)) or the session's own char/ship —
+// never a caller-supplied station/structure/char id. So the argless calls below do
+// NOT return empty: they return Farmer's own clones at his current dock. A browser
+// injecting a foreign id via /api/bridge/call cannot steer these at another
+// character's clones — verified LIVE cross-account (Farmer 140000005 vs Test Two
+// 140000002: a foreign location/char id returns Farmer's OWN clone state). No
+// handoff-doc flag needed. Clones/implants are PRIVATE.
+//
+// ValidateInstallJumpClone is a NON-MUTATING read-style validator (returns an ARRAY
+// of error labels; empty = install allowed) — it writes nothing. Every jumpCloneSvc
+// WRITE sibling (Install*/CloneJump/Destroy*/SetJumpCloneName/…) stays refused.
+//
+// readHeldFlight first, so the location-scoped reads (station clones / structure
+// count / price / validator) see the CURRENT docked station after any autopilot
+// arrival (matching /api/bridge/bound-inventory). Independent Promise.allSettled:
+// no clones at the current station, no clones in a structure/ship, a bare-0 count
+// and an empty validator error list are all legitimate states, never a blanking
+// failure — each read carries its own {result} or {error, message}. Returns the raw
+// result envelopes for web/src/bridge/boundClones.ts; NO UI consumes this yet.
+const CLONE_BOUND_READS = Object.freeze([
+  // GetCloneState() — the whole clone sheet: KeyVal{clones:Rowset, implants:Rowset,
+  // timeLastJump:long FILETIME}. Session char; args ignored.
+  ["GetCloneState", []],
+  // GetStationCloneState() — retail passes a stationID, but the handler DROPS it and
+  // filters own clones to getCurrentDockedLocation(session).locationID. Rowset.
+  ["GetStationCloneState", []],
+  // GetShipCloneState() — own clones installed in the session's active ship. Rowset.
+  ["GetShipCloneState", []],
+  // GetNumClonesInPilotsStructure() — a BARE count of own clones at the session's
+  // structure/ship; 0 when none (a legitimate empty state).
+  ["GetNumClonesInPilotsStructure", []],
+  // GetPriceForClone() — a BARE number: the current docked location's clone-bay fee.
+  // ⚠ kept bigint-safe (ISK) though it fits Number in practice.
+  ["GetPriceForClone", []],
+  // ValidateInstallJumpClone() — an ARRAY of error labels ([] = install allowed).
+  // Non-mutating pre-check; args ignored.
+  ["ValidateInstallJumpClone", []],
+]);
+
+app.get("/api/bridge/bound-clones", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    // Sync the held session to the live position first, so the location-scoped
+    // clone reads target the CURRENT docked station (matching bound-inventory).
+    await readHeldFlight(held, req.webSessionID);
+    const settled = await Promise.allSettled(
+      CLONE_BOUND_READS.map(([method, args]) =>
+        heldTopLevelCall(held, req.webSessionID, "jumpCloneSvc", method, args, null),
+      ),
+    );
+    // A lost live session cannot be recovered by any read; surface it so the page
+    // returns to character select (matching /api/bridge/inventory).
+    for (const s of settled) {
+      if (s.status === "rejected" && s.reason && s.reason.code === "SESSION_NOT_FOUND") {
+        next(s.reason);
+        return;
+      }
+    }
+    const reads = {};
+    CLONE_BOUND_READS.forEach(([method], index) => {
+      const s = settled[index];
+      if (s.status === "fulfilled") {
+        reads[method] = { result: s.value.result };
+      } else {
+        const reason = s.reason || {};
+        reads[method] = {
+          error: String(reason.code || "READ_FAILED"),
+          message: typeof reason.message === "string" ? reason.message : null,
+        };
+      }
+    });
+    res.json({ ok: true, characterID: held.characterID, reads });
+  } catch (error) {
+    if (error && error.code === "SESSION_NOT_FOUND") {
+      forgetBridgeSession(req.webSessionID);
+    }
+    next(error);
+  }
+});
+
+// R77 PLUMBING — the FIFTH Phase-2 BOUND-READ batch: the 7 RB-PI reads (planetary-
+// industry colony + resource geography) that bind to a planetID. Unlike R73/R76's
+// session-global monikers (top-level /call seam), these ride the REAL bound two-
+// step off planetMgr.MachoBindObject(planetID) (mirrors /api/bridge/bound-dogma /
+// bound-inventory) — the BFF holds the handle, the browser never sees the OID. The
+// route requires a ?planetID (a UI reaches it from GetPlanetsForChar, R71). Six of
+// the seven also accept the planetID in args ({allowArgs:true}); the two that do
+// NOT (GetResourceData / GetProgramResultInfo) recover it from the bind that
+// planetBindSpec establishes.
+//
+// ⚠ OWNERSHIP is SPLIT for this batch (verified live cross-account, Farmer 140000005
+// owns colony planetID 40009077 vs Test Two 140000002). This route is SESSION-SCOPED
+// so it never leaks: ownerID defaults to held.characterID (the caller's OWN char),
+// so GetFullNetworkForOwner reads the caller's own colony, and GetPlanetInfo's colony
+// body is server-scoped to session.characterID regardless. But the HANDLERS leak
+// under attacker-chosen args on /api/bridge/call (NOT via this route):
+// GetFullNetworkForOwner(planetID, ownerID) returns ANY (planetID, ownerID) colony's
+// full network with no session check, and GetCommandPinsForPlanet /
+// GetExtractorsForPlanet list ALL owners' pins on a planetID — an arg-injection leak
+// flagged in docs/arg-injection-leak-handoff.md, kept pre-plumbed (operator flag-
+// only). GetPlanetResourceInfo / GetResourceData (static per-planet resource
+// geography) and GetProgramResultInfo (a computed extractor-yield estimate) read no
+// colony ownership — safe for everyone.
+//
+// Independent Promise.allSettled: a planet with no colony (empty network / no command
+// pins / no extractors) and a zeroed program estimate are legitimate states, never a
+// blanking failure — each read carries its own {result} or {error, message}. Returns
+// the raw result envelopes for web/src/bridge/boundPlanets.ts; NO UI consumes this yet.
+const PLANET_PROGRAM_HEAD_RADIUS = 0.1;
+function planetBoundReads(planetID, ownerID, resourceTypeID) {
+  const pid = Number(planetID) || 0;
+  const oid = Number(ownerID) || 0;
+  const rtid = Number(resourceTypeID) || 0;
+  return [
+    // GetPlanetInfo(planetID) — static celestial geography + (only) the SESSION
+    // char's own colony body (KeyVal). Foreign colony never appears here.
+    ["GetPlanetInfo", [pid]],
+    // GetPlanetResourceInfo(planetID) — a CachedMethodCallResult wrapping a dict
+    // {resourceTypeID -> quality} of the static per-planet resource field.
+    ["GetPlanetResourceInfo", [pid]],
+    // GetResourceData({resourceTypeID,oldBand,newBand,proximity}) — planetID from the
+    // bind; the per-resource distribution band bytes {data, numBands, proximity}. A
+    // UI supplies a real resourceTypeID (0 → an empty/default band read).
+    ["GetResourceData", [{ resourceTypeID: rtid, oldBand: 0, newBand: 15, proximity: 0 }]],
+    // GetFullNetworkForOwner(planetID, ownerID) — [pins(list of KeyVal), links(list of
+    // [endpoint1,endpoint2])]. ownerID is the SESSION's own char here (never foreign).
+    ["GetFullNetworkForOwner", [pid, oid]],
+    // GetCommandPinsForPlanet(planetID) — dict {ownerID -> command-pin KeyVal} across
+    // all colonies on the planet.
+    ["GetCommandPinsForPlanet", [pid]],
+    // GetExtractorsForPlanet(planetID) — list of extractor KeyVals across all colonies.
+    ["GetExtractorsForPlanet", [pid]],
+    // GetProgramResultInfo(planetID-ignored, resourceTypeID, heads, headRadius) —
+    // planetID from the bind; a computed [qtyToDistribute, cycleTime, numCycles]
+    // extractor-yield estimate (bigint-safe). Empty heads → a zeroed-qty estimate.
+    ["GetProgramResultInfo", [pid, rtid, [], PLANET_PROGRAM_HEAD_RADIUS]],
+  ];
+}
+
+app.get("/api/bridge/bound-planet", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const planetID = Number(req.query.planetID) || 0;
+  if (planetID <= 0) {
+    res.status(400).json({
+      ok: false,
+      error: "INVALID_PLANET",
+      message: "A positive planetID query param is required.",
+    });
+    return;
+  }
+  // ownerID defaults to the caller's OWN character so this route reads the caller's
+  // own colony; a caller-chosen foreign ownerID is the GetFullNetworkForOwner leak,
+  // reachable only via /api/bridge/call (flagged), never introduced by this route.
+  const ownerID = Number(req.query.ownerID) || held.characterID;
+  const resourceTypeID = Number(req.query.resourceTypeID) || 0;
+  const spec = planetBindSpec(planetID);
+  const reads = planetBoundReads(planetID, ownerID, resourceTypeID);
+  try {
+    const settled = await Promise.allSettled(
+      reads.map(([method, args]) =>
+        boundCall(held, req.webSessionID, spec, method, args, null),
+      ),
+    );
+    // A lost live session cannot be recovered by any read; surface it so the page
+    // returns to character select (matching /api/bridge/bound-inventory).
+    for (const s of settled) {
+      if (s.status === "rejected" && s.reason && s.reason.code === "SESSION_NOT_FOUND") {
+        next(s.reason);
+        return;
+      }
+    }
+    const out = {};
+    reads.forEach(([method], index) => {
+      const s = settled[index];
+      if (s.status === "fulfilled") {
+        out[method] = { result: s.value.result };
+      } else {
+        const reason = s.reason || {};
+        out[method] = {
+          error: String(reason.code || "READ_FAILED"),
+          message: typeof reason.message === "string" ? reason.message : null,
+        };
+      }
+    });
+    res.json({
+      ok: true,
+      characterID: held.characterID,
+      planetID,
+      ownerID,
+      resourceTypeID,
+      reads: out,
+    });
+  } catch (error) {
+    if (error && error.code === "SESSION_NOT_FOUND") {
+      forgetBridgeSession(req.webSessionID);
+    }
+    next(error);
+  }
+});
+
+// R78 PLUMBING — the SIXTH Phase-2 BOUND-READ batch: the 4 RB-CRIME reads
+// (crimewatch client states / own + any-char security status / sec-status
+// transaction history) on service "crimewatch". Retail obtains crimewatch as a
+// bound Moniker (CrimewatchService defines MachoBindObject and it is NOT in
+// machoNet's serviceInfo table), but the gateway dispatches serviceManager.lookup
+// ("crimewatch") directly — a real registered service — and all four handlers are
+// session/arg-derived with NO bound-state dependency, so like R73's skillHandler /
+// R76's jumpCloneSvc they ride the ORDINARY top-level /call seam (heldTopLevelCall
+// ("crimewatch", <method>)), NOT the bound two-step.
+//
+// ⚠ OWNERSHIP: this route is SESSION-SCOPED and never leaks. GetClientStates /
+// GetMySecurityStatus / GetSecurityStatusTransactions derive the char from the
+// SESSION and ignore any injected charID (verified live cross-account Farmer
+// 140000005 sec 0.1404 vs Test Two 140000002 sec 0: injecting the foreign id
+// returned the CALLER's own value). GetCharacterSecurityStatus takes a charID; the
+// route defaults it to the caller's OWN char, and an optional ?characterID= does a
+// PUBLIC sec-status lookup (a char's sec status is rendered on every EVE overview —
+// the handler returns ONLY the public float, never private crimewatch state), so
+// even the override leaks nothing. No handoff-doc flag needed.
+//
+// Independent Promise.allSettled: a clean crimewatch state (idle timers, no flagged
+// chars, safety full) and an empty transaction history (the handler returns [])
+// are legitimate states, never a blanking failure — each read carries its own
+// {result} or {error, message}. Returns the raw result envelopes for
+// web/src/bridge/boundCrimewatch.ts; NO UI consumes this yet.
+app.get("/api/bridge/bound-crimewatch", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  // GetCharacterSecurityStatus target: the caller's OWN char by default; an
+  // optional ?characterID= does a PUBLIC (safe) sec-status lookup of another char.
+  const characterID = Number(req.query.characterID) || held.characterID;
+  const CRIMEWATCH_READS = [
+    ["GetClientStates", []],
+    ["GetMySecurityStatus", []],
+    ["GetCharacterSecurityStatus", [characterID]],
+    ["GetSecurityStatusTransactions", []],
+  ];
+  try {
+    const settled = await Promise.allSettled(
+      CRIMEWATCH_READS.map(([method, args]) =>
+        heldTopLevelCall(held, req.webSessionID, "crimewatch", method, args, null),
+      ),
+    );
+    // A lost live session cannot be recovered by any read; surface it so the page
+    // returns to character select (matching /api/bridge/bound-clones).
+    for (const s of settled) {
+      if (s.status === "rejected" && s.reason && s.reason.code === "SESSION_NOT_FOUND") {
+        next(s.reason);
+        return;
+      }
+    }
+    const reads = {};
+    CRIMEWATCH_READS.forEach(([method], index) => {
+      const s = settled[index];
+      if (s.status === "fulfilled") {
+        reads[method] = { result: s.value.result };
+      } else {
+        const reason = s.reason || {};
+        reads[method] = {
+          error: String(reason.code || "READ_FAILED"),
+          message: typeof reason.message === "string" ? reason.message : null,
+        };
+      }
+    });
+    res.json({ ok: true, characterID: held.characterID, securityStatusOf: characterID, reads });
+  } catch (error) {
+    if (error && error.code === "SESSION_NOT_FOUND") {
+      forgetBridgeSession(req.webSessionID);
+    }
+    next(error);
+  }
+});
+
+// R79 — the 8 "small-service tail" Phase-2 BOUND reads across FOUR services
+// (wars / scan / PI-tax / corp-station), the last of the small Phase-2 binds
+// (PLUMBING ONLY — no UI, no writes). Retail addresses each on a bound Moniker
+// (warRegistry via eveMoniker.GetWar keyed on owner; scanMgr via GetSystemScanMgr;
+// planetOrbitalRegistryBroker + corpStationMgr via MachoBindObject), but every
+// handler resolves its target from the SESSION or plain caller args with NO
+// bound-state dependency and each is a real registered BaseService, so — like R73
+// skillHandler / R76 jumpCloneSvc / R78 crimewatch — each dispatches as
+// heldTopLevelCall(<svc>, <method>) on the ORDINARY top-level /call seam; NO
+// MachoBindObject two-step. scanMgr.GetSystemScanMgr (R72) stays wired but is not
+// needed here (GetFullState/GetScanTargetID recover the system from the session).
+//
+// ⚠ OWNERSHIP: this route issues SESSION-SCOPED / PUBLIC default args and does not
+// leak. GetFullState (args voided → session's own system), GetNegotiations (session
+// corp only), IsAllianceOrCorpLocal (constant) and GetTaxRate (public per-office)
+// are safe. GetWars defaults to the session corp ([]) with an optional ?ownerID for
+// a PUBLIC per-owner war lookup (war declarations are public — same as warsInfoMgr.
+// GetWarsByOwnerID). GetScanTargetID takes a ?siteID within the session's OWN system.
+// DoStandingCheckForStationService runs for the SESSION's own char (no charID arg is
+// passed here) at ?serviceID. ⚠ Two of the eight leak via /api/bridge/call's verbatim
+// arg forwarding (NOT via this route): GetWarNegotiation(id) reads any negotiation's
+// private terms with no session check, and DoStandingCheckForStationService(_, charID)
+// is a standing-gate oracle for a foreign charID — both FLAGGED in
+// docs/arg-injection-leak-handoff.md, kept pre-plumbed (operator flag-only). ?warNeg
+// otiationID is exposed here for verification but defaults to 0 (returns null in this
+// world — no negotiation seeded).
+//
+// Independent Promise.allSettled: an empty war/negotiation set, an all-empty scan
+// full-state, a null GetWarNegotiation and a null (passed) standing check are all
+// LEGITIMATE states, never a blanking failure — each read carries its own {result}
+// or {error, message}. A gate FAILURE on the standing check comes back as {error}
+// (the handler throws a CustomNotify), which the decoder reads as passed:false.
+// Returns the raw result envelopes for web/src/bridge/boundSmallServices.ts; NO UI
+// consumes this yet.
+app.get("/api/bridge/bound-small-services", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  // Optional overrides for the arg-taking reads. GetWars defaults to the session
+  // corp ([]); a ?ownerID does a PUBLIC per-owner war lookup. The rest carry
+  // benign defaults so the route is reachable with no query.
+  const siteID = Number(req.query.siteID) || 0;
+  const ownerID = Number(req.query.ownerID) || 0;
+  const warNegotiationID = Number(req.query.warNegotiationID) || 0;
+  const orbitalID = Number(req.query.orbitalID) || 0;
+  const serviceID = Number(req.query.serviceID) || 1;
+  const SMALL_SERVICE_READS = [
+    ["scanMgr", "GetFullState", []],
+    ["scanMgr", "GetScanTargetID", [siteID]],
+    ["warRegistry", "GetWars", ownerID > 0 ? [ownerID] : []],
+    ["warRegistry", "GetNegotiations", []],
+    ["warRegistry", "GetWarNegotiation", [warNegotiationID]],
+    ["warRegistry", "IsAllianceOrCorpLocal", []],
+    ["planetOrbitalRegistryBroker", "GetTaxRate", [orbitalID]],
+    // Session's OWN char (no charID arg) — the gate check for a station service.
+    ["corpStationMgr", "DoStandingCheckForStationService", [serviceID]],
+  ];
+  try {
+    const settled = await Promise.allSettled(
+      SMALL_SERVICE_READS.map(([service, method, args]) =>
+        heldTopLevelCall(held, req.webSessionID, service, method, args, null),
+      ),
+    );
+    // A lost live session cannot be recovered by any read; surface it so the page
+    // returns to character select (matching /api/bridge/bound-crimewatch).
+    for (const s of settled) {
+      if (s.status === "rejected" && s.reason && s.reason.code === "SESSION_NOT_FOUND") {
+        next(s.reason);
+        return;
+      }
+    }
+    const reads = {};
+    SMALL_SERVICE_READS.forEach(([, method], index) => {
+      const s = settled[index];
+      if (s.status === "fulfilled") {
+        reads[method] = { result: s.value.result };
+      } else {
+        const reason = s.reason || {};
+        reads[method] = {
+          error: String(reason.code || "READ_FAILED"),
+          message: typeof reason.message === "string" ? reason.message : null,
+        };
+      }
+    });
+    res.json({
+      ok: true,
+      characterID: held.characterID,
+      corporationID: held.corporationID,
+      solarSystemID: held.solarSystemID,
+      reads,
+    });
+  } catch (error) {
+    if (error && error.code === "SESSION_NOT_FOUND") {
+      forgetBridgeSession(req.webSessionID);
+    }
+    next(error);
+  }
+});
+
+// R85 — the 5 RB-FLEET Phase-2 BOUND reads (roster/init-state, wings, MOTD,
+// join-requests, composition), the LAST Phase-2 bound-read batch — CLOSES Phase-2
+// bound reads (111/111). PLUMBING ONLY — no UI, no writes. Retail addresses these
+// on the fleet bound Moniker (fleetObjectHandler.MachoBindObject), a genuine bound
+// two-step: the bind mints the OID handle keyed on the session's fleetID and the
+// reads dispatch as bound methods. This route rides boundCall over fleetBindSpec()
+// (the R72 bind, session-scoped: NO fleetID arg → the session's OWN fleet), same as
+// /api/bridge/bound-inventory / bound-planet — the BFF holds the handle, the browser
+// never sees the OID.
+//
+// ⚠ OWNERSHIP: this route is SESSION-SCOPED and never leaks — fleetBindSpec() passes
+// no fleetID, so the bound context is the session's own fleet (fleetid 0 → no fleet,
+// which is the real state for a docked/fleetless char). But ALL FIVE HANDLERS leak
+// under attacker-chosen args on /api/bridge/call (NOT via this route): a browser can
+// POST /api/bridge/call {service:"fleetObjectHandler", method:"MachoBindObject",
+// args:[[<rival fleetID>]]} to mint a handle bound to a FOREIGN fleet, then the bound
+// read off it returns that fleet's roster/wings/MOTD/join-requests/composition with no
+// membership check — the R72 BINDS-ARBITRARY-OID gateway, flagged in
+// docs/arg-injection-leak-handoff.md, kept pre-plumbed (operator flag-only). None of
+// fleetRuntime.getFleetState/getWings/getMotd/getJoinRequests/getFleetComposition calls
+// ensureFleetMembership (that gate guards only the fleet WRITES).
+//
+// Independent Promise.allSettled: with no fleet, ensureFleetExists(0) throws
+// FleetNotFound, so each read comes back as {error:"CALL_REFUSED", message:
+// "FleetNotFound"} (verified live) — a LEGITIMATE "not in a fleet" state, never a
+// blanking failure. A char IN a fleet gets
+// the populated envelopes. Each read carries its own {result} or {error, message}.
+// Returns the raw result envelopes for web/src/bridge/boundFleet.ts; NO UI consumes
+// this yet.
+app.get("/api/bridge/bound-fleet", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  // Re-resolve the session's current membership on every panel refresh. A fleet OID
+  // is membership-scoped, not valid for the full lifetime of the selected character.
+  invalidateFleetBoundHandles(held);
+  const spec = fleetBindSpec();
+  const FLEET_READS = [
+    // GetInitState() — the full fleet KeyVal {motd, options, fleetID, members(dict),
+    // isLootLogging, squads(dict), wings(dict)}.
+    ["GetInitState", []],
+    // GetWings() — dict {wingID -> wing KeyVal{wingID, name, squads(dict)}}.
+    ["GetWings", []],
+    // GetMotd() — the MOTD string.
+    ["GetMotd", []],
+    // GetJoinRequests() — dict {charID -> join-request KeyVal{charID, corpID,
+    // allianceID, warFactionID, securityStatus}}.
+    ["GetJoinRequests", []],
+    // GetFleetComposition() — list of composition KeyVals {characterID, solarSystemID,
+    // stationID, shipTypeID, skills, skillIDs}.
+    ["GetFleetComposition", []],
+  ];
+  try {
+    const settled = await Promise.allSettled(
+      FLEET_READS.map(([method, args]) =>
+        boundCall(held, req.webSessionID, spec, method, args, null),
+      ),
+    );
+    // A lost live session cannot be recovered by any read; surface it so the page
+    // returns to character select (matching /api/bridge/bound-planet).
+    for (const s of settled) {
+      if (s.status === "rejected" && s.reason && s.reason.code === "SESSION_NOT_FOUND") {
+        next(s.reason);
+        return;
+      }
+    }
+    const reads = {};
+    FLEET_READS.forEach(([method], index) => {
+      const s = settled[index];
+      if (s.status === "fulfilled") {
+        reads[method] = { result: s.value.result };
+      } else {
+        const reason = s.reason || {};
+        reads[method] = {
+          error: String(reason.code || "READ_FAILED"),
+          message: typeof reason.message === "string" ? reason.message : null,
+        };
+      }
+    });
+    res.json({
+      ok: true,
+      characterID: held.characterID,
+      fleetID: held.fleetID || null,
+      reads,
+    });
+  } catch (error) {
+    if (error && error.code === "SESSION_NOT_FOUND") {
+      forgetBridgeSession(req.webSessionID);
+    }
+    next(error);
+  }
+});
+
+// Move one item hangar <-> active-ship cargo. The bound object is the
+// DESTINATION; retail's Add(itemID, sourceLocationID, qty, flag) carries the
+// source location and the destination flag.
+app.post("/api/bridge/inventory/move", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const body = req.body || {};
+  const itemID = Number(body.itemID) || 0;
+  const direction = String(body.direction || "");
+  const qty = Number(body.qty);
+  if (itemID <= 0 || (direction !== "toCargo" && direction !== "toHangar")) {
+    res.status(400).json({ ok: false, error: "INVALID_MOVE", message: "itemID and a valid direction are required." });
+    return;
+  }
+  const shipID = held.activeShipID;
+  if (!shipID) {
+    res.status(409).json({ ok: false, error: "NO_ACTIVE_SHIP", message: "No active ship to move cargo to or from." });
+    return;
+  }
+  const kwargs = { flag: direction === "toCargo" ? ITEM_FLAG_CARGO_HOLD : ITEM_FLAG_HANGAR };
+  if (Number.isSafeInteger(qty) && qty > 0) {
+    kwargs.qty = qty;
+  }
+  const destSpec = direction === "toCargo" ? cargoBindSpec(held, shipID) : hangarBindSpec(held);
+  const sourceLocationID = direction === "toCargo" ? held.stationID : shipID;
+  try {
+    const outcome = await boundCall(
+      held,
+      req.webSessionID,
+      destSpec,
+      "Add",
+      [itemID, sourceLocationID],
+      kwargs,
+    );
+    res.json({ ok: true, notifications: outcome.notifications });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Stack all loose stacks in the hangar or the active-ship cargo.
+app.post("/api/bridge/inventory/stack", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const target = String((req.body && req.body.target) || "");
+  if (target !== "hangar" && target !== "cargo") {
+    res.status(400).json({ ok: false, error: "INVALID_TARGET", message: "target must be 'hangar' or 'cargo'." });
+    return;
+  }
+  const shipID = held.activeShipID;
+  if (target === "cargo" && !shipID) {
+    res.status(409).json({ ok: false, error: "NO_ACTIVE_SHIP", message: "No active ship cargo to stack." });
+    return;
+  }
+  const spec = target === "cargo" ? cargoBindSpec(held, shipID) : hangarBindSpec(held);
+  const flag = target === "cargo" ? ITEM_FLAG_CARGO_HOLD : ITEM_FLAG_HANGAR;
+  try {
+    const outcome = await boundCall(held, req.webSessionID, spec, "StackAll", [flag], null);
+    res.json({ ok: true, notifications: outcome.notifications });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// --- R14 Inventory depth + corporation hangars -----------------------------
+// All of this is the SAME R3 bound-object bridge above, with arguments R3
+// hardcoded away. Nothing here forks a parallel path: every route goes through
+// boundCall() and the shared bind/handle cache.
+//
+//   split a stack   Add(itemID, sourceLocationID, qty=<partial>)
+//   multi-move      MultiAdd(itemIDs, sourceLocationID, flag=<dest>)
+//   re-merge        MultiMerge([[src,dst,qty]], sourceContainerID)
+//   open container  GetInventoryFromId(containerID) then List() with NO FLAG
+//   corp hangar     GetInventoryFromId(officeID) then List(<division flag>)
+//   trash           TrashItems(itemIDs, locationID) — DESTRUCTIVE, confirm-gated
+//
+// The browser never sends a flagID or a division flag: it names a place
+// ("hangar", "cargo", a container's itemID, a corp division NUMBER 1-7) and the
+// mapping to retail flags lives here.
+
+// Container contents carry flagID 0 — NOT 4/5. A container is therefore listed
+// with no flag at all, and an item filed INTO one must be given flag 0
+// explicitly (a container binding's flag context is null, and a null flag falls
+// back to the hangar flag).
+const ITEM_FLAG_NONE = 0;
+// flagCorpSAG1..7 = 115..121. Division N maps to 114 + N. These numbers never
+// reach the browser; it addresses a division by its ordinal and sees its NAME.
+const CORP_DIVISION_FLAG_BASE = 114;
+const CORP_DIVISION_COUNT = 7;
+
+function corpDivisionFlag(division) {
+  return CORP_DIVISION_FLAG_BASE + division;
+}
+
+function isValidDivision(division) {
+  return Number.isSafeInteger(division) && division >= 1 && division <= CORP_DIVISION_COUNT;
+}
+
+// A container binds with the IDENTICAL call ship cargo binds with — there is no
+// container-specific bind method, and container-ness is a client-side
+// static-data question the server never asks.
+function containerBindSpec(containerID) {
+  return {
+    key: `container:${containerID}`,
+    service: "invbroker",
+    method: "GetInventoryFromId",
+    args: [containerID],
+    kwargs: { passive: 0 },
+  };
+}
+
+// The corporation's office at this station. See readCorpOffice() for why the
+// identifier bound here is the PUBLISHED one and what it is not.
+function corpOfficeBindSpec(officeID) {
+  return {
+    key: `corpOffice:${officeID}`,
+    service: "invbroker",
+    method: "GetInventoryFromId",
+    args: [officeID],
+    kwargs: { passive: 0 },
+  };
+}
+
+// Moniker('invbroker', (stationID, groupStation)) — the inventory MANAGER.
+// TrashItems dispatches on this, not on a per-container binding.
+function inventoryManagerBindSpec(held) {
+  return {
+    key: `invManager:${held.stationID}`,
+    service: "invbroker",
+    method: "MachoBindObject",
+    args: [[held.stationID, SHIP_BIND_GROUP_STATION]],
+    kwargs: null,
+  };
+}
+
+// Decode an invbroker List result to plain rows. Rows arrive as packedrows, or
+// (when empty and flag-scoped) a python set wrapping an empty list.
+function decodeInventoryRows(result) {
+  let listValue = result;
+  if (listValue && listValue.type === "objectex1" && Array.isArray(listValue.header)) {
+    const token = listValue.header[0];
+    if (token && token.value === "__builtin__.set" && Array.isArray(listValue.header[1])) {
+      listValue = listValue.header[1][0] ?? null;
+    }
+  } else if (listValue && listValue.type === "object" && Array.isArray(listValue.args)) {
+    listValue = listValue.args[0] ?? null;
+  }
+  const items =
+    listValue && listValue.type === "list" && Array.isArray(listValue.items) ? listValue.items : [];
+  const rows = [];
+  for (const item of items) {
+    const fields = item && item.type === "packedrow" && item.fields ? item.fields : item;
+    if (!fields || typeof fields !== "object") {
+      continue;
+    }
+    const itemID = Number(fields.itemID) || 0;
+    if (itemID > 0) {
+      rows.push({
+        itemID,
+        typeID: Number(fields.typeID) || 0,
+        locationID: Number(fields.locationID) || 0,
+        flagID: Number(fields.flagID) || 0,
+        quantity: Number(fields.quantity) || Number(fields.stacksize) || 0,
+        // R40: what a row IS, not just where it sits. The ship bays route needs
+        // these to tell a ship from a container from a stack of ore without a
+        // second read. Additive — every existing caller picks the fields it
+        // wants and is unaffected. groupID/categoryID are null (not 0) when the
+        // row did not carry them: 0 is a real category and "absent" is not it.
+        groupID: fields.groupID === undefined || fields.groupID === null ? null : Number(fields.groupID),
+        categoryID:
+          fields.categoryID === undefined || fields.categoryID === null
+            ? null
+            : Number(fields.categoryID),
+        singleton: Number(fields.singleton) === 1,
+      });
+    }
+  }
+  return rows;
+}
+
+// Decode officeManager.GetMyCorporationsOffices (a CRowset: objectex2 whose
+// `list` holds packedrows).
+function decodeOfficeRows(result) {
+  const rows = result && Array.isArray(result.list) ? result.list : [];
+  const offices = [];
+  for (const row of rows) {
+    const fields = row && row.type === "packedrow" && row.fields ? row.fields : null;
+    if (!fields) {
+      continue;
+    }
+    offices.push({
+      officeID: Number(fields.officeID) || 0,
+      stationID: Number(fields.stationID) || 0,
+    });
+  }
+  return offices;
+}
+
+// Decode corpRegistry.GetCorporation (a util.Row: a `header` list of column
+// names paired with a `line` list of values) into division ordinal -> name.
+function decodeDivisionNames(result) {
+  const entries =
+    result && result.type === "object" && result.args && Array.isArray(result.args.entries)
+      ? result.args.entries
+      : [];
+  const header = (entries.find(([key]) => key === "header") || [])[1];
+  const line = (entries.find(([key]) => key === "line") || [])[1];
+  const names = (header && header.items) || [];
+  const values = (line && line.items) || [];
+  const byDivision = {};
+  for (let division = 1; division <= CORP_DIVISION_COUNT; division += 1) {
+    const index = names.indexOf(`division${division}`);
+    const value = index >= 0 ? values[index] : null;
+    byDivision[division] = typeof value === "string" && value.trim() !== "" ? value : null;
+  }
+  return byDivision;
+}
+
+/**
+ * Resolve the corporation's office at the docked station.
+ *
+ * ⚠ IDENTITY. An office carries three separately allocated ids: officeID (where
+ * the hangar CONTENTS sit), officeFolderID, and itemID. What
+ * GetMyCorporationsOffices publishes as `officeID` is the office's ITEM id.
+ * GetInventoryFromId accepts any of the three, so BINDING with the published
+ * value is correct — but it is NOT the items' locationID, and passing it as the
+ * source location of a move-out gets the move declined SILENTLY (a 200 with
+ * nothing moved). Everywhere a source location is needed, the bridge takes it
+ * from the LISTED ROW's own locationID instead of assuming.
+ */
+async function readCorpOffice(held, webSessionID) {
+  const outcome = await heldTopLevelCall(
+    held,
+    webSessionID,
+    "officeManager",
+    "GetMyCorporationsOffices",
+    [],
+    null,
+  );
+  const offices = decodeOfficeRows(outcome.result);
+  const here = offices.find((office) => office.stationID === held.stationID);
+  return here ? here.officeID : 0;
+}
+
+// Resolve a browser-supplied place descriptor to a bind spec, the destination
+// flag, and the source location to quote when moving OUT of it.
+//   { kind: "hangar" }                     the docked station hangar
+//   { kind: "cargo" }                      the active ship's cargo hold
+//   { kind: "shipBay", bay: "ore" }        a specialised bay of the ACTIVE ship
+//   { kind: "container", itemID }          a container in the hangar or cargo
+//   { kind: "corp", division: 1..7 }       a corporation hangar division
+async function resolvePlace(held, webSessionID, descriptor) {
+  const kind = String((descriptor && descriptor.kind) || "");
+  if (kind === "hangar") {
+    return { spec: hangarBindSpec(held), flag: ITEM_FLAG_HANGAR, locationID: held.stationID };
+  }
+  if (kind === "cargo") {
+    if (!held.activeShipID) {
+      throw Object.assign(new Error("No active ship."), { code: "NO_ACTIVE_SHIP", status: 409 });
+    }
+    return {
+      spec: cargoBindSpec(held, held.activeShipID),
+      flag: ITEM_FLAG_CARGO_HOLD,
+      locationID: held.activeShipID,
+    };
+  }
+  // A specialised bay of the ACTIVE ship (ore hold, drone bay, fleet hangar, …),
+  // addressed by its bay KEY. The key -> flag mapping is R40's SHIP_BAYS, the
+  // very enumeration the /bays route reads with — so a bay is never guessed and
+  // the browser never sends a flag number. A bay is just a flag on the ship's
+  // own inventory, so the bind and the source location are identical to cargo's;
+  // only the flag differs. (There is deliberately no addressing for a bay on a
+  // hull the player is NOT flying — that has no source location here.)
+  if (kind === "shipBay") {
+    if (!held.activeShipID) {
+      throw Object.assign(new Error("No active ship."), { code: "NO_ACTIVE_SHIP", status: 409 });
+    }
+    const bayKey = String((descriptor && descriptor.bay) || "");
+    const bay = SHIP_BAYS.find((entry) => entry.key === bayKey);
+    if (!bay) {
+      throw Object.assign(new Error("Unknown ship bay."), { code: "INVALID_BAY", status: 400 });
+    }
+    return {
+      spec: cargoBindSpec(held, held.activeShipID),
+      flag: bay.flag,
+      locationID: held.activeShipID,
+    };
+  }
+  if (kind === "container") {
+    const containerID = Number(descriptor && descriptor.itemID) || 0;
+    if (containerID <= 0) {
+      throw Object.assign(new Error("A container is required."), {
+        code: "INVALID_CONTAINER",
+        status: 400,
+      });
+    }
+    return {
+      spec: containerBindSpec(containerID),
+      flag: ITEM_FLAG_NONE,
+      locationID: containerID,
+    };
+  }
+  if (kind === "corp") {
+    const division = Number(descriptor && descriptor.division) || 0;
+    if (!isValidDivision(division)) {
+      throw Object.assign(new Error("A corporation hangar division is required."), {
+        code: "INVALID_DIVISION",
+        status: 400,
+      });
+    }
+    const officeID = await readCorpOffice(held, webSessionID);
+    if (!officeID) {
+      throw Object.assign(
+        new Error("Your corporation has no office at this station."),
+        { code: "NO_CORP_OFFICE", status: 409 },
+      );
+    }
+    // locationID is deliberately null: the office's PUBLISHED id is not where
+    // items sit, so a move OUT of a division must read the row's own location.
+    return {
+      spec: corpOfficeBindSpec(officeID),
+      flag: corpDivisionFlag(division),
+      locationID: null,
+      division,
+    };
+  }
+  throw Object.assign(new Error("Unknown inventory location."), {
+    code: "INVALID_LOCATION",
+    status: 400,
+  });
+}
+
+// List a place. A container lists with NO flag argument at all; everything else
+// is flag-scoped.
+async function listPlace(held, webSessionID, place) {
+  const args = place.flag === ITEM_FLAG_NONE ? [] : [place.flag];
+  const outcome = await boundCall(held, webSessionID, place.spec, "List", args, null);
+  return decodeInventoryRows(outcome.result);
+}
+
+function sendPlaceError(res, error) {
+  if (error && error.status) {
+    res.status(error.status).json({ ok: false, error: error.code, message: error.message });
+    return true;
+  }
+  return false;
+}
+
+// Open a container and list its contents. THE RULE: a container binding is
+// listed with NO flag — its contents carry flagID 0, so a flag-scoped List
+// would answer empty and the container would look wrongly empty.
+app.get("/api/bridge/inventory/container/:itemID", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const containerID = Number(req.params.itemID) || 0;
+  if (containerID <= 0) {
+    res.status(400).json({ ok: false, error: "INVALID_CONTAINER", message: "A container is required." });
+    return;
+  }
+  const spec = containerBindSpec(containerID);
+  try {
+    const [list, capacity] = await Promise.allSettled([
+      boundCall(held, req.webSessionID, spec, "List", [], null),
+      boundCall(held, req.webSessionID, spec, "GetCapacity", [], null),
+    ]);
+    for (const settled of [list, capacity]) {
+      if (settled.status === "rejected" && settled.reason && settled.reason.code === "SESSION_NOT_FOUND") {
+        next(settled.reason);
+        return;
+      }
+    }
+    if (list.status === "rejected") {
+      next(list.reason);
+      return;
+    }
+    res.json({
+      ok: true,
+      containerID,
+      list: list.value.result,
+      // A container that reports no capacity is still browsable; the panel
+      // simply omits the gauge.
+      capacity: capacity.status === "fulfilled" ? capacity.value.result : null,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * The general move. One route carries split, multi-select move, and every
+ * hangar/cargo/container/corp-division combination, because they are all the
+ * same retail call with different arguments:
+ *   one item  + qty   -> Add(itemID, sourceLocationID, {qty, flag})   (a SPLIT)
+ *   many items        -> MultiAdd(itemIDs, sourceLocationID, {flag})
+ *
+ * The response reports what ACTUALLY moved. invbroker declines silently in
+ * several branches (source-location mismatch, no room, a rig, a corp division
+ * the character cannot take from) — it returns null WITHOUT raising — so a 200
+ * is never treated as proof. The destination is re-read and the caller is told
+ * which items landed and which did not.
+ */
+app.post("/api/bridge/inventory/transfer", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const body = req.body || {};
+  const itemIDs = (Array.isArray(body.itemIDs) ? body.itemIDs : [body.itemID])
+    .map((value) => Number(value) || 0)
+    .filter((value) => value > 0);
+  const qty = Number(body.qty);
+  const hasQty = Number.isSafeInteger(qty) && qty > 0;
+  if (itemIDs.length === 0) {
+    res.status(400).json({ ok: false, error: "INVALID_MOVE", message: "At least one item is required." });
+    return;
+  }
+  if (hasQty && itemIDs.length > 1) {
+    res.status(400).json({
+      ok: false,
+      error: "INVALID_SPLIT",
+      message: "A quantity can only be given when moving a single stack.",
+    });
+    return;
+  }
+  try {
+    await readHeldFlight(held, req.webSessionID);
+    const from = await resolvePlace(held, req.webSessionID, body.from);
+    const to = await resolvePlace(held, req.webSessionID, body.to);
+
+    // Read the source FIRST. This is what supplies the source location for a
+    // corp division (whose published office id is not the items' location), and
+    // the before-quantity a split is judged against.
+    const sourceRowsBefore = await listPlace(held, req.webSessionID, from);
+    const sourceByID = new Map(sourceRowsBefore.map((row) => [row.itemID, row]));
+    const missing = itemIDs.filter((itemID) => !sourceByID.has(itemID));
+    if (missing.length === itemIDs.length) {
+      res.status(409).json({
+        ok: false,
+        error: "ITEMS_NOT_AT_SOURCE",
+        message: "Those items are no longer where the panel last saw them; refresh and try again.",
+      });
+      return;
+    }
+    const present = itemIDs.filter((itemID) => sourceByID.has(itemID));
+    // Quote the source location the ITEMS report, never an assumed one.
+    const sourceLocationID =
+      from.locationID !== null && from.locationID !== undefined
+        ? from.locationID
+        : sourceByID.get(present[0]).locationID;
+
+    const kwargs = { flag: to.flag };
+    let outcome;
+    // A THROW IS NOT PROOF OF FAILURE, exactly as a 200 is not proof of
+    // success. Looting an NPC wreck raises after the item has already moved
+    // (eve.js nativeNpcWreckService.js:222 calls a scene method that does not
+    // exist, but only once the transfer itself is done). Measured live: five
+    // consecutive loot calls each answered CALL_FAILED and all five items were
+    // in the cargo hold afterwards. So the dispatch error is REMEMBERED, not
+    // rethrown here, and the re-read below decides. If the re-read shows
+    // nothing moved, the original error is raised unchanged.
+    let dispatchError = null;
+    try {
+      if (present.length === 1 && hasQty) {
+        outcome = await boundCall(
+          held,
+          req.webSessionID,
+          to.spec,
+          "Add",
+          [present[0], sourceLocationID],
+          { ...kwargs, qty },
+        );
+      } else if (present.length === 1) {
+        outcome = await boundCall(
+          held,
+          req.webSessionID,
+          to.spec,
+          "Add",
+          [present[0], sourceLocationID],
+          kwargs,
+        );
+      } else {
+        outcome = await boundCall(
+          held,
+          req.webSessionID,
+          to.spec,
+          "MultiAdd",
+          [present, sourceLocationID],
+          kwargs,
+        );
+      }
+    } catch (error) {
+      dispatchError = error;
+      outcome = { notifications: [] };
+    }
+
+    // RE-READ. The status code above proves only that the call was dispatched.
+    const [destinationRows, sourceRowsAfter] = await Promise.all([
+      listPlace(held, req.webSessionID, to),
+      listPlace(held, req.webSessionID, from),
+    ]);
+    const destinationIDs = new Set(destinationRows.map((row) => row.itemID));
+    const sourceAfterByID = new Map(sourceRowsAfter.map((row) => [row.itemID, row]));
+
+    // Items that kept their identity and are now at the destination. This is
+    // the ONLY signal the route used to have, and it is the one that fails.
+    const moved = present.filter((itemID) => destinationIDs.has(itemID));
+
+    // THE SOURCE IS THE AUTHORITY, not the destination. Three different server
+    // paths mint a NEW itemID at the destination and so can never appear in
+    // `moved`, all three measured live against this emulator:
+    //   * looting a wreck   — the wreck row is destroyed and a fresh row is
+    //                         minted in the cargo hold (5/5 items, new ids)
+    //   * splitting a stack — the source keeps its id and shrinks
+    //   * fitting from a stack / loading ammo — one unit peels off as a new row
+    // What every one of them has in common is that the SOURCE gave something
+    // up: the row vanished, or its quantity fell. That is what `applied` now
+    // asks. Judging by destination membership alone reported `applied:false`
+    // on a completed move and would have told the player their loot was lost.
+    const gaveUpAtSource = (itemID) => {
+      const before = sourceByID.get(itemID);
+      if (!before) {
+        return false;
+      }
+      const after = sourceAfterByID.get(itemID);
+      if (!after) {
+        return true; // the row is gone from the source entirely
+      }
+      return (after.quantity ?? 0) < (before.quantity ?? 0);
+    };
+    const surrendered = present.filter(gaveUpAtSource);
+    const applied = moved.length > 0 || surrendered.length > 0;
+
+    // Nothing left the source AND nothing arrived: the server took the call and
+    // did nothing, which is the silent-decline shape this bridge exists to
+    // catch. Only now is a dispatch error a real failure.
+    if (!applied && dispatchError) {
+      throw dispatchError;
+    }
+
+    const declined = present.filter(
+      (itemID) => !destinationIDs.has(itemID) && !gaveUpAtSource(itemID),
+    );
+
+    res.json({
+      ok: true,
+      applied,
+      moved,
+      // Items that left the source but arrived under a NEW id, so the caller
+      // knows the move landed even though `moved` cannot name them.
+      reminted: surrendered.filter((itemID) => !destinationIDs.has(itemID)),
+      // Items the server did not move, and no reason was given: say exactly
+      // that rather than inventing a cause.
+      declined,
+      declinedSilently: !applied && declined.length > 0,
+      notFound: missing,
+      notifications: outcome.notifications,
+    });
+  } catch (error) {
+    if (sendPlaceError(res, error)) {
+      return;
+    }
+    next(error);
+  }
+});
+
+// Re-merge one stack into another of the same type (retail's drag-onto-stack).
+// MultiMerge takes (ops, sourceContainerID) with each op [source, dest, qty].
+app.post("/api/bridge/inventory/merge", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const body = req.body || {};
+  const sourceItemID = Number(body.sourceItemID) || 0;
+  const destinationItemID = Number(body.destinationItemID) || 0;
+  if (sourceItemID <= 0 || destinationItemID <= 0 || sourceItemID === destinationItemID) {
+    res.status(400).json({
+      ok: false,
+      error: "INVALID_MERGE",
+      message: "Two different stacks are required to merge.",
+    });
+    return;
+  }
+  try {
+    await readHeldFlight(held, req.webSessionID);
+    const place = await resolvePlace(held, req.webSessionID, body.place);
+    const rowsBefore = await listPlace(held, req.webSessionID, place);
+    const source = rowsBefore.find((row) => row.itemID === sourceItemID);
+    const destination = rowsBefore.find((row) => row.itemID === destinationItemID);
+    if (!source || !destination) {
+      res.status(409).json({
+        ok: false,
+        error: "ITEMS_NOT_AT_SOURCE",
+        message: "Those stacks are no longer where the panel last saw them; refresh and try again.",
+      });
+      return;
+    }
+    const requested = Number(body.qty);
+    const quantity =
+      Number.isSafeInteger(requested) && requested > 0 && requested <= source.quantity
+        ? requested
+        : source.quantity;
+    const containerID =
+      place.locationID !== null && place.locationID !== undefined
+        ? place.locationID
+        : source.locationID;
+    const outcome = await boundCall(
+      held,
+      req.webSessionID,
+      place.spec,
+      "MultiMerge",
+      [[[sourceItemID, destinationItemID, quantity]], containerID],
+      null,
+    );
+    // Re-read: the destination should have GROWN by the merged quantity.
+    const rowsAfter = await listPlace(held, req.webSessionID, place);
+    const destinationAfter = rowsAfter.find((row) => row.itemID === destinationItemID);
+    const applied = Boolean(destinationAfter) && destinationAfter.quantity > destination.quantity;
+    res.json({
+      ok: true,
+      applied,
+      merged: applied ? destinationAfter.quantity - destination.quantity : 0,
+      declinedSilently: !applied,
+      notifications: outcome.notifications,
+    });
+  } catch (error) {
+    if (sendPlaceError(res, error)) {
+      return;
+    }
+    next(error);
+  }
+});
+
+/**
+ * DESTROY items. This is irreversible, so — exactly as R12 fenced the rig
+ * destroy — the route refuses outright unless `confirm` is true, and the web UI
+ * puts a two-step confirm in front of that. TrashItems dispatches on the
+ * inventory MANAGER moniker, not on a per-container binding.
+ */
+app.post("/api/bridge/inventory/trash", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const body = req.body || {};
+  const itemIDs = (Array.isArray(body.itemIDs) ? body.itemIDs : [body.itemID])
+    .map((value) => Number(value) || 0)
+    .filter((value) => value > 0);
+  if (itemIDs.length === 0) {
+    res.status(400).json({ ok: false, error: "INVALID_TRASH", message: "At least one item is required." });
+    return;
+  }
+  if (body.confirm !== true) {
+    res.status(400).json({
+      ok: false,
+      error: "CONFIRMATION_REQUIRED",
+      message: "Trashing destroys these items permanently. This action must be confirmed explicitly.",
+    });
+    return;
+  }
+  try {
+    await readHeldFlight(held, req.webSessionID);
+    const place = await resolvePlace(held, req.webSessionID, body.place);
+    const rowsBefore = await listPlace(held, req.webSessionID, place);
+    const beforeIDs = new Set(rowsBefore.map((row) => row.itemID));
+    const present = itemIDs.filter((itemID) => beforeIDs.has(itemID));
+    if (present.length === 0) {
+      res.status(409).json({
+        ok: false,
+        error: "ITEMS_NOT_AT_SOURCE",
+        message: "Those items are no longer where the panel last saw them; refresh and try again.",
+      });
+      return;
+    }
+    const locationID =
+      place.locationID !== null && place.locationID !== undefined
+        ? place.locationID
+        : rowsBefore.find((row) => row.itemID === present[0]).locationID;
+    const outcome = await boundCall(
+      held,
+      req.webSessionID,
+      inventoryManagerBindSpec(held),
+      "TrashItems",
+      [present, locationID],
+      null,
+    );
+    // Re-read: the handler declines an untrashable item (an active ship, a
+    // locked corp asset) by returning without raising, so only the listing
+    // proves anything was destroyed.
+    const rowsAfter = await listPlace(held, req.webSessionID, place);
+    const afterIDs = new Set(rowsAfter.map((row) => row.itemID));
+    const destroyed = present.filter((itemID) => !afterIDs.has(itemID));
+    const survived = present.filter((itemID) => afterIDs.has(itemID));
+    res.json({
+      ok: true,
+      applied: destroyed.length > 0,
+      destroyed,
+      survived,
+      declinedSilently: survived.length > 0,
+      notifications: outcome.notifications,
+    });
+  } catch (error) {
+    if (sendPlaceError(res, error)) {
+      return;
+    }
+    next(error);
+  }
+});
+
+/**
+ * The corporation hangar: which office, what the seven divisions are CALLED,
+ * and what is in each one. Every division is read independently
+ * (Promise.allSettled) so a division the character lacks the query role for
+ * never blanks the rest — the server answers an empty list for those, and it
+ * stays authoritative. The client's own role check is cosmetic.
+ */
+app.get("/api/bridge/inventory/corp", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    await readHeldFlight(held, req.webSessionID);
+    const [officeSettled, corporationSettled] = await Promise.allSettled([
+      readCorpOffice(held, req.webSessionID),
+      heldTopLevelCall(held, req.webSessionID, "corpRegistry", "GetCorporation", [], null),
+    ]);
+    for (const settled of [officeSettled, corporationSettled]) {
+      if (settled.status === "rejected" && settled.reason && settled.reason.code === "SESSION_NOT_FOUND") {
+        next(settled.reason);
+        return;
+      }
+    }
+    const divisionNames =
+      corporationSettled.status === "fulfilled"
+        ? decodeDivisionNames(corporationSettled.value.result)
+        : {};
+    const officeID = officeSettled.status === "fulfilled" ? officeSettled.value : 0;
+    if (!officeID) {
+      res.json({
+        ok: true,
+        available: false,
+        // Not an error: plenty of characters simply have no corp office here.
+        reason:
+          officeSettled.status === "rejected"
+            ? String((officeSettled.reason && officeSettled.reason.code) || "READ_FAILED")
+            : "NO_CORP_OFFICE",
+        divisions: [],
+      });
+      return;
+    }
+    const spec = corpOfficeBindSpec(officeID);
+    const ordinals = [];
+    for (let division = 1; division <= CORP_DIVISION_COUNT; division += 1) {
+      ordinals.push(division);
+    }
+    const settledLists = await Promise.allSettled(
+      ordinals.map((division) =>
+        boundCall(held, req.webSessionID, spec, "List", [corpDivisionFlag(division)], null),
+      ),
+    );
+    for (const settled of settledLists) {
+      if (settled.status === "rejected" && settled.reason && settled.reason.code === "SESSION_NOT_FOUND") {
+        next(settled.reason);
+        return;
+      }
+    }
+    res.json({
+      ok: true,
+      available: true,
+      divisions: ordinals.map((division, index) => {
+        const settled = settledLists[index];
+        return {
+          division,
+          // The player-authored name; the browser falls back to "Division N"
+          // when a corporation never renamed it. A flag number is never shown.
+          name: divisionNames[division] || null,
+          list: settled.status === "fulfilled" ? settled.value.result : null,
+          error:
+            settled.status === "rejected"
+              ? String((settled.reason && settled.reason.code) || "READ_FAILED")
+              : null,
+        };
+      }),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Board a ship sitting in the station hangar (the retail
+// Moniker('ship',(stationID,groupStation)).Board(shipID, oldShipID)). On
+// success the newly boarded ship becomes the active ship for cargo reads.
+app.post("/api/bridge/ship/board", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const shipID = Number((req.body && req.body.shipID) || 0);
+  if (shipID <= 0) {
+    res.status(400).json({ ok: false, error: "INVALID_SHIP", message: "A positive shipID is required." });
+    return;
+  }
+  if (!await acquireRouteTransition(res, held, "board", { shipID })) {
+    return;
+  }
+  try {
+    const outcome = await boundCall(
+      held,
+      req.webSessionID,
+      shipBindSpec(held),
+      "Board",
+      [shipID, held.activeShipID || null],
+      null,
+    );
+    markTransitionAccepted(held);
+    const ready = await awaitRouteTransition(held, req.webSessionID, "board", { shipID });
+    if (!ready.ok) {
+      sendTransitionTimeout(res, ready, outcome.notifications);
+      return;
+    }
+    // Only an authoritative postcondition changes the active hull. The epoch
+    // already evicted all ship/dogma/inventory bindings.
+    held.activeShipID = Number(ready.flight.shipID) || null;
+    res.json({
+      ok: true,
+      activeShipID: held.activeShipID,
+      flight: { ...ready.flight, transition: ready.transition },
+      transition: ready.transition,
+      notifications: [...outcome.notifications, ...ready.notifications],
+    });
+  } catch (error) {
+    if (held.transition && held.transition.phase === "requested") {
+      cancelHeldTransition(held);
+    } else if (kind === "reconnect") {
+      outcome = await boundCall(
+        held,
+        req.webSessionID,
+        systemScanBindSpec(),
+        "ReconnectToLostProbes",
+        [],
+        null,
+      );
+    } else {
+      markTransitionFailed(held, error && error.message);
+    }
+    next(error);
+  }
+});
+
+// --- R12 Ship fitting -------------------------------------------------------
+// Fitting is NOT a dedicated service: it is the SAME bound-object two-step the
+// R3 inventory routes above drive, with a SLOT flag instead of the hangar (4) /
+// cargo (5) flag. So `fit` and `unfit` are literally invbroker.Add through the
+// same boundCall + handle cache, and this section adds no new bind machinery.
+//
+//   read  slots      ship binding . ListByFlags(<every slot flag>)
+//   read  resources  dogmaIM.ShipGetInfo()        [top level, no bind]
+//   read  online     dogmaIM.ShipOnlineModules()  [top level, no bind]
+//   fit              ship binding . Add(moduleID, sourceID, {flag:<slot>})
+//   unfit            hangar/ship binding . Add(moduleID, shipID, {flag:4|5})
+//   online/offline   dogmaIM.SetModuleOnline / TakeModuleOffline
+//   remove a rig     ship binding . DestroyFitting(rigID)  -- DESTRUCTIVE
+//
+// The browser NEVER sends a slot flagID. It addresses a slot by FAMILY and
+// INDEX ("the third high slot"), and this module is the only place that knows
+// the numbers — which is what keeps raw flagIDs out of browser JS entirely.
+
+// Slot flag families (inventorycommon/const.py; mirrored server-side by
+// services/fitting/liveFittingState.js SLOT_FAMILY_FLAGS).
+const SLOT_FAMILY_FLAGS = Object.freeze({
+  high: Object.freeze([27, 28, 29, 30, 31, 32, 33, 34]),
+  mid: Object.freeze([19, 20, 21, 22, 23, 24, 25, 26]),
+  low: Object.freeze([11, 12, 13, 14, 15, 16, 17, 18]),
+  rig: Object.freeze([92, 93, 94, 95, 96, 97, 98, 99]),
+  subsystem: Object.freeze([125, 126, 127, 128, 129, 130, 131, 132]),
+});
+// Deliberately the SERVER's ranges (rig 92-99, subsystem 125-132), which are
+// wider than the retail client's own lists (92-94 / 125-128). The server clamps
+// each family to the ship's actual slot count anyway, so reading the wider
+// range costs nothing and never misses a slot this server considers legal.
+const ALL_SLOT_FLAGS = Object.freeze([
+  ...SLOT_FAMILY_FLAGS.low,
+  ...SLOT_FAMILY_FLAGS.mid,
+  ...SLOT_FAMILY_FLAGS.high,
+  ...SLOT_FAMILY_FLAGS.rig,
+  ...SLOT_FAMILY_FLAGS.subsystem,
+]);
+// flag 0 is flagAutoFit: the SERVER picks the slot. The panel offers this as
+// "first free slot" so a player never has to think in slot numbers at all.
+const ITEM_FLAG_AUTO_FIT = 0;
+
+// The ship's resource attributes (CPU / powergrid / capacitor / calibration)
+// ride back in the raw ShipGetInfo result and are decoded browser side, like
+// every other retail-shaped read here — see web/src/bridge/fitting.ts for the
+// dogma attribute IDs and why the capacitor read is capacity-or-charge.
+
+// Resolve a browser-addressed slot ("high", index 2) to its flagID. `family`
+// "auto" (or a missing index) means let the server choose the slot.
+function resolveSlotFlag(family, index) {
+  if (family === "auto") {
+    return ITEM_FLAG_AUTO_FIT;
+  }
+  const flags = SLOT_FAMILY_FLAGS[family];
+  if (!flags) {
+    return null;
+  }
+  const numericIndex = Number(index);
+  if (!Number.isSafeInteger(numericIndex) || numericIndex < 0 || numericIndex >= flags.length) {
+    return null;
+  }
+  return flags[numericIndex];
+}
+
+// The whole fitting panel: what is in every slot, the ship's resource
+// attributes, and which modules are online. The three reads are INDEPENDENT
+// (Promise.allSettled) so one failed read never blanks the rest — R2's rule,
+// as the inventory and rewards routes apply it.
+app.get("/api/bridge/fitting", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    // Sync the held ship/station to the live position first, so the slot read
+    // binds the CURRENT active ship after a board or a dock elsewhere.
+    await readHeldFlight(held, req.webSessionID);
+    const shipID = held.activeShipID;
+    const noShip = () =>
+      Promise.reject(Object.assign(new Error("No active ship."), { code: "NO_ACTIVE_SHIP" }));
+    const [slots, shipInfo, online] = await Promise.allSettled([
+      shipID
+        ? boundCall(held, req.webSessionID, cargoBindSpec(held, shipID), "ListByFlags", [ALL_SLOT_FLAGS], null)
+        : noShip(),
+      shipID
+        ? heldTopLevelCall(held, req.webSessionID, "dogmaIM", "ShipGetInfo", [], null)
+        : noShip(),
+      shipID
+        ? heldTopLevelCall(held, req.webSessionID, "dogmaIM", "ShipOnlineModules", [], null)
+        : noShip(),
+    ]);
+
+    for (const settled of [slots, shipInfo, online]) {
+      if (settled.status === "rejected" && settled.reason && settled.reason.code === "SESSION_NOT_FOUND") {
+        next(settled.reason);
+        return;
+      }
+    }
+    const settledCode = (settled) =>
+      settled.status === "rejected"
+        ? String((settled.reason && settled.reason.code) || "READ_FAILED")
+        : null;
+    const settledValue = (settled) =>
+      settled.status === "fulfilled" ? settled.value.result : null;
+
+    res.json({
+      ok: true,
+      activeShipID: shipID,
+      stationID: held.stationID,
+      slots: settledValue(slots),
+      shipInfo: settledValue(shipInfo),
+      online: settledValue(online),
+      // What each fitted module TYPE will take: its charge size and the charge
+      // groups it accepts, from the same static dogma the volume lookup uses —
+      // no bridge call, no allowlist pair. ⚠ ADVISORY: a picker uses it to put
+      // likely charges first and must never HIDE one, because the server is the
+      // authority on what actually loads.
+      chargeFits: readModuleChargeFits(settledValue(slots)),
+      errors: {
+        slots: settledCode(slots),
+        shipInfo: settledCode(shipInfo),
+        online: settledCode(online),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Read just the slot rows — used to VERIFY a mutation actually landed. The
+// server can decline a fit SILENTLY (invbroker's SKILL_REQUIRED branch returns
+// null without raising a UserError), so a 200 from Add is not proof anything
+// moved. Every mutating route below re-reads and reports what really happened
+// rather than echoing an optimistic success.
+async function readFittedItemIDs(held, webSessionID, shipID) {
+  const outcome = await boundCall(
+    held,
+    webSessionID,
+    cargoBindSpec(held, shipID),
+    "ListByFlags",
+    [ALL_SLOT_FLAGS],
+    null,
+  );
+  return decodeFittedSlotMap(outcome.result);
+}
+
+// Decode an invbroker ListByFlags result to itemID -> flagID. Rows arrive as
+// packedrows (or, when empty, a python set wrapping an empty list).
+function decodeFittedSlotMap(result) {
+  let listValue = result;
+  if (listValue && listValue.type === "objectex1" && Array.isArray(listValue.header)) {
+    const token = listValue.header[0];
+    if (token && token.value === "__builtin__.set" && Array.isArray(listValue.header[1])) {
+      listValue = listValue.header[1][0] ?? null;
+    }
+  } else if (listValue && listValue.type === "object" && Array.isArray(listValue.args)) {
+    listValue = listValue.args[0] ?? null;
+  }
+  const items =
+    listValue && listValue.type === "list" && Array.isArray(listValue.items) ? listValue.items : [];
+  const byItemID = new Map();
+  for (const item of items) {
+    const fields = item && item.type === "packedrow" && item.fields ? item.fields : item;
+    if (!fields || typeof fields !== "object") {
+      continue;
+    }
+    const itemID = Number(fields.itemID) || 0;
+    if (itemID > 0) {
+      byItemID.set(itemID, Number(fields.flagID) || 0);
+    }
+  }
+  return byItemID;
+}
+
+/**
+ * Did a fit land? The named itemID is checked first, then — because fitting a
+ * unit out of a STACK mints a new row the caller cannot predict — whether any
+ * slot that was empty before is occupied now.
+ *
+ * Both maps are itemID -> flagID, so "a slot filled" is read as a flagID that
+ * was not present before. This is the same mint-at-destination problem the
+ * inventory transfer route hits with wreck loot, answered the same way: judge
+ * the OUTCOME, never the identity of the row.
+ */
+function fitLanded(before, after, itemID) {
+  if (after.has(itemID)) {
+    return true;
+  }
+  const occupiedBefore = new Set(before.values());
+  for (const flagID of after.values()) {
+    if (!occupiedBefore.has(flagID)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Fit a module from the station hangar or the ship's own cargo into a slot.
+// The bound object is the SHIP (the destination); the source location is the
+// station when fitting from the hangar and the ship when fitting from cargo.
+app.post("/api/bridge/fitting/fit", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const body = req.body || {};
+  const itemID = Number(body.itemID) || 0;
+  const source = String(body.source || "hangar");
+  const family = String(body.family || "auto");
+  const slotFlag = resolveSlotFlag(family, body.index);
+  if (itemID <= 0 || slotFlag === null || (source !== "hangar" && source !== "cargo")) {
+    res.status(400).json({
+      ok: false,
+      error: "INVALID_FIT",
+      message: "A module, a source of 'hangar' or 'cargo', and a real slot are required.",
+    });
+    return;
+  }
+  const shipID = held.activeShipID;
+  if (!shipID) {
+    res.status(409).json({ ok: false, error: "NO_ACTIVE_SHIP", message: "No active ship to fit to." });
+    return;
+  }
+  try {
+    // The slots BEFORE, so a fit that arrives under a new itemID is still
+    // recognised. Fitting ONE module out of a STACK peels a unit off and mints
+    // a fresh row: measured live, fitting two turrets from a stack of three
+    // produced ids the caller had never seen while the stack fell 3 -> 1, and
+    // judging by `fitted.has(itemID)` called both successful fits a failure.
+    const before = await readFittedItemIDs(held, req.webSessionID, shipID);
+    const outcome = await boundCall(
+      held,
+      req.webSessionID,
+      cargoBindSpec(held, shipID),
+      "Add",
+      [itemID, source === "cargo" ? shipID : held.stationID],
+      { qty: 1, flag: slotFlag },
+    );
+    // Verify: a silent decline is indistinguishable from success at the call
+    // seam, so the answer is what the SLOTS say afterwards.
+    const fitted = await readFittedItemIDs(held, req.webSessionID, shipID);
+    res.json({
+      ok: true,
+      applied: fitLanded(before, fitted, itemID),
+      notifications: outcome.notifications,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Unfit a module back to the station hangar (docked) or the ship's cargo. The
+// same Add, reversed: the DESTINATION container is the bound object, the ship
+// is the source location, and the flag is the hangar/cargo flag.
+app.post("/api/bridge/fitting/unfit", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const body = req.body || {};
+  const itemID = Number(body.itemID) || 0;
+  const destination = String(body.destination || "hangar");
+  if (itemID <= 0 || (destination !== "hangar" && destination !== "cargo")) {
+    res.status(400).json({
+      ok: false,
+      error: "INVALID_UNFIT",
+      message: "A module and a destination of 'hangar' or 'cargo' are required.",
+    });
+    return;
+  }
+  const shipID = held.activeShipID;
+  if (!shipID) {
+    res.status(409).json({ ok: false, error: "NO_ACTIVE_SHIP", message: "No active ship to unfit from." });
+    return;
+  }
+  const destSpec =
+    destination === "cargo" ? cargoBindSpec(held, shipID) : hangarBindSpec(held);
+  try {
+    const outcome = await boundCall(
+      held,
+      req.webSessionID,
+      destSpec,
+      "Add",
+      [itemID, shipID],
+      { qty: 1, flag: destination === "cargo" ? ITEM_FLAG_CARGO_HOLD : ITEM_FLAG_HANGAR },
+    );
+    const fitted = await readFittedItemIDs(held, req.webSessionID, shipID);
+    res.json({
+      ok: true,
+      applied: !fitted.has(itemID),
+      notifications: outcome.notifications,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Bring a fitted module online or take it offline. Top-level dogmaIM calls: the
+// handler resolves the ship from the session. The handler ALSO owns the CPU /
+// powergrid / capacitor gating, and answers a refusal with its own reason
+// ("You do not have enough CPU to online that module.") — which arrives here as
+// a typed CALL_REFUSED and is passed through untouched. The BFF never
+// pre-judges whether a module can be onlined.
+app.post("/api/bridge/fitting/state", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const body = req.body || {};
+  const itemID = Number(body.itemID) || 0;
+  const online = body.online === true;
+  if (itemID <= 0) {
+    res.status(400).json({ ok: false, error: "INVALID_MODULE", message: "A module is required." });
+    return;
+  }
+  const shipID = held.activeShipID;
+  if (!shipID) {
+    res.status(409).json({ ok: false, error: "NO_ACTIVE_SHIP", message: "No active ship." });
+    return;
+  }
+  try {
+    const outcome = await heldTopLevelCall(
+      held,
+      req.webSessionID,
+      "dogmaIM",
+      online ? "SetModuleOnline" : "TakeModuleOffline",
+      [shipID, itemID],
+      null,
+    );
+    res.json({ ok: true, online, notifications: outcome.notifications });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// DESTROY a fitted rig. Rigs cannot be unfitted — removing one destroys it —
+// so this route is the only destructive fitting action, and it refuses unless
+// the caller explicitly confirms. That is a second gate behind the web UI's own
+// two-step confirmation: neither a stray click nor a stray POST can lose a rig.
+app.post("/api/bridge/fitting/destroy-rig", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const body = req.body || {};
+  const itemID = Number(body.itemID) || 0;
+  if (itemID <= 0) {
+    res.status(400).json({ ok: false, error: "INVALID_MODULE", message: "A rig is required." });
+    return;
+  }
+  if (body.confirm !== true) {
+    res.status(400).json({
+      ok: false,
+      error: "CONFIRMATION_REQUIRED",
+      message: "Removing a rig destroys it. This action must be confirmed explicitly.",
+    });
+    return;
+  }
+  const shipID = held.activeShipID;
+  if (!shipID) {
+    res.status(409).json({ ok: false, error: "NO_ACTIVE_SHIP", message: "No active ship." });
+    return;
+  }
+  try {
+    // Only a RIG may go through this route: the server refuses a non-rig
+    // anyway, but checking here means a mis-aimed call is a clear 400 rather
+    // than a silent no-op the player has to infer from the panel.
+    const before = await readFittedItemIDs(held, req.webSessionID, shipID);
+    const flagID = before.get(itemID);
+    if (flagID === undefined || !SLOT_FAMILY_FLAGS.rig.includes(flagID)) {
+      res.status(400).json({
+        ok: false,
+        error: "NOT_A_RIG",
+        message: "That module is not a rig on the active ship; unfit it instead.",
+      });
+      return;
+    }
+    const outcome = await boundCall(
+      held,
+      req.webSessionID,
+      cargoBindSpec(held, shipID),
+      "DestroyFitting",
+      [itemID],
+      null,
+    );
+    const after = await readFittedItemIDs(held, req.webSessionID, shipID);
+    res.json({
+      ok: true,
+      applied: !after.has(itemID),
+      notifications: outcome.notifications,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// --- R15 Industry (blueprints / jobs / facilities) -------------------------
+// Unlike every panel before it, industry needs NO bound-object machinery: the
+// whole retail surface is TOP-LEVEL (sm.RemoteSvc('blueprintManager') /
+// ('industryManager') / ('facilityManager')), so heldTopLevelCall carries all
+// of it. See docs/bridge-wire-contract.md for the call table.
+//
+// The split between live calls and static data:
+//   LIVE  — the player's own blueprint INSTANCES (material/time efficiency,
+//           runs left, where they sit, whether one is busy in a job), their
+//           JOBS, their used job slots, and the FACILITIES their region offers
+//           with each one's tax and supported activities.
+//   STATIC — every NAME and every recipe: what a blueprint is called, what it
+//           produces, what each activity consumes and how long it takes, and
+//           what a facility/solar system is called. None of that changes with
+//           the player, so it never needs a round-trip.
+
+app.get("/api/bridge/industry", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    // Sync held station/system to the live position first, so the facility
+    // read reflects where the character actually is.
+    await readHeldFlight(held, req.webSessionID);
+    const ownerID = held.characterID;
+    // Five INDEPENDENT reads (R2's rule): one failure never blanks the rest.
+    // A player with no facilities in range should still see their blueprints.
+    const [blueprints, jobs, jobCounts, facilities, modifiers] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "blueprintManager", "GetBlueprintDataByOwner", [ownerID, null], null),
+      // includeCompleted=true: the panel shows finished work alongside running
+      // work, and filters client-side by the status the SERVER computed.
+      heldTopLevelCall(held, req.webSessionID, "industryManager", "GetJobsByOwner", [ownerID, true], null),
+      heldTopLevelCall(held, req.webSessionID, "industryManager", "GetJobCounts", [ownerID], null),
+      heldTopLevelCall(held, req.webSessionID, "facilityManager", "GetFacilities", [], null),
+      heldTopLevelCall(held, req.webSessionID, "facilityManager", "GetMaxActivityModifiers", [], null),
+    ]);
+
+    for (const settled of [blueprints, jobs, jobCounts, facilities, modifiers]) {
+      if (settled.status === "rejected" && settled.reason && settled.reason.code === "SESSION_NOT_FOUND") {
+        next(settled.reason);
+        return;
+      }
+    }
+
+    const settledCode = (settled) =>
+      settled.status === "rejected"
+        ? String((settled.reason && settled.reason.code) || "READ_FAILED")
+        : null;
+    const settledValue = (settled) =>
+      settled.status === "fulfilled" ? settled.value.result : null;
+
+    res.json({
+      ok: true,
+      ownerID,
+      stationID: held.stationID,
+      solarSystemID: held.solarSystemID ?? null,
+      blueprints: { result: settledValue(blueprints), error: settledCode(blueprints) },
+      jobs: { result: settledValue(jobs), error: settledCode(jobs) },
+      jobCounts: { result: settledValue(jobCounts), error: settledCode(jobCounts) },
+      facilities: { result: settledValue(facilities), error: settledCode(facilities) },
+      activityModifiers: { result: settledValue(modifiers), error: settledCode(modifiers) },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// --- R15 Industry mutations (install / deliver / cancel) --------------------
+//
+// The browser names an ACTIVITY, never an activityID — the same rule R14 used
+// for inventory places and R12 for slot families. This map is the only place
+// the number exists on the BFF, and it never crosses the wire in either
+// direction.
+const INDUSTRY_ACTIVITY_IDS = Object.freeze({
+  manufacturing: 1,
+  research_time: 3,
+  research_material: 4,
+  copying: 5,
+  invention: 8,
+  reaction: 9,
+});
+// industry job status codes, for judging what a mutation actually did.
+const INDUSTRY_STATUS_DELIVERED = 101;
+const INDUSTRY_STATUS_CANCELLED = 102;
+// Retail's own ceiling on a single job; a runs value beyond it is a typo, and
+// rejecting it here makes that a clear 400 instead of a server refusal.
+const INDUSTRY_MAX_RUNS = 1_000_000;
+
+/**
+ * Resolve the input/output hangars an install will use.
+ *
+ * `GetFacilityLocations(facilityID, ownerID)` answers the CHOICES; the input
+ * must be one the character may TAKE from. Passing a location explicitly is
+ * optional — the server falls back to the first usable one — but resolving it
+ * here means the preview and the install agree about where the materials are
+ * coming from, which is the whole point of showing the player a preview.
+ *
+ * ⚠ The fields live in `header[2]` as {type:"dict", entries:[...]}, NOT in the
+ * top-level `dict` (which is empty). See docs/bridge-wire-contract.md.
+ */
+function decodeFacilityLocationChoices(result) {
+  const items = result && Array.isArray(result.items) ? result.items : [];
+  const choices = [];
+  for (const item of items) {
+    if (!item || item.type !== "objectex1" || !Array.isArray(item.header)) {
+      continue;
+    }
+    const stateDict = item.header[2];
+    const entries = stateDict && Array.isArray(stateDict.entries) ? stateDict.entries : [];
+    const fields = {};
+    for (const entry of entries) {
+      if (Array.isArray(entry) && typeof entry[0] === "string") {
+        fields[entry[0]] = entry[1];
+      }
+    }
+    const itemID = Number(fields.itemID) || 0;
+    if (itemID > 0) {
+      choices.push({
+        itemID,
+        typeID: Number(fields.typeID) || 0,
+        ownerID: Number(fields.ownerID) || 0,
+        flagID: Number(fields.flagID) || 0,
+        solarSystemID: Number(fields.solarSystemID) || 0,
+        canView: fields.canView !== false,
+        canTake: fields.canTake !== false,
+      });
+    }
+  }
+  return choices;
+}
+
+async function readIndustryLocations(held, webSessionID, facilityID) {
+  const outcome = await heldTopLevelCall(
+    held,
+    webSessionID,
+    "facilityManager",
+    "GetFacilityLocations",
+    [facilityID, held.characterID],
+    null,
+  );
+  const choices = decodeFacilityLocationChoices(outcome.result);
+  return {
+    choices,
+    // The input must be takeable; the output need not be.
+    input: choices.find((choice) => choice.canTake !== false) || choices[0] || null,
+    output: choices[0] || null,
+  };
+}
+
+/**
+ * The InstallJob payload — ONE POSITIONAL DICT, the shape
+ * `industry.Job.dump()` produces and `parseIndustryRequest` reads.
+ *
+ * ⚠ WHAT THE SERVER ACTUALLY READS. It recomputes materials, time and cost
+ * from the blueprint definition plus the facility's modifiers, so `cost` /
+ * `tax` / `time` / `materials` here are ADVISORY — sending them wrong does not
+ * change what gets charged, and sending them right does not make them
+ * authoritative. The fields that genuinely decide the outcome are
+ * `blueprintID`, `activityID`, `facilityID`, `runs` (plus `licensedRuns` for
+ * copying, `productTypeID` for invention, and the two locations). They are all
+ * sent anyway because the shape is the retail one and a partial dict is a
+ * worse contract than a complete one.
+ */
+function buildInstallJobPayload(held, request) {
+  return {
+    blueprintID: request.blueprintItemID,
+    blueprintTypeID: request.blueprintTypeID || 0,
+    activityID: request.activityID,
+    facilityID: request.facilityID,
+    solarSystemID: held.solarSystemID || 0,
+    characterID: held.characterID,
+    corporationID: 0,
+    // Personal industry only: the wallet charge takes the character path, for
+    // which `account` is unused. A corporation install would need the
+    // (ownerID, walletKey) pair here.
+    account: null,
+    runs: request.runs,
+    licensedRuns: request.licensedRuns,
+    cost: 0,
+    tax: 0,
+    time: 0,
+    materials: {},
+    inputLocation: request.inputLocation,
+    outputLocation: request.outputLocation,
+    productTypeID: request.productTypeID || 0,
+    optionalTypeID: null,
+    optionalTypeID2: null,
+  };
+}
+
+/**
+ * Validate the browser's install/preview request. Returns a normalized request
+ * or null (having already answered a 400).
+ */
+function normalizeIndustryRequest(req, res) {
+  const body = req.body || {};
+  const blueprintItemID = Number(body.blueprintItemID) || 0;
+  const facilityID = Number(body.facilityID) || 0;
+  const runs = Number(body.runs) || 0;
+  const activity = String(body.activity || "");
+  const activityID = INDUSTRY_ACTIVITY_IDS[activity] || 0;
+  if (blueprintItemID <= 0) {
+    res.status(400).json({
+      ok: false,
+      error: "INVALID_BLUEPRINT",
+      message: "A blueprint is required.",
+    });
+    return null;
+  }
+  if (activityID <= 0) {
+    res.status(400).json({
+      ok: false,
+      error: "INVALID_ACTIVITY",
+      message: "A known kind of industry work is required.",
+    });
+    return null;
+  }
+  if (facilityID <= 0) {
+    res.status(400).json({
+      ok: false,
+      error: "INVALID_FACILITY",
+      message: "A facility to do the work at is required.",
+    });
+    return null;
+  }
+  if (!Number.isSafeInteger(runs) || runs <= 0 || runs > INDUSTRY_MAX_RUNS) {
+    res.status(400).json({
+      ok: false,
+      error: "INVALID_RUNS",
+      message: "A positive number of runs is required.",
+    });
+    return null;
+  }
+  const licensedRuns = Number(body.licensedRuns) || 1;
+  return {
+    blueprintItemID,
+    blueprintTypeID: Number(body.blueprintTypeID) || 0,
+    activity,
+    activityID,
+    facilityID,
+    runs,
+    licensedRuns: licensedRuns > 0 ? licensedRuns : 1,
+    productTypeID: Number(body.productTypeID) || 0,
+  };
+}
+
+/**
+ * The install PREVIEW: what the player actually HAS of each material this job
+ * would consume, straight from the server.
+ *
+ * `industryMonitor.ConnectJob` is retail's own preview seam. It is NOT a pure
+ * read — it persists a monitor row — so this route always releases the monitor
+ * it opened, whatever happens.
+ *
+ * ⚠ WHAT THIS CANNOT TELL THE PLAYER: the installation FEE. No allowlisted
+ * retail call quotes a cost without also installing the job, so the ISK figure
+ * genuinely cannot be previewed. The panel says so plainly rather than showing
+ * an invented estimate, and the install response reports the cost the server
+ * actually charged.
+ */
+app.post("/api/bridge/industry/preview", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const request = normalizeIndustryRequest(req, res);
+  if (!request) {
+    return;
+  }
+  let monitorID = 0;
+  try {
+    await readHeldFlight(held, req.webSessionID);
+    const locations = await readIndustryLocations(held, req.webSessionID, request.facilityID);
+    const payload = buildInstallJobPayload(held, {
+      ...request,
+      inputLocation: locations.input,
+      outputLocation: locations.output,
+    });
+    const outcome = await heldTopLevelCall(
+      held,
+      req.webSessionID,
+      "industryMonitor",
+      "ConnectJob",
+      [payload],
+      null,
+    );
+    // [monitorID, dict<typeID -> availableQuantity>]
+    const result = Array.isArray(outcome.result) ? outcome.result : [];
+    monitorID = Number(result[0]) || 0;
+    const dict = result[1];
+    const entries = dict && Array.isArray(dict.entries) ? dict.entries : [];
+    const available = {};
+    for (const entry of entries) {
+      if (Array.isArray(entry)) {
+        available[String(Number(entry[0]) || 0)] = Number(entry[1]) || 0;
+      }
+    }
+    res.json({
+      ok: true,
+      available,
+      inputLocation: locations.input,
+      outputLocation: locations.output,
+      notifications: outcome.notifications,
+    });
+  } catch (error) {
+    next(error);
+  } finally {
+    if (monitorID > 0) {
+      // Best-effort release: a leaked monitor row is harmless but untidy, and
+      // failing to release must never turn a good preview into an error.
+      try {
+        await heldTopLevelCall(
+          held,
+          req.webSessionID,
+          "industryMonitor",
+          "DisconnectJob",
+          [monitorID],
+          null,
+        );
+      } catch {
+        // Ignored on purpose (see above).
+      }
+    }
+  }
+});
+
+/**
+ * INSTALL a job. This CONSUMES MATERIALS out of a hangar and CHARGES THE
+ * WALLET, so the route refuses outright without an explicit `confirm: true` —
+ * the second gate behind the UI's two-step confirm, exactly as `destroy-rig`
+ * (R12) and `trash` (R14) are fenced.
+ *
+ * The R12/R14 lesson applies: a 200 is not proof. The route re-reads the job
+ * AND the blueprint and reports what actually applied.
+ */
+app.post("/api/bridge/industry/install", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const request = normalizeIndustryRequest(req, res);
+  if (!request) {
+    return;
+  }
+  if ((req.body || {}).confirm !== true) {
+    res.status(400).json({
+      ok: false,
+      error: "CONFIRMATION_REQUIRED",
+      message:
+        "Installing a job spends materials and charges an installation fee. This action must be confirmed explicitly.",
+    });
+    return;
+  }
+  try {
+    await readHeldFlight(held, req.webSessionID);
+    const locations = await readIndustryLocations(held, req.webSessionID, request.facilityID);
+    const payload = buildInstallJobPayload(held, {
+      ...request,
+      inputLocation: locations.input,
+      outputLocation: locations.output,
+    });
+    const outcome = await heldTopLevelCall(
+      held,
+      req.webSessionID,
+      "industryManager",
+      "InstallJob",
+      [payload],
+      null,
+    );
+    const jobID = Number(outcome.result) || 0;
+    if (jobID <= 0) {
+      // A SILENT DECLINE: the handler answered without raising and without
+      // starting a job. Saying exactly that is honest; naming a cause would be
+      // a guess, and the server did not give one.
+      res.json({
+        ok: true,
+        applied: false,
+        declinedSilently: true,
+        jobID: null,
+        job: null,
+        blueprint: null,
+        notifications: outcome.notifications,
+      });
+      return;
+    }
+    // Re-read BOTH: the job proves it exists and carries the cost the server
+    // really charged, and the blueprint proves it is now locked into that job.
+    const [jobSettled, blueprintSettled] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "industryManager", "GetJob", [jobID], null),
+      heldTopLevelCall(
+        held,
+        req.webSessionID,
+        "blueprintManager",
+        "GetBlueprintData",
+        [request.blueprintItemID],
+        null,
+      ),
+    ]);
+    res.json({
+      ok: true,
+      applied: true,
+      declinedSilently: false,
+      jobID,
+      job: jobSettled.status === "fulfilled" ? jobSettled.value.result : null,
+      blueprint: blueprintSettled.status === "fulfilled" ? blueprintSettled.value.result : null,
+      notifications: outcome.notifications,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * DELIVER a finished job (`CompleteJob(jobID, solarSystemID)`) — this is what
+ * hands the products over. Not gated behind a confirm: it only ever gives the
+ * player something.
+ *
+ * `applied` comes from the RE-READ, not from the response: a job that was not
+ * ready, or that another client already delivered, can come back without the
+ * status having moved.
+ */
+app.post("/api/bridge/industry/deliver", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const jobID = Number((req.body || {}).jobID) || 0;
+  if (jobID <= 0) {
+    res.status(400).json({ ok: false, error: "INVALID_JOB", message: "A job is required." });
+    return;
+  }
+  try {
+    await readHeldFlight(held, req.webSessionID);
+    const outcome = await heldTopLevelCall(
+      held,
+      req.webSessionID,
+      "industryManager",
+      "CompleteJob",
+      [jobID, held.solarSystemID || 0],
+      null,
+    );
+    const after = await heldTopLevelCall(
+      held,
+      req.webSessionID,
+      "industryManager",
+      "GetJob",
+      [jobID],
+      null,
+    );
+    const status = readIndustryJobStatus(after.result);
+    const applied = status === INDUSTRY_STATUS_DELIVERED;
+    res.json({
+      ok: true,
+      applied,
+      declinedSilently: !applied,
+      jobID,
+      job: after.result,
+      notifications: outcome.notifications,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * CANCEL a job. Cancelling stops the work and returns the blueprint, but
+ * refunds NEITHER the materials NOR the installation fee — both stay spent —
+ * so it is fenced behind the same explicit `confirm: true` the install is, and
+ * the UI says what will be lost before asking.
+ */
+app.post("/api/bridge/industry/cancel", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const body = req.body || {};
+  const jobID = Number(body.jobID) || 0;
+  if (jobID <= 0) {
+    res.status(400).json({ ok: false, error: "INVALID_JOB", message: "A job is required." });
+    return;
+  }
+  if (body.confirm !== true) {
+    res.status(400).json({
+      ok: false,
+      error: "CONFIRMATION_REQUIRED",
+      message:
+        "Cancelling a job does not return its materials or its installation fee. This action must be confirmed explicitly.",
+    });
+    return;
+  }
+  try {
+    await readHeldFlight(held, req.webSessionID);
+    const outcome = await heldTopLevelCall(
+      held,
+      req.webSessionID,
+      "industryManager",
+      "CancelJob",
+      [jobID, held.solarSystemID || 0],
+      null,
+    );
+    const after = await heldTopLevelCall(
+      held,
+      req.webSessionID,
+      "industryManager",
+      "GetJob",
+      [jobID],
+      null,
+    );
+    const applied = readIndustryJobStatus(after.result) === INDUSTRY_STATUS_CANCELLED;
+    res.json({
+      ok: true,
+      applied,
+      declinedSilently: !applied,
+      jobID,
+      job: after.result,
+      notifications: outcome.notifications,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// --- R16 Market (order books, own orders, transactions, escrow) ------------
+//
+// ⚠ THE SERVICE IS "marketProxy". EveJS registers TWO market services and the
+// obvious name is the wrong one: `market` (marketService.js) is a DEAD STUB
+// whose every method answers an empty rowset. `marketProxy`
+// (marketProxyService.js) is the real implementation — daemon-backed order
+// books, escrow, broker fees, real wallet debits. Calling `market` would give
+// the player a market page that renders perfectly and is permanently empty.
+// Every call below names marketProxy; the gateway allowlist refuses `market`.
+//
+// ⚠ THERE IS NO SERVER `marketQuote`. Sorting, jump filtering, best-bid
+// matching and skill-gated order limits are CLIENT-side in retail, so they are
+// client-side here too (web/src/bridge/market.ts). Do not go looking for a
+// call.
+//
+// ⚠ AN EXTERNAL DAEMON BACKS THIS. marketProxy talks to a market daemon over
+// TCP 127.0.0.1:40111. When it is down, reads THROW rather than answering
+// empty — which is what lets this route tell the browser "the market is not
+// answering" instead of "nobody is trading this item". The two are different
+// facts and the panel says which one happened.
+//
+// Like industry, market needs NO bound-object machinery: the whole surface is
+// top-level (sm.ProxySvc('marketProxy')), so heldTopLevelCall carries it all.
+//
+// SCOPE, and why the browser cannot widen it: every read below is scoped by the
+// SESSION the gateway materialized — region for the order book, character for
+// the own-orders/transactions/escrow reads. The only argument any of them takes
+// is a typeID. There is no owner parameter to tamper with.
+
+/**
+ * The daemon-outage code, told apart from an ordinary read failure so the panel
+ * can say something true about which one happened.
+ */
+function isMarketUnavailable(error) {
+  const text = String((error && (error.message || error.detail)) || "");
+  return text.includes("MarketUnavailable") || text.includes("market daemon");
+}
+
+app.get("/api/bridge/market", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  // A typeID is OPTIONAL: the player's own orders, transactions and escrow are
+  // worth showing before they have picked an item to look at.
+  const typeID = Number(req.query.typeID) || 0;
+  try {
+    // Sync the held station/system to the live position first: the order book's
+    // `jumps` column is computed from where the character actually is.
+    await readHeldFlight(held, req.webSessionID);
+
+    // Six INDEPENDENT reads (R2's rule): one failure never blanks the rest. A
+    // player whose order book fails to load still sees their own orders and
+    // their ISK.
+    const [book, ownOrders, history, transactions, escrow, balance, priceHistory] =
+      await Promise.allSettled([
+        typeID > 0
+          ? heldTopLevelCall(held, req.webSessionID, "marketProxy", "GetOrders", [typeID], null)
+          : Promise.resolve({ result: null }),
+        heldTopLevelCall(held, req.webSessionID, "marketProxy", "GetCharOrders", [], null),
+        heldTopLevelCall(held, req.webSessionID, "marketProxy", "GetMarketOrderHistory", [], null),
+        // fromDate 0 = everything the server still keeps.
+        heldTopLevelCall(held, req.webSessionID, "marketProxy", "CharGetTransactions", [0], null),
+        heldTopLevelCall(held, req.webSessionID, "marketProxy", "GetCharEscrow", [], null),
+        // Already allowlisted since R6. The wallet sits beside the order book
+        // so the player can see what they have before they spend it.
+        heldTopLevelCall(held, req.webSessionID, "account", "GetCashBalance", [0], null),
+        typeID > 0
+          ? heldTopLevelCall(held, req.webSessionID, "marketProxy", "GetNewPriceHistory", [typeID], null)
+          : Promise.resolve({ result: null }),
+      ]);
+
+    const settled = [book, ownOrders, history, transactions, escrow, balance, priceHistory];
+    for (const entry of settled) {
+      if (entry.status === "rejected" && entry.reason && entry.reason.code === "SESSION_NOT_FOUND") {
+        next(entry.reason);
+        return;
+      }
+    }
+
+    const codeOf = (entry) =>
+      entry.status === "rejected"
+        ? String((entry.reason && entry.reason.code) || "READ_FAILED")
+        : null;
+    const valueOf = (entry) => (entry.status === "fulfilled" ? entry.value.result : null);
+
+    // ⚠ The daemon-outage signal, extracted ONCE across every read: if the
+    // market itself is not answering, saying "you have no orders" would be a
+    // lie. The panel gets told which it is.
+    const outage = settled.find(
+      (entry) => entry.status === "rejected" && isMarketUnavailable(entry.reason),
+    );
+
+    res.json({
+      ok: true,
+      typeID: typeID > 0 ? typeID : null,
+      characterID: held.characterID,
+      stationID: held.stationID,
+      solarSystemID: held.solarSystemID ?? null,
+      book: { result: valueOf(book), error: codeOf(book) },
+      ownOrders: { result: valueOf(ownOrders), error: codeOf(ownOrders) },
+      orderHistory: { result: valueOf(history), error: codeOf(history) },
+      transactions: { result: valueOf(transactions), error: codeOf(transactions) },
+      escrow: { result: valueOf(escrow), error: codeOf(escrow) },
+      cashBalance: { result: valueOf(balance), error: codeOf(balance) },
+      priceHistory: { result: valueOf(priceHistory), error: codeOf(priceHistory) },
+      marketUnavailable: outage
+        ? "The market is not answering right now, so these figures may be incomplete."
+        : null,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// --- R16 Market mutations (place buy / place sell / cancel / modify) -------
+//
+// ⚠ THIS IS THE FIRST FEATURE THAT SPENDS THE PLAYER'S ISK. Every route below
+// runs a handler that calls debitCharacterWallet / creditCharacterWallet for
+// real, writes escrow records, and charges a broker's fee and an SCC
+// surcharge. So all four are fenced the way R12's destroy-rig, R14's trash and
+// R15's install are: NO route acts without an explicit `confirm: true`, and the
+// web UI puts a two-step confirm in front of that showing the item, price x
+// quantity, the ESTIMATED broker's fee and the player's current ISK.
+//
+// ⚠ AND A 200 IS NOT PROOF (the R12/R14/R15 lesson). Every route below re-reads
+// the WALLET before and after and reports the difference, plus re-reads the
+// player's own orders. `charged` is that difference and nothing else — it is
+// the only authoritative statement about what an order cost, and it is what the
+// panel shows. The client's estimated fee never appears in a response.
+
+// Retail's own ceiling (marketRules.MARKET_MAX_ORDER_PRICE): the ISK value at
+// which the underlying scaled 64-bit representation overflows. Rejected here so
+// a typo is a clear 400 instead of an opaque server refusal.
+const MARKET_MAX_ORDER_PRICE = 9_223_372_036_854;
+// The durations the server accepts (marketRules.ALLOWED_DURATIONS). 0 means
+// "fill immediately or not at all" and creates no standing order.
+const MARKET_ALLOWED_DURATIONS = new Set([0, 1, 3, 7, 14, 30, 90]);
+// Order range sentinels. -1 = this station only; that is the default because a
+// wider range is skill-gated and the server refuses one the character has not
+// trained for.
+const MARKET_RANGE_STATION = -1;
+
+/** Round to 2dp exactly as the server's `roundIsk` does. */
+function roundMarketPrice(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return 0;
+  }
+  return Math.round(numeric * 100) / 100;
+}
+
+/**
+ * Read the character's ISK. Used BEFORE and AFTER every write, because the
+ * difference between the two is the only honest answer to "what did that
+ * cost?" — the server's own fee arithmetic is not exposed by any allowlisted
+ * read, and the client's estimate is an estimate.
+ */
+async function readMarketBalance(held, webSessionID) {
+  try {
+    const outcome = await heldTopLevelCall(
+      held,
+      webSessionID,
+      "account",
+      "GetCashBalance",
+      [0],
+      null,
+    );
+    return marketAmountString(outcome.result);
+  } catch {
+    // A wallet read that fails leaves `charged` null, which the panel reports
+    // as "the server did not report a wallet change" rather than as a number.
+    return null;
+  }
+}
+
+/** An amount as a bigint-safe decimal string; null when absent/malformed. */
+function marketAmountString(value) {
+  if (value && typeof value === "object" && value.type === "long") {
+    return String(value.value);
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return String(value);
+  }
+  if (typeof value === "string" && /^-?\d+(\.\d+)?$/.test(value)) {
+    return value;
+  }
+  return null;
+}
+
+/**
+ * before - after, in exact hundredths. Positive = taken from the player,
+ * negative = returned to them. Goes through BigInt, never a float: ISK exceeds
+ * 2^53 and a float subtraction at that magnitude loses ISK.
+ */
+function marketIskDelta(before, after) {
+  if (before === null || after === null) {
+    return null;
+  }
+  const hundredths = (text) => {
+    const match = /^(-?)(\d*)(?:\.(\d*))?$/.exec(String(text).trim());
+    if (!match) {
+      return null;
+    }
+    const frac = (match[3] || "").padEnd(2, "0").slice(0, 2);
+    const value = BigInt(`${match[2] || "0"}${frac}`);
+    return match[1] === "-" ? -value : value;
+  };
+  const left = hundredths(before);
+  const right = hundredths(after);
+  if (left === null || right === null) {
+    return null;
+  }
+  const diff = left - right;
+  const negative = diff < 0n;
+  const magnitude = negative ? -diff : diff;
+  return `${negative ? "-" : ""}${(magnitude / 100n).toString()}.${(magnitude % 100n)
+    .toString()
+    .padStart(2, "0")}`;
+}
+
+/** The confirm gate every market write sits behind. */
+function requireMarketConfirmation(req, res, message) {
+  if ((req.body || {}).confirm === true) {
+    return true;
+  }
+  res.status(400).json({
+    ok: false,
+    error: "CONFIRMATION_REQUIRED",
+    message,
+  });
+  return false;
+}
+
+/**
+ * Validate a price the way the retail client does BEFORE dispatch: round to
+ * 2dp, and reject anything above the market ceiling. Returns the rounded price,
+ * or null having already answered a 400.
+ */
+function normalizeMarketPrice(req, res) {
+  const raw = Number((req.body || {}).price);
+  if (!Number.isFinite(raw) || raw <= 0) {
+    res.status(400).json({
+      ok: false,
+      error: "INVALID_PRICE",
+      message: "A price above zero is required.",
+    });
+    return null;
+  }
+  if (raw > MARKET_MAX_ORDER_PRICE) {
+    res.status(400).json({
+      ok: false,
+      error: "PRICE_TOO_HIGH",
+      message: "That price is higher than the market allows.",
+    });
+    return null;
+  }
+  const price = roundMarketPrice(raw);
+  if (price <= 0) {
+    res.status(400).json({
+      ok: false,
+      error: "INVALID_PRICE",
+      message: "That price rounds down to nothing. The smallest price is 0.01 ISK.",
+    });
+    return null;
+  }
+  return price;
+}
+
+/**
+ * Re-read the player's own orders after a write — the proof half. A response
+ * saying "ok" proves nothing; this is what the panel judges `applied` against.
+ */
+async function readOwnOrdersQuietly(held, webSessionID) {
+  try {
+    const outcome = await heldTopLevelCall(
+      held,
+      webSessionID,
+      "marketProxy",
+      "GetCharOrders",
+      [],
+      null,
+    );
+    return outcome.result;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * PLACE A BUY ORDER.
+ *
+ * `PlaceBuyOrder([stationID, typeID, price, quantity, orderRange, minVolume,
+ *                 duration, useCorp, expectedBrokersFee])` — every argument read
+ * by INDEX.
+ *
+ * ⚠ `expectedBrokersFee` IS A RATE AND A CHECK, NOT A PAYMENT. The server
+ * compares it against the character's real broker commission rate and refuses
+ * the whole order (MktBrokersFeeUnexpected2) if they differ — it exists to stop
+ * a player being charged a rate other than the one they were shown. We cannot
+ * compute that rate: it is 3% minus (Broker Relations level x 0.3%) minus
+ * standings terms, and NO allowlisted read answers either input. A guess would
+ * refuse legitimate orders from any trained trader, so `null` — the documented
+ * "do not check" value — is sent, and the honesty is delivered the other way
+ * round: the UI labels its estimate an estimate, and this route reports the
+ * amount the wallet ACTUALLY lost.
+ */
+app.post("/api/bridge/market/buy", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const body = req.body || {};
+  const typeID = Number(body.typeID) || 0;
+  const quantity = Number(body.quantity) || 0;
+  if (typeID <= 0) {
+    res.status(400).json({ ok: false, error: "INVALID_TYPE", message: "An item is required." });
+    return;
+  }
+  if (!Number.isSafeInteger(quantity) || quantity <= 0) {
+    res.status(400).json({
+      ok: false,
+      error: "INVALID_QUANTITY",
+      message: "A whole number of units above zero is required.",
+    });
+    return;
+  }
+  const price = normalizeMarketPrice(req, res);
+  if (price === null) {
+    return;
+  }
+  const durationDays = Number(body.durationDays);
+  if (!MARKET_ALLOWED_DURATIONS.has(durationDays)) {
+    res.status(400).json({
+      ok: false,
+      error: "INVALID_DURATION",
+      message: "That is not a length of time the market accepts.",
+    });
+    return;
+  }
+  if (
+    !requireMarketConfirmation(
+      req,
+      res,
+      "Placing a buy order sets aside ISK straight away and charges a broker's fee. This action must be confirmed explicitly.",
+    )
+  ) {
+    return;
+  }
+  try {
+    await readHeldFlight(held, req.webSessionID);
+    // BEFORE. Read first, so the difference afterwards is the real charge.
+    const balanceBefore = await readMarketBalance(held, req.webSessionID);
+    const outcome = await heldTopLevelCall(
+      held,
+      req.webSessionID,
+      "marketProxy",
+      "PlaceBuyOrder",
+      [
+        held.stationID,
+        typeID,
+        price,
+        quantity,
+        // Station-only range: a wider one is skill-gated and the server refuses
+        // a range the character has not trained for.
+        MARKET_RANGE_STATION,
+        1,
+        durationDays,
+        // Personal market only — the handler refuses a corp order outright.
+        false,
+        // See the note above: a rate we cannot know must not be asserted.
+        null,
+      ],
+      null,
+    );
+    const balanceAfter = await readMarketBalance(held, req.webSessionID);
+    const charged = marketIskDelta(balanceBefore, balanceAfter);
+    const ownOrders = await readOwnOrdersQuietly(held, req.webSessionID);
+    // ⚠ `applied` comes from the WALLET, not from the 200. PlaceBuyOrder
+    // answers None whether it created an order, filled one immediately, or did
+    // nothing at all — so a response alone cannot tell them apart. A charge of
+    // exactly zero means nothing happened, and saying so is honest where
+    // naming a cause would be a guess the server did not give.
+    const applied = charged !== null && charged !== "0.00";
+    res.json({
+      ok: true,
+      applied,
+      declinedSilently: !applied,
+      charged,
+      balanceBefore,
+      balanceAfter,
+      ownOrders,
+      notifications: outcome.notifications,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * PLACE A SELL ORDER.
+ *
+ * `PlaceMultiSellOrder([itemList, useCorp, duration, expectedBrokersFee])`.
+ *
+ * ⚠ SELLING IS ITEM-BASED, NOT TYPE-BASED. Each entry must carry
+ * `{itemID, typeID, stationID, price, quantity}` — the handler moves specific
+ * STACKS out of the hangar into escrow, so it needs the itemID of the stack,
+ * not just "10 of type 34". There is no single-sell method in the whole retail
+ * surface; this one call is it, and the browser sends a one-entry list.
+ */
+app.post("/api/bridge/market/sell", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const body = req.body || {};
+  const itemID = Number(body.itemID) || 0;
+  const typeID = Number(body.typeID) || 0;
+  const quantity = Number(body.quantity) || 0;
+  if (itemID <= 0 || typeID <= 0) {
+    res.status(400).json({
+      ok: false,
+      error: "INVALID_ITEM",
+      message: "A specific stack of goods to sell is required.",
+    });
+    return;
+  }
+  if (!Number.isSafeInteger(quantity) || quantity <= 0) {
+    res.status(400).json({
+      ok: false,
+      error: "INVALID_QUANTITY",
+      message: "A whole number of units above zero is required.",
+    });
+    return;
+  }
+  const price = normalizeMarketPrice(req, res);
+  if (price === null) {
+    return;
+  }
+  const durationDays = Number(body.durationDays);
+  if (!MARKET_ALLOWED_DURATIONS.has(durationDays)) {
+    res.status(400).json({
+      ok: false,
+      error: "INVALID_DURATION",
+      message: "That is not a length of time the market accepts.",
+    });
+    return;
+  }
+  if (
+    !requireMarketConfirmation(
+      req,
+      res,
+      "Placing a sell order hands the goods over to the market and charges a broker's fee. This action must be confirmed explicitly.",
+    )
+  ) {
+    return;
+  }
+  try {
+    await readHeldFlight(held, req.webSessionID);
+    const balanceBefore = await readMarketBalance(held, req.webSessionID);
+    const outcome = await heldTopLevelCall(
+      held,
+      req.webSessionID,
+      "marketProxy",
+      "PlaceMultiSellOrder",
+      [
+        [{ itemID, typeID, stationID: held.stationID, price, quantity }],
+        false,
+        durationDays,
+        // Same reasoning as the buy route: a rate we cannot know is not asserted.
+        null,
+      ],
+      null,
+    );
+    const balanceAfter = await readMarketBalance(held, req.webSessionID);
+    const ownOrders = await readOwnOrdersQuietly(held, req.webSessionID);
+    // PlaceMultiSellOrder answers a BOOLEAN — true when it traded or created an
+    // order. That is a real signal (unlike PlaceBuyOrder's None), so it is used,
+    // and the wallet delta is reported alongside it: a sell order COSTS the
+    // broker's fee up front and pays out only when it fills.
+    const applied = outcome.result === true;
+    res.json({
+      ok: true,
+      applied,
+      declinedSilently: !applied,
+      charged: marketIskDelta(balanceBefore, balanceAfter),
+      balanceBefore,
+      balanceAfter,
+      ownOrders,
+      notifications: outcome.notifications,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * CANCEL an order. `CancelCharOrder([orderID, regionID])`.
+ *
+ * ⚠ The server IGNORES `regionID` and reads only `args[0]`, re-deriving the
+ * region from the order it loads. The trailing argument is sent anyway because
+ * that is the retail shape.
+ *
+ * Cancelling a BUY order returns the ISK held in escrow but NOT the broker's
+ * fee already paid; cancelling a SELL order returns the goods. Confirmed because
+ * the fee is genuinely lost either way.
+ */
+app.post("/api/bridge/market/cancel", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const orderID = String((req.body || {}).orderID || "").trim();
+  if (!/^\d+$/.test(orderID)) {
+    res.status(400).json({ ok: false, error: "INVALID_ORDER", message: "An order is required." });
+    return;
+  }
+  if (
+    !requireMarketConfirmation(
+      req,
+      res,
+      "Taking an order down returns what it was holding, but the broker's fee you already paid is not returned. This action must be confirmed explicitly.",
+    )
+  ) {
+    return;
+  }
+  try {
+    await readHeldFlight(held, req.webSessionID);
+    const before = await readOwnOrdersQuietly(held, req.webSessionID);
+    const balanceBefore = await readMarketBalance(held, req.webSessionID);
+    const outcome = await heldTopLevelCall(
+      held,
+      req.webSessionID,
+      "marketProxy",
+      "CancelCharOrder",
+      // The regionID the server ignores. Sent because the shape is retail's.
+      [orderID, 0],
+      null,
+    );
+    const balanceAfter = await readMarketBalance(held, req.webSessionID);
+    const ownOrders = await readOwnOrdersQuietly(held, req.webSessionID);
+    // ⚠ `applied` is the RE-READ, not the 200: the order is gone from the open
+    // list, or it is not. CancelCharOrder answers None either way, including
+    // when the order was already closed.
+    const applied = marketOrderCount(before) > marketOrderCount(ownOrders);
+    res.json({
+      ok: true,
+      applied,
+      declinedSilently: !applied,
+      // A cancel usually RETURNS ISK, so this is normally negative.
+      charged: marketIskDelta(balanceBefore, balanceAfter),
+      balanceBefore,
+      balanceAfter,
+      ownOrders,
+      notifications: outcome.notifications,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * MODIFY an order's price.
+ * `ModifyCharOrder([orderID, newPrice, bid, stationID, solarSystemID, oldPrice,
+ *                   range, volRemaining, issueDate])`.
+ *
+ * ⚠ The server reads ONLY `args[0]` and `args[1]` and re-derives everything
+ * else from the order it loads — so the seven trailing arguments cannot change
+ * the outcome, and a caller that got one wrong would not be told. They are sent
+ * because the shape is the retail one.
+ *
+ * Repricing charges a modification fee and, on a buy order, moves the escrow up
+ * or down, so it is confirmed like the rest.
+ */
+app.post("/api/bridge/market/modify", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const body = req.body || {};
+  const orderID = String(body.orderID || "").trim();
+  if (!/^\d+$/.test(orderID)) {
+    res.status(400).json({ ok: false, error: "INVALID_ORDER", message: "An order is required." });
+    return;
+  }
+  const price = normalizeMarketPrice(req, res);
+  if (price === null) {
+    return;
+  }
+  if (
+    !requireMarketConfirmation(
+      req,
+      res,
+      "Changing an order's price charges a fee, and on a buy order it changes how much ISK is set aside. This action must be confirmed explicitly.",
+    )
+  ) {
+    return;
+  }
+  try {
+    await readHeldFlight(held, req.webSessionID);
+    const balanceBefore = await readMarketBalance(held, req.webSessionID);
+    const outcome = await heldTopLevelCall(
+      held,
+      req.webSessionID,
+      "marketProxy",
+      "ModifyCharOrder",
+      [
+        orderID,
+        price,
+        // Everything from here down is re-derived server-side. Sent for shape
+        // fidelity only — see the note above.
+        Boolean(body.bid),
+        held.stationID,
+        held.solarSystemID || 0,
+        roundMarketPrice(body.oldPrice),
+        Number(body.range) || MARKET_RANGE_STATION,
+        Number(body.volumeRemaining) || 0,
+        0,
+      ],
+      null,
+    );
+    const balanceAfter = await readMarketBalance(held, req.webSessionID);
+    const ownOrders = await readOwnOrdersQuietly(held, req.webSessionID);
+    // ⚠ `applied` is the RE-READ: the order now carries the new price, or it
+    // does not. ModifyCharOrder answers None whether it repriced, found nothing
+    // to change, or the order was already closed.
+    const applied = marketOrderHasPrice(ownOrders, orderID, price);
+    res.json({
+      ok: true,
+      applied,
+      declinedSilently: !applied,
+      charged: marketIskDelta(balanceBefore, balanceAfter),
+      balanceBefore,
+      balanceAfter,
+      ownOrders,
+      notifications: outcome.notifications,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// --- Reading the owner-order rowset, for the re-read verdicts ---------------
+// The BFF understands just enough of this rowset to judge whether a mutation
+// applied. The browser still gets the RAW result and decodes it properly; these
+// two helpers exist only so `applied` is a fact rather than an echo.
+
+/** Unwrap the inline cached envelope, if that is what arrived. */
+function unwrapMarketCached(result) {
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    return result;
+  }
+  const name = result.name;
+  const text = typeof name === "string" ? name : (name && name.value) || "";
+  if (!String(text).endsWith("objectCaching.CachedMethodCallResult")) {
+    return result;
+  }
+  const carrier = Array.isArray(result.args) ? result.args[1] : null;
+  return carrier && carrier.type === "substream" ? carrier.value : null;
+}
+
+/** The owner-order rowset as {column: value} records. */
+function marketOwnerOrderRows(result) {
+  const rowset = unwrapMarketCached(result);
+  if (!rowset || typeof rowset !== "object" || !rowset.args) {
+    return [];
+  }
+  const entries = Array.isArray(rowset.args.entries) ? rowset.args.entries : [];
+  const pick = (key) => {
+    const entry = entries.find((candidate) => Array.isArray(candidate) && candidate[0] === key);
+    return entry ? entry[1] : null;
+  };
+  const columnsValue = pick("columns");
+  const columns = columnsValue && Array.isArray(columnsValue.items)
+    ? columnsValue.items.map((column) =>
+      (typeof column === "string" ? column : (column && column.value) || ""))
+    : [];
+  const linesValue = pick("lines");
+  const lines = linesValue && Array.isArray(linesValue.items) ? linesValue.items : [];
+  return lines.map((line) => {
+    const cells = Array.isArray(line) ? line : (line && line.items) || [];
+    const row = {};
+    columns.forEach((column, index) => {
+      row[column] = cells[index];
+    });
+    return row;
+  });
+}
+
+function marketOrderCount(result) {
+  return marketOwnerOrderRows(result).length;
+}
+
+/** Does the named order now carry `price`? The modify verdict. */
+function marketOrderHasPrice(result, orderID, price) {
+  const wanted = String(orderID);
+  for (const row of marketOwnerOrderRows(result)) {
+    const id = row.orderID && row.orderID.type === "long"
+      ? String(row.orderID.value)
+      : String(row.orderID);
+    if (id === wanted) {
+      return roundMarketPrice(row.price) === roundMarketPrice(price);
+    }
+  }
+  return false;
+}
+
+// --- R17 Mail (mailMgr bridge) ---------------------------------------------
+//
+// Like industry and market, the whole retail mail surface is TOP-LEVEL
+// (sm.RemoteSvc('mailMgr')) — no bound-object step — so heldTopLevelCall
+// carries all of it and this adds no bridge machinery.
+//
+// ⚠ THE INBOX IS A DELTA SYNC, NOT A LIST CALL. There is no "give me my mail"
+// method. SyncMail(firstID, lastID) takes the MIN and MAX messageID the CALLER
+// already holds and answers only what falls outside that window. A caller that
+// invents a window gets a PARTIAL mailbox and NO error. The browser caches
+// nothing across a page load, so it is permanently cold and this route always
+// passes the cold-start pair [null, 0] — "I hold nothing, send everything".
+// (server/tests/webGatewayMail.test.js pins both the cold and the warm shape.)
+//
+// ⚠ GetBody RETURNS A ZLIB-DEFLATED BUFFER, NOT TEXT, and inflating it is THIS
+// FILE'S JOB. See mailBodyText below. The browser never sees a compressed byte.
+//
+// ⚠ AN EMPTY RECIPIENT LIST IS NOT REFUSED BY THE SERVER. mailState.sendMail's
+// NO_RECIPIENTS guard reads `recipients.length === 0 && !saveSenderCopy`, and
+// the handler hardcodes saveSenderCopy: true — so the guard can never fire
+// through the gateway, and mail addressed to nobody is written, filed into the
+// sender's own mailbox, and looks sent. The send route below refuses it here
+// instead, because nothing downstream will.
+
+/** The cold-start SyncMail window: "I hold nothing, send me the lot." */
+const MAIL_COLD_START_SYNC = Object.freeze([null, 0]);
+const MAIL_STATUS_MASK_READ = 1;
+const MAIL_MAX_RECIPIENTS = 20;
+const MAIL_MAX_TITLE = 200;
+const MAIL_MAX_BODY = 8000;
+
+/**
+ * ⚠ THE ZLIB RULE, and the single place it is implemented.
+ *
+ * mailMgr.GetBody answers zlib.deflateSync(body). A Node Buffer crosses the
+ * JSON bridge as {type:"Buffer", data:[...]}, so rendering the return directly
+ * would show the player a wall of byte values. This inflates it and hands back
+ * plain text. Decompressing in the BROWSER is not an option worth taking: it
+ * would mean shipping an inflate implementation to every page load to undo
+ * something the server did for a wire format the browser never speaks.
+ *
+ * Returns null for "no such message" (GetBody's own answer for one the
+ * character cannot see) and throws nothing on a corrupt stream — a body that
+ * will not inflate is reported as unreadable rather than blanking the message.
+ */
+function mailBodyText(result) {
+  if (result === null || result === undefined) {
+    return { text: null, unreadable: false };
+  }
+  let bytes = null;
+  if (Buffer.isBuffer(result)) {
+    bytes = result;
+  } else if (
+    result &&
+    typeof result === "object" &&
+    result.type === "Buffer" &&
+    Array.isArray(result.data)
+  ) {
+    bytes = Buffer.from(result.data);
+  } else if (typeof result === "string") {
+    // Not a shape the service produces today, but if a body ever arrives
+    // already-decoded it is text, not an error.
+    return { text: result, unreadable: false };
+  }
+  if (!bytes) {
+    return { text: null, unreadable: true };
+  }
+  try {
+    return { text: zlib.inflateSync(bytes).toString("utf8"), unreadable: false };
+  } catch {
+    return { text: null, unreadable: true };
+  }
+}
+
+function readMailKeyVal(row, key) {
+  const entries =
+    row && row.args && Array.isArray(row.args.entries) ? row.args.entries : [];
+  const entry = entries.find((candidate) => {
+    const name = Array.isArray(candidate) ? candidate[0] : null;
+    return (typeof name === "string" ? name : name && name.value) === key;
+  });
+  return entry ? entry[1] : undefined;
+}
+
+function mailListItems(value) {
+  return value && Array.isArray(value.items) ? value.items : [];
+}
+
+function mailNumber(value) {
+  if (typeof value === "number") {
+    return value;
+  }
+  if (value && value.type === "long") {
+    return Number(value.value) || 0;
+  }
+  return Number(value) || 0;
+}
+
+/**
+ * The unread count, computed HERE rather than trusted from anywhere else: it is
+ * the number of status rows whose read bit is clear. The browser gets the raw
+ * rows too and could count them itself; this exists so the count shown beside
+ * the tab and the count implied by the list can never disagree.
+ */
+function mailUnreadCount(syncResult) {
+  let unread = 0;
+  for (const row of mailListItems(readMailKeyVal(syncResult, "mailStatus"))) {
+    if ((mailNumber(readMailKeyVal(row, "statusMask")) & MAIL_STATUS_MASK_READ) === 0) {
+      unread += 1;
+    }
+  }
+  return unread;
+}
+
+/** Is `messageID` present in this sync's headers? The send/read re-read verdict. */
+function mailHeaderIDs(syncResult) {
+  const ids = new Set();
+  for (const arm of ["newMail", "oldMail"]) {
+    for (const row of mailListItems(readMailKeyVal(syncResult, arm))) {
+      ids.add(mailNumber(readMailKeyVal(row, "messageID")));
+    }
+  }
+  return ids;
+}
+
+function mailIsRead(syncResult, messageID) {
+  for (const row of mailListItems(readMailKeyVal(syncResult, "mailStatus"))) {
+    if (mailNumber(readMailKeyVal(row, "messageID")) === Number(messageID)) {
+      return (mailNumber(readMailKeyVal(row, "statusMask")) & MAIL_STATUS_MASK_READ) !== 0;
+    }
+  }
+  return false;
+}
+
+/**
+ * GET /api/bridge/mail — the whole inbox, cold-started.
+ *
+ * One call does it: a cold SyncMail IS the full mailbox. GetMailHeaders is the
+ * backfill for any messageID that has a status row but no header, which a cold
+ * sync should never produce — it is issued only when that actually happens, so
+ * the common case stays a single round-trip.
+ */
+app.get("/api/bridge/mail", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const sync = await heldTopLevelCall(
+      held,
+      req.webSessionID,
+      "mailMgr",
+      "SyncMail",
+      MAIL_COLD_START_SYNC,
+      null,
+    );
+
+    // Backfill: any message the mailbox knows the STATUS of but not the HEADER.
+    // ⚠ The argument is a list NESTED in args[0], not a spread of ids.
+    const haveHeaders = mailHeaderIDs(sync.result);
+    const missing = [];
+    for (const row of mailListItems(readMailKeyVal(sync.result, "mailStatus"))) {
+      const messageID = mailNumber(readMailKeyVal(row, "messageID"));
+      if (messageID > 0 && !haveHeaders.has(messageID)) {
+        missing.push(messageID);
+      }
+    }
+    let backfill = null;
+    if (missing.length > 0) {
+      const extra = await heldTopLevelCall(
+        held,
+        req.webSessionID,
+        "mailMgr",
+        "GetMailHeaders",
+        [missing],
+        null,
+      );
+      backfill = extra.result;
+    }
+
+    res.json({
+      ok: true,
+      characterID: held.characterID,
+      sync: sync.result,
+      backfill,
+      unreadCount: mailUnreadCount(sync.result),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * GET /api/bridge/mail/body?messageID=&markRead= — one message, as TEXT.
+ *
+ * ⚠ markRead=1 makes this a WRITE: it clears the unread bit and pushes
+ * OnMailUpdatedByExternal to the character's other sessions. Opening a message
+ * is the player's own deliberate act, so it needs no confirm gate — but it is
+ * re-read anyway, because a 200 is not proof that the flag moved.
+ */
+app.get("/api/bridge/mail/body", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const messageID = Number(req.query.messageID) || 0;
+  if (messageID <= 0) {
+    res.status(400).json({ ok: false, error: "MAIL_INVALID", message: "No message was named." });
+    return;
+  }
+  const markRead = req.query.markRead === "1" || req.query.markRead === "true";
+  try {
+    const body = await heldTopLevelCall(
+      held,
+      req.webSessionID,
+      "mailMgr",
+      "GetBody",
+      [messageID, markRead ? 1 : 0],
+      null,
+    );
+    const { text, unreadable } = mailBodyText(body.result);
+
+    // GetBody answers null for a message this character cannot see. That is a
+    // definite answer, not a failure, and it is reported as one.
+    if (text === null && !unreadable) {
+      res.status(404).json({
+        ok: false,
+        error: "MAIL_NOT_FOUND",
+        message: "That message is not in your mailbox.",
+      });
+      return;
+    }
+
+    // ⚠ A 200 IS NOT PROOF. Re-read the mailbox and report the flag the server
+    // actually holds, not the one we asked for.
+    let nowRead = null;
+    let unreadCount = null;
+    try {
+      const sync = await heldTopLevelCall(
+        held,
+        req.webSessionID,
+        "mailMgr",
+        "SyncMail",
+        MAIL_COLD_START_SYNC,
+        null,
+      );
+      nowRead = mailIsRead(sync.result, messageID);
+      unreadCount = mailUnreadCount(sync.result);
+    } catch {
+      // The body is in hand and worth showing; a failed re-read only means we
+      // decline to make a claim about the read flag.
+    }
+
+    res.json({
+      ok: true,
+      messageID,
+      body: text,
+      unreadable,
+      markedRead: nowRead,
+      unreadCount,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * POST /api/bridge/mail/send — write to another character.
+ *
+ * ⚠ EXACT POSITIONAL SIGNATURE (Handle_SendMail reads by index; a mis-ordered
+ * list is a silently different message, not an error):
+ *   [toCharacterIDs, toListID, toCorpOrAllianceID, title, body,
+ *    isReplyTo, isForwardedFrom]
+ * args[0] is a LIST on the way in even though headers read it back as a
+ * comma-joined string on the way out. toListID and toCorpOrAllianceID are
+ * always null: mailing lists are a separate service and corp/alliance mail fans
+ * out to every member — neither is in this slice.
+ *
+ * This is a write, but not a destructive or costly one — nothing is spent and
+ * nothing is deleted — so it takes no `confirm` gate, unlike R12/R14/R15/R16.
+ * What it does take is a RECIPIENT CHECK, because the server has none: see the
+ * empty-list note above.
+ */
+app.post("/api/bridge/mail/send", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const payload = req.body && typeof req.body === "object" ? req.body : {};
+  const recipients = Array.isArray(payload.toCharacterIDs)
+    ? [...new Set(payload.toCharacterIDs.map((id) => Number(id) || 0).filter((id) => id > 0))]
+    : [];
+  const title = typeof payload.title === "string" ? payload.title.trim() : "";
+  const body = typeof payload.body === "string" ? payload.body : "";
+
+  // ⚠ THE GUARD THE SERVER DOES NOT HAVE. Without this, mail to nobody is
+  // written into the sender's own mailbox and looks sent.
+  if (recipients.length === 0) {
+    res.status(400).json({
+      ok: false,
+      error: "MAIL_NO_RECIPIENT",
+      message: "Choose someone to send this to first.",
+    });
+    return;
+  }
+  if (recipients.length > MAIL_MAX_RECIPIENTS) {
+    res.status(400).json({
+      ok: false,
+      error: "MAIL_TOO_MANY_RECIPIENTS",
+      message: `You can send to at most ${MAIL_MAX_RECIPIENTS} people at once.`,
+    });
+    return;
+  }
+  if (!title) {
+    res.status(400).json({
+      ok: false,
+      error: "MAIL_NO_SUBJECT",
+      message: "Give your message a subject first.",
+    });
+    return;
+  }
+  if (title.length > MAIL_MAX_TITLE || body.length > MAIL_MAX_BODY) {
+    res.status(400).json({
+      ok: false,
+      error: "MAIL_TOO_LONG",
+      message: "That message is longer than the mail system accepts.",
+    });
+    return;
+  }
+
+  try {
+    const sent = await heldTopLevelCall(
+      held,
+      req.webSessionID,
+      "mailMgr",
+      "SendMail",
+      [recipients, null, null, title, body, null, null],
+      null,
+    );
+    const messageID = mailNumber(sent.result);
+
+    // ⚠ THE SILENT DECLINE. SendMail answers a bare null on failure with NO
+    // reason attached. Say exactly that rather than inventing a cause.
+    if (!messageID) {
+      res.json({
+        ok: true,
+        applied: false,
+        declinedSilently: true,
+        messageID: null,
+        message: "The server did not send that message, and did not say why.",
+      });
+      return;
+    }
+
+    // ⚠ A 200 IS NOT PROOF. Re-read the sender's own mailbox: the handler keeps
+    // a sender copy, so the message must be visible there if it really landed.
+    let applied = true;
+    let unreadCount = null;
+    try {
+      const sync = await heldTopLevelCall(
+        held,
+        req.webSessionID,
+        "mailMgr",
+        "SyncMail",
+        MAIL_COLD_START_SYNC,
+        null,
+      );
+      applied = mailHeaderIDs(sync.result).has(messageID);
+      unreadCount = mailUnreadCount(sync.result);
+    } catch {
+      // Keep `applied` as the messageID implies; a failed re-read is not
+      // evidence the send failed.
+    }
+
+    res.json({
+      ok: true,
+      applied,
+      declinedSilently: false,
+      messageID,
+      unreadCount,
+      recipientCount: recipients.length,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// --- R86 Mail + mailing-list WRITES (mailMgr / mailingListsMgr) -------------
+//
+// The FIRST Phase-3 writes batch. Every retail mail write is TOP-LEVEL
+// (sm.RemoteSvc("mailMgr") / sm.RemoteSvc("mailingListsMgr")) — no bound-object
+// step — so heldTopLevelCall carries them, exactly like the R17 reads/SendMail.
+//
+// ⚠ EVERY ROUTE IS CONFIRM-GATED. Mirroring the R14 TrashItems / R16 market
+// pattern: the route refuses outright (400 CONFIRMATION_REQUIRED, NO dispatch)
+// unless the browser passes `confirm: true`. Neither a stray click nor a stray
+// POST can trash, delete, relabel, or join/leave a list. The two permanent-
+// delete writes (DeleteMail / EmptyTrash) carry the same gate; the UI puts its
+// own two-step confirm in front of that.
+//
+// ⚠ ALL SESSION-SCOPED. Every mailMgr write resolves its mailbox from the
+// SESSION character (resolveSessionCharacterID); a messageID/labelID the session
+// does not own is simply absent from its rows and the write is a silent no-op —
+// no arg a browser sends mutates another character's mail. mailingListsMgr
+// Join/Leave self-add / self-remove the session char; Create makes a new list
+// owned by the session. FAST-MODE educated-guess responses: every handler
+// returns null except CreateLabel (labelID), mailingListsMgr.Create (listID),
+// and mailingListsMgr.Join (a list-info KeyVal) — the decoders read those.
+
+/** The confirm gate every R86 mail write sits behind (mirrors TrashItems/market). */
+function requireMailConfirmation(req, res, message) {
+  if ((req.body || {}).confirm === true) {
+    return true;
+  }
+  res.status(400).json({ ok: false, error: "CONFIRMATION_REQUIRED", message });
+  return false;
+}
+
+/** Coerce a browser-sent messageIDs/labelIDs payload to a clean positive-int list. */
+function mailIDList(value) {
+  const raw = Array.isArray(value) ? value : [value];
+  return [...new Set(raw.map((v) => Number(v) || 0).filter((v) => v > 0))];
+}
+
+/**
+ * Dispatch one confirm-gated mail write and answer a uniform ack. FAST-MODE:
+ * the server returns null on every status/trash/label write, so `applied` is
+ * true whenever the dispatch did not throw; the panel re-reads the mailbox
+ * itself to prove the mutation. A route that needs the return value (label /
+ * list creation) reads `outcome.result` directly instead of calling this.
+ */
+async function dispatchMailWrite(req, res, next, method, args) {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const outcome = await heldTopLevelCall(held, req.webSessionID, "mailMgr", method, args, null);
+    res.json({ ok: true, applied: true, result: outcome.result ?? null, notifications: outcome.notifications });
+  } catch (error) {
+    next(error);
+  }
+}
+
+// Status writes: MarkAsRead / MarkAsUnread take a messageID list (args[0]).
+app.post("/api/bridge/mail/mark-read", requireAuth, async (req, res, next) => {
+  if (!requireMailConfirmation(req, res, "This marks those messages read. Confirm to continue.")) {
+    return;
+  }
+  await dispatchMailWrite(req, res, next, "MarkAsRead", [mailIDList((req.body || {}).messageIDs)]);
+});
+
+app.post("/api/bridge/mail/mark-unread", requireAuth, async (req, res, next) => {
+  if (!requireMailConfirmation(req, res, "This marks those messages unread. Confirm to continue.")) {
+    return;
+  }
+  await dispatchMailWrite(req, res, next, "MarkAsUnread", [mailIDList((req.body || {}).messageIDs)]);
+});
+
+// MarkAllAsRead takes no args — the whole mailbox.
+app.post("/api/bridge/mail/mark-all-read", requireAuth, async (req, res, next) => {
+  if (!requireMailConfirmation(req, res, "This marks your whole inbox read. Confirm to continue.")) {
+    return;
+  }
+  await dispatchMailWrite(req, res, next, "MarkAllAsRead", []);
+});
+
+// Trash moves (reversible): MoveToTrash / MoveFromTrash take a messageID list.
+app.post("/api/bridge/mail/trash", requireAuth, async (req, res, next) => {
+  if (!requireMailConfirmation(req, res, "This moves those messages to the trash. Confirm to continue.")) {
+    return;
+  }
+  await dispatchMailWrite(req, res, next, "MoveToTrash", [mailIDList((req.body || {}).messageIDs)]);
+});
+
+app.post("/api/bridge/mail/untrash", requireAuth, async (req, res, next) => {
+  if (!requireMailConfirmation(req, res, "This restores those messages from the trash. Confirm to continue.")) {
+    return;
+  }
+  await dispatchMailWrite(req, res, next, "MoveFromTrash", [mailIDList((req.body || {}).messageIDs)]);
+});
+
+// MoveAllToTrash takes no args — everything not already trashed.
+app.post("/api/bridge/mail/trash-all", requireAuth, async (req, res, next) => {
+  if (!requireMailConfirmation(req, res, "This moves your whole inbox to the trash. Confirm to continue.")) {
+    return;
+  }
+  await dispatchMailWrite(req, res, next, "MoveAllToTrash", []);
+});
+
+// ⚠ PERMANENT-DELETE PAIR — reachable + confirm-gated, NEVER fired on the live
+// world in this plumbing pass. DeleteMail purges the named messages; EmptyTrash
+// purges everything already in the trash. removeMessageStatuses / emptyTrash
+// erase the rows outright — there is no untrash after this.
+app.post("/api/bridge/mail/delete", requireAuth, async (req, res, next) => {
+  if (
+    !requireMailConfirmation(
+      req,
+      res,
+      "Deleting these messages is permanent — they cannot be restored. This must be confirmed explicitly.",
+    )
+  ) {
+    return;
+  }
+  await dispatchMailWrite(req, res, next, "DeleteMail", [mailIDList((req.body || {}).messageIDs)]);
+});
+
+app.post("/api/bridge/mail/empty-trash", requireAuth, async (req, res, next) => {
+  if (
+    !requireMailConfirmation(
+      req,
+      res,
+      "Emptying the trash permanently deletes everything in it. This must be confirmed explicitly.",
+    )
+  ) {
+    return;
+  }
+  await dispatchMailWrite(req, res, next, "EmptyTrash", []);
+});
+
+// Label WRITES. CreateLabel(name, color) answers the new labelID; EditLabel
+// (labelID, name, color) / DeleteLabel(labelID) / AssignLabels(messageIDs,
+// labelMask) / RemoveLabels(messageIDs, labelMask) answer null.
+app.post("/api/bridge/mail/label/create", requireAuth, async (req, res, next) => {
+  if (!requireMailConfirmation(req, res, "This creates a new mail label. Confirm to continue.")) {
+    return;
+  }
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const body = req.body || {};
+  const name = typeof body.name === "string" ? body.name.trim() : "";
+  if (!name) {
+    res.status(400).json({ ok: false, error: "MAIL_LABEL_NO_NAME", message: "Give the label a name first." });
+    return;
+  }
+  const color = Number(body.color) || 0;
+  try {
+    const outcome = await heldTopLevelCall(held, req.webSessionID, "mailMgr", "CreateLabel", [name, color], null);
+    const labelID = mailNumber(outcome.result);
+    res.json({ ok: true, applied: labelID > 0, labelID: labelID > 0 ? labelID : null, notifications: outcome.notifications });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/bridge/mail/label/edit", requireAuth, async (req, res, next) => {
+  if (!requireMailConfirmation(req, res, "This renames or recolours that label. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const labelID = Number(body.labelID) || 0;
+  if (labelID <= 0) {
+    res.status(400).json({ ok: false, error: "MAIL_LABEL_INVALID", message: "A label is required." });
+    return;
+  }
+  const args = [labelID];
+  if (typeof body.name === "string") {
+    args.push(body.name);
+    if (Number.isFinite(Number(body.color))) {
+      args.push(Number(body.color));
+    }
+  }
+  await dispatchMailWrite(req, res, next, "EditLabel", args);
+});
+
+app.post("/api/bridge/mail/label/delete", requireAuth, async (req, res, next) => {
+  if (!requireMailConfirmation(req, res, "This deletes that label. Confirm to continue.")) {
+    return;
+  }
+  const labelID = Number((req.body || {}).labelID) || 0;
+  if (labelID <= 0) {
+    res.status(400).json({ ok: false, error: "MAIL_LABEL_INVALID", message: "A label is required." });
+    return;
+  }
+  await dispatchMailWrite(req, res, next, "DeleteLabel", [labelID]);
+});
+
+app.post("/api/bridge/mail/label/assign", requireAuth, async (req, res, next) => {
+  if (!requireMailConfirmation(req, res, "This applies that label to the messages. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const labelMask = Number(body.labelMask ?? body.labelID) || 0;
+  await dispatchMailWrite(req, res, next, "AssignLabels", [mailIDList(body.messageIDs), labelMask]);
+});
+
+app.post("/api/bridge/mail/label/remove", requireAuth, async (req, res, next) => {
+  if (!requireMailConfirmation(req, res, "This removes that label from the messages. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const labelMask = Number(body.labelMask ?? body.labelID) || 0;
+  await dispatchMailWrite(req, res, next, "RemoveLabels", [mailIDList(body.messageIDs), labelMask]);
+});
+
+// --- R86 mailing-list WRITES (mailingListsMgr — a DISTINCT service) ---------
+//
+// Join(listID) self-adds the session char and answers the joined list's info
+// KeyVal; Leave(listID) self-removes and answers null; Create(name, ...) makes a
+// new list owned by the session char and answers the new listID.
+
+app.post("/api/bridge/mailing-list/join", requireAuth, async (req, res, next) => {
+  if (!requireMailConfirmation(req, res, "This joins you to that mailing list. Confirm to continue.")) {
+    return;
+  }
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const body = req.body || {};
+  // Join takes a name OR an id (resolveMailingListByNameOrID); pass through as sent.
+  const target = body.listID !== undefined ? Number(body.listID) || body.listID : body.name;
+  if (target === undefined || target === null || target === "") {
+    res.status(400).json({ ok: false, error: "MAILING_LIST_INVALID", message: "A mailing list is required." });
+    return;
+  }
+  try {
+    const outcome = await heldTopLevelCall(held, req.webSessionID, "mailingListsMgr", "Join", [target], null);
+    res.json({ ok: true, applied: outcome.result != null, list: outcome.result ?? null, notifications: outcome.notifications });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/bridge/mailing-list/leave", requireAuth, async (req, res, next) => {
+  if (!requireMailConfirmation(req, res, "This removes you from that mailing list. Confirm to continue.")) {
+    return;
+  }
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const listID = Number((req.body || {}).listID) || 0;
+  if (listID <= 0) {
+    res.status(400).json({ ok: false, error: "MAILING_LIST_INVALID", message: "A mailing list is required." });
+    return;
+  }
+  try {
+    const outcome = await heldTopLevelCall(held, req.webSessionID, "mailingListsMgr", "Leave", [listID], null);
+    res.json({ ok: true, applied: true, result: outcome.result ?? null, notifications: outcome.notifications });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/bridge/mailing-list/create", requireAuth, async (req, res, next) => {
+  if (!requireMailConfirmation(req, res, "This creates a new mailing list you will own. Confirm to continue.")) {
+    return;
+  }
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const body = req.body || {};
+  const name = typeof body.name === "string" ? body.name.trim() : "";
+  if (!name) {
+    res.status(400).json({ ok: false, error: "MAILING_LIST_NO_NAME", message: "Give the mailing list a name first." });
+    return;
+  }
+  // Create(name, defaultAccess, defaultMemberAccess, cost) — all optional past name.
+  const args = [name];
+  if (body.defaultAccess !== undefined) {
+    args.push(Number(body.defaultAccess));
+  }
+  if (body.defaultMemberAccess !== undefined) {
+    args.push(Number(body.defaultMemberAccess));
+  }
+  if (body.cost !== undefined) {
+    args.push(Number(body.cost) || 0);
+  }
+  try {
+    const outcome = await heldTopLevelCall(held, req.webSessionID, "mailingListsMgr", "Create", args, null);
+    const listID = mailNumber(outcome.result);
+    res.json({ ok: true, applied: listID > 0, listID: listID > 0 ? listID : null, notifications: outcome.notifications });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// --- R87 notifications + calendar + bookmark WRITES -------------------------
+// (notificationMgr / calendarMgr / accessGroupBookmarkMgr)
+//
+// The Phase-3 "personal + org" writes batch, following the R86 mail pattern.
+// Every write is a TOP-LEVEL call on the held session (heldTopLevelCall) and
+// every route is CONFIRM-GATED: it refuses outright (400 CONFIRMATION_REQUIRED,
+// NO dispatch) unless the browser passes `confirm: true`. A stray click or
+// stray POST cannot mark, delete, create, edit, or move anything.
+//
+// ⚠ SESSION / ACCESS SCOPED — no write mutates a FOREIGN entity:
+//   • notificationMgr writes resolve the mailbox from the SESSION character
+//     (getSessionCharacterID); a group/id the session does not own is simply
+//     absent from its rows, so the write is a silent no-op.
+//   • calendarMgr Edit/Delete/Respond/UpdateParticipants all pass through
+//     access.canEditOrDeleteEvent(event, session) server-side — a foreign
+//     eventID is a permission error, never a foreign mutation. Create*Corp /
+//     Create*Alliance / UpdateEventParticipants are role/scope gated (a normal
+//     member gets a 403 / CustomNotify — that is CORRECT).
+//   • accessGroupBookmarkMgr writes resolve the folder via resolveFolderView
+//     against the SESSION character's access level and gate on
+//     canWriteFolder / canManageFolder / ACCESS_ADMIN — a foreign folderID is
+//     FolderAccessDenied, never a foreign mutation.
+//
+// ⚠ DESTRUCTIVE PAIRS — reachable + confirm-gated, NEVER fired on the live
+// world in this plumbing pass: notifications delete-group / delete-all /
+// delete, calendar event/delete, bookmark folder/delete + bookmarks/delete.
+//
+// FAST-MODE educated-guess responses: every handler returns null except the
+// three calendar Create*Event writes (an eventID), bookmark folder/add (the
+// folder view payload) and folder/update (an access level int). The decoders
+// (web/src/bridge/{notifications,calendar,bookmarks}.ts) read those.
+
+/** The confirm gate every R87 write sits behind (mirrors requireMailConfirmation). */
+function requireWriteConfirmation(req, res, message) {
+  if ((req.body || {}).confirm === true) {
+    return true;
+  }
+  res.status(400).json({ ok: false, error: "CONFIRMATION_REQUIRED", message });
+  return false;
+}
+
+/** Coerce a browser-sent id-list payload to a clean positive-int list. */
+function bridgeIDList(value) {
+  const raw = Array.isArray(value) ? value : [value];
+  return [...new Set(raw.map((v) => Number(v) || 0).filter((v) => v > 0))];
+}
+
+/**
+ * Forward an optional positional-args array for writes whose handler ignores its
+ * args (the abyssal / pvp rejection stubs). The browser MAY send `{ args: [...] }`;
+ * anything else yields `[]`. Kept deliberately generic — these handlers reject or
+ * no-op regardless of what is passed, so there is no per-arg coercion to do.
+ */
+function bridgeArgs(req) {
+  const value = (req.body || {}).args;
+  return Array.isArray(value) ? value : [];
+}
+
+/**
+ * Dispatch one confirm-gated write and answer a uniform ack. FAST-MODE: most of
+ * these handlers return null, so `applied` is true whenever the dispatch did not
+ * throw; a panel re-reads to prove the mutation. A route that needs the return
+ * value (an event/folder id) reads `outcome.result` directly instead.
+ */
+async function dispatchBridgeWrite(req, res, next, service, method, args) {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const outcome = await heldTopLevelCall(held, req.webSessionID, service, method, args, null);
+    res.json({ ok: true, applied: true, result: outcome.result ?? null, notifications: outcome.notifications });
+  } catch (error) {
+    next(error);
+  }
+}
+
+/**
+ * One ACCOUNT-LEVEL call: a call whose subject is the signed-in ACCOUNT, not a
+ * character it has brought online.
+ *
+ * Every other bridge call in this file goes through `requireHeldBridgeSession`,
+ * which is right for anything a pilot does — there is a pilot. Character
+ * SELECTION and CREATION are the two things that necessarily happen before one
+ * exists, and on a brand-new account there is no character to select at all, so
+ * a held-session gate there is not a safety rail, it is a locked door with the
+ * key inside. `POST /api/bridge/select` already lives outside the gate for
+ * exactly this reason, and `/api/bridge/call` already falls back to a
+ * userid-only session when the map has no entry (the path the pre-select
+ * GetCharacterSelectionData read takes).
+ *
+ * So: run on the held session when there IS one (a second tab creating an alt
+ * while a pilot flies), and on an ephemeral userid-only session when there is
+ * not. The account identity is the BFF's own `req.account.accountID` either
+ * way — never anything the browser sent — which is what keeps the write landing
+ * on the caller's account and no other.
+ */
+async function accountLevelCall(req, service, method, args, kwargs = null) {
+  const held = bridgeSessions.get(req.webSessionID) || null;
+  try {
+    return await gateway.callMethod(
+      service,
+      method,
+      args,
+      kwargs,
+      { userid: Number(req.account.accountID) },
+      held ? held.bridgeSessionID : undefined,
+    );
+  } catch (error) {
+    if (held && error && error.code === "SESSION_NOT_FOUND") {
+      forgetBridgeSession(req.webSessionID);
+    }
+    throw error;
+  }
+}
+
+/**
+ * Dispatch a write that SWAPS the session's ACTIVE SHIP. A known target hull
+ * is pinned when the route has one; otherwise readiness requires the live
+ * flight ship to differ from the pre-write hull. In space, the scene ego must
+ * match it too. The write is issued once and an uncertain timeout stays
+ * latched, exactly like dock/undock/gate transitions.
+ */
+async function dispatchShipSwapWrite(req, res, next, service, method, args, targetShipID = null) {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const before = await readHeldFlight(held, req.webSessionID);
+    const expected = {
+      shipID: Number(targetShipID) || null,
+      fromShipID: Number(before.flight && before.flight.shipID) || Number(held.activeShipID) || null,
+    };
+    if (!await acquireRouteTransition(res, held, "board", expected)) {
+      return;
+    }
+    const outcome = await heldTopLevelCall(held, req.webSessionID, service, method, args, null);
+    markTransitionAccepted(held);
+    const after = await awaitRouteTransition(held, req.webSessionID, "board", expected);
+    if (!after.ok) {
+      sendTransitionTimeout(res, after, outcome.notifications);
+      return;
+    }
+    res.json({
+      ok: true,
+      applied: true,
+      result: outcome.result ?? null,
+      activeShipID: held.activeShipID || null,
+      flight: { ...after.flight, transition: after.transition },
+      transition: after.transition,
+      notifications: [...outcome.notifications, ...after.notifications],
+    });
+  } catch (error) {
+    if (held.transition && held.transition.kind === "board") {
+      if (held.transition.phase === "requested") {
+        cancelHeldTransition(held);
+      } else if (held.transition.phase !== "failed") {
+        markTransitionFailed(held, error && error.message);
+      }
+    }
+    next(error);
+  }
+}
+
+// --- notificationMgr WRITES -------------------------------------------------
+// Mark* clear the "unprocessed" flag (reversible-ish); Delete* purge rows
+// (destructive). MarkGroupAsProcessed/DeleteGroupNotifications take a groupID;
+// MarkAsProcessed/DeleteNotifications take a notificationID list; the All*
+// variants take no args. LogNotificationInteraction records a referenceID.
+
+app.post("/api/bridge/notifications/mark-group-processed", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This marks that notification group processed. Confirm to continue.")) {
+    return;
+  }
+  const groupID = Number((req.body || {}).groupID) || 0;
+  await dispatchBridgeWrite(req, res, next, "notificationMgr", "MarkGroupAsProcessed", [groupID]);
+});
+
+app.post("/api/bridge/notifications/mark-all-processed", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This marks all your notifications processed. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "notificationMgr", "MarkAllAsProcessed", []);
+});
+
+app.post("/api/bridge/notifications/mark-processed", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This marks those notifications processed. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "notificationMgr", "MarkAsProcessed", [bridgeIDList((req.body || {}).notificationIDs)]);
+});
+
+// ⚠ DESTRUCTIVE — reachable + gated, never fired live in the plumbing pass.
+app.post("/api/bridge/notifications/delete-group", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "Deleting a notification group is permanent. This must be confirmed explicitly.")) {
+    return;
+  }
+  const groupID = Number((req.body || {}).groupID) || 0;
+  await dispatchBridgeWrite(req, res, next, "notificationMgr", "DeleteGroupNotifications", [groupID]);
+});
+
+app.post("/api/bridge/notifications/delete-all", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "Deleting all your notifications is permanent. This must be confirmed explicitly.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "notificationMgr", "DeleteAllNotifications", []);
+});
+
+app.post("/api/bridge/notifications/delete", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "Deleting those notifications is permanent. This must be confirmed explicitly.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "notificationMgr", "DeleteNotifications", [bridgeIDList((req.body || {}).notificationIDs)]);
+});
+
+app.post("/api/bridge/notifications/log-interaction", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This logs a notification interaction. Confirm to continue.")) {
+    return;
+  }
+  const referenceID = Number((req.body || {}).referenceID) || 0;
+  await dispatchBridgeWrite(req, res, next, "notificationMgr", "LogNotificationInteraction", [referenceID]);
+});
+
+// --- calendarMgr WRITES -----------------------------------------------------
+// The three Create*Event writes answer the new eventID; Edit / Delete / Respond
+// / UpdateParticipants answer null. Corp/alliance create + participant updates
+// are role/scope gated server-side (a normal member gets a CustomNotify/403).
+
+/** Build the shared Create*Event arg tuple (dateTime, duration, title, desc, importance[, invitees]). */
+function calendarCreateArgs(body, withInvitees) {
+  const args = [
+    body.eventDateTime ?? null,
+    Number(body.duration) || 0,
+    typeof body.title === "string" ? body.title : "",
+    typeof body.description === "string" ? body.description : "",
+    Number(body.importance) || 0,
+  ];
+  if (withInvitees) {
+    args.push(bridgeIDList(body.invitees));
+  }
+  return args;
+}
+
+/** Dispatch a Create*Event and answer the new eventID (null when declined). */
+async function dispatchCalendarCreate(req, res, next, method, args) {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const outcome = await heldTopLevelCall(held, req.webSessionID, "calendarMgr", method, args, null);
+    const eventID = mailNumber(outcome.result);
+    res.json({ ok: true, applied: eventID > 0, eventID: eventID > 0 ? eventID : null, notifications: outcome.notifications });
+  } catch (error) {
+    next(error);
+  }
+}
+
+app.post("/api/bridge/calendar/event/create-personal", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This creates a personal calendar event. Confirm to continue.")) {
+    return;
+  }
+  await dispatchCalendarCreate(req, res, next, "CreatePersonalEvent", calendarCreateArgs(req.body || {}, true));
+});
+
+app.post("/api/bridge/calendar/event/create-corporation", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This creates a corporation calendar event. Confirm to continue.")) {
+    return;
+  }
+  await dispatchCalendarCreate(req, res, next, "CreateCorporationEvent", calendarCreateArgs(req.body || {}, false));
+});
+
+app.post("/api/bridge/calendar/event/create-alliance", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This creates an alliance calendar event. Confirm to continue.")) {
+    return;
+  }
+  await dispatchCalendarCreate(req, res, next, "CreateAllianceEvent", calendarCreateArgs(req.body || {}, false));
+});
+
+// EditPersonalEvent(eventID, oldDateTime, eventDateTime, duration, title, description, importance).
+app.post("/api/bridge/calendar/event/edit", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This edits that calendar event. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const eventID = Number(body.eventID) || 0;
+  if (eventID <= 0) {
+    res.status(400).json({ ok: false, error: "CALENDAR_EVENT_INVALID", message: "An event is required." });
+    return;
+  }
+  const args = [
+    eventID,
+    body.oldDateTime ?? null,
+    body.eventDateTime ?? null,
+    Number(body.duration) || 0,
+    typeof body.title === "string" ? body.title : "",
+    typeof body.description === "string" ? body.description : "",
+    Number(body.importance) || 0,
+  ];
+  await dispatchBridgeWrite(req, res, next, "calendarMgr", "EditPersonalEvent", args);
+});
+
+// ⚠ DESTRUCTIVE — reachable + gated, never fired live. DeleteEvent(eventID, ownerID);
+// canEditOrDeleteEvent gates it server-side, so a foreign eventID is refused.
+app.post("/api/bridge/calendar/event/delete", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "Deleting a calendar event is permanent. This must be confirmed explicitly.")) {
+    return;
+  }
+  const body = req.body || {};
+  const eventID = Number(body.eventID) || 0;
+  if (eventID <= 0) {
+    res.status(400).json({ ok: false, error: "CALENDAR_EVENT_INVALID", message: "An event is required." });
+    return;
+  }
+  const ownerID = body.ownerID !== undefined ? Number(body.ownerID) || null : null;
+  await dispatchBridgeWrite(req, res, next, "calendarMgr", "DeleteEvent", [eventID, ownerID]);
+});
+
+// SendEventResponse(eventID, ownerID, response) — accept/decline/maybe an invite.
+app.post("/api/bridge/calendar/event/respond", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This sends your response to that event. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const eventID = Number(body.eventID) || 0;
+  if (eventID <= 0) {
+    res.status(400).json({ ok: false, error: "CALENDAR_EVENT_INVALID", message: "An event is required." });
+    return;
+  }
+  const ownerID = body.ownerID !== undefined ? Number(body.ownerID) || null : null;
+  const response = Number(body.response) || 0;
+  await dispatchBridgeWrite(req, res, next, "calendarMgr", "SendEventResponse", [eventID, ownerID, response]);
+});
+
+// UpdateEventParticipants(eventID, addList, removeList) — personal events only,
+// canEditOrDeleteEvent gated (a non-owner is refused).
+app.post("/api/bridge/calendar/event/participants", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This updates that event's participants. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const eventID = Number(body.eventID) || 0;
+  if (eventID <= 0) {
+    res.status(400).json({ ok: false, error: "CALENDAR_EVENT_INVALID", message: "An event is required." });
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "calendarMgr", "UpdateEventParticipants", [eventID, bridgeIDList(body.add), bridgeIDList(body.remove)]);
+});
+
+// --- accessGroupBookmarkMgr WRITES ------------------------------------------
+// (reads were wired R65; these are the CRUD writers on the same service.)
+// AddFolder answers the folder view payload; UpdateFolder answers an access-level
+// int; BookmarkStaticLocation answers a bookmark reply tuple; DeleteBookmarks
+// answers the list of deleted ids; DeleteFolder / UpdateBookmark / MoveBookmarks
+// answer null. Every write resolves the folder against the SESSION character's
+// access level (FolderAccessDenied for a foreign folder).
+
+/** Build the shared folder access-group arg tail (admin/manage/use/view group ids, null when absent). */
+function bookmarkGroupArgs(body) {
+  const groupOrNull = (v) => (v !== undefined && v !== null ? Number(v) || null : null);
+  return [
+    groupOrNull(body.adminGroupID),
+    groupOrNull(body.manageGroupID),
+    groupOrNull(body.useGroupID),
+    groupOrNull(body.viewGroupID),
+  ];
+}
+
+app.post("/api/bridge/bookmarks/folder/add", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This creates a bookmark folder. Confirm to continue.")) {
+    return;
+  }
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const body = req.body || {};
+  const isPersonal = body.isPersonal !== undefined ? Boolean(body.isPersonal) : true;
+  const folderName = typeof body.folderName === "string" ? body.folderName : "My Locations";
+  const description = typeof body.description === "string" ? body.description : "";
+  const args = [isPersonal, folderName, description, ...bookmarkGroupArgs(body)];
+  try {
+    const outcome = await heldTopLevelCall(held, req.webSessionID, "accessGroupBookmarkMgr", "AddFolder", args, null);
+    res.json({ ok: true, applied: outcome.result != null, folder: outcome.result ?? null, notifications: outcome.notifications });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/bridge/bookmarks/folder/update", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This updates that bookmark folder. Confirm to continue.")) {
+    return;
+  }
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const body = req.body || {};
+  const folderID = Number(body.folderID) || 0;
+  if (folderID <= 0) {
+    res.status(400).json({ ok: false, error: "BOOKMARK_FOLDER_INVALID", message: "A folder is required." });
+    return;
+  }
+  const folderName = typeof body.folderName === "string" ? body.folderName : "";
+  const description = typeof body.description === "string" ? body.description : "";
+  const args = [folderID, folderName, description, ...bookmarkGroupArgs(body)];
+  try {
+    const outcome = await heldTopLevelCall(held, req.webSessionID, "accessGroupBookmarkMgr", "UpdateFolder", args, null);
+    const accessLevel = mailNumber(outcome.result);
+    res.json({ ok: true, applied: true, accessLevel, notifications: outcome.notifications });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ⚠ DESTRUCTIVE — reachable + gated, never fired live. DeleteFolder(folderID);
+// non-personal folders require ACCESS_ADMIN server-side.
+app.post("/api/bridge/bookmarks/folder/delete", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "Deleting a bookmark folder is permanent. This must be confirmed explicitly.")) {
+    return;
+  }
+  const folderID = Number((req.body || {}).folderID) || 0;
+  if (folderID <= 0) {
+    res.status(400).json({ ok: false, error: "BOOKMARK_FOLDER_INVALID", message: "A folder is required." });
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "accessGroupBookmarkMgr", "DeleteFolder", [folderID]);
+});
+
+// BookmarkStaticLocation(itemID, folderID, name, comment, expiryMode, subfolderID).
+app.post("/api/bridge/bookmarks/create-static", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This saves a bookmark. Confirm to continue.")) {
+    return;
+  }
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const body = req.body || {};
+  const itemID = Number(body.itemID) || 0;
+  if (itemID <= 0) {
+    res.status(400).json({ ok: false, error: "BOOKMARK_ITEM_INVALID", message: "A location item is required." });
+    return;
+  }
+  const args = [
+    itemID,
+    Number(body.folderID) || 0,
+    typeof body.name === "string" ? body.name : "",
+    typeof body.comment === "string" ? body.comment : "",
+    Number(body.expiryMode) || 0,
+    body.subfolderID !== undefined ? Number(body.subfolderID) || null : null,
+  ];
+  try {
+    const outcome = await heldTopLevelCall(held, req.webSessionID, "accessGroupBookmarkMgr", "BookmarkStaticLocation", args, null);
+    res.json({ ok: true, applied: outcome.result != null, bookmark: outcome.result ?? null, notifications: outcome.notifications });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// UpdateBookmark(bookmarkID, folderID, name, note, subfolderID, newFolderID, expiryCancel).
+app.post("/api/bridge/bookmarks/update", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This updates that bookmark. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const bookmarkID = Number(body.bookmarkID) || 0;
+  if (bookmarkID <= 0) {
+    res.status(400).json({ ok: false, error: "BOOKMARK_INVALID", message: "A bookmark is required." });
+    return;
+  }
+  const folderID = Number(body.folderID) || 0;
+  const args = [
+    bookmarkID,
+    folderID,
+    typeof body.name === "string" ? body.name : "",
+    typeof body.note === "string" ? body.note : "",
+    body.subfolderID !== undefined ? Number(body.subfolderID) || null : null,
+    body.newFolderID !== undefined ? Number(body.newFolderID) || folderID : folderID,
+    Boolean(body.expiryCancel),
+  ];
+  await dispatchBridgeWrite(req, res, next, "accessGroupBookmarkMgr", "UpdateBookmark", args);
+});
+
+// ⚠ DESTRUCTIVE — reachable + gated, never fired live. DeleteBookmarks(folderID,
+// bookmarkIDs); each id must sit in a folder the session char can manage (or be
+// its creator).
+app.post("/api/bridge/bookmarks/delete", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "Deleting those bookmarks is permanent. This must be confirmed explicitly.")) {
+    return;
+  }
+  const body = req.body || {};
+  const folderID = Number(body.folderID) || 0;
+  await dispatchBridgeWrite(req, res, next, "accessGroupBookmarkMgr", "DeleteBookmarks", [folderID, bridgeIDList(body.bookmarkIDs)]);
+});
+
+// MoveBookmarksToFolderAndSubfolder(oldFolderID, newFolderID, subfolderID, bookmarkIDs).
+app.post("/api/bridge/bookmarks/move", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This moves those bookmarks. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const args = [
+    Number(body.oldFolderID) || 0,
+    Number(body.newFolderID) || 0,
+    body.subfolderID !== undefined ? Number(body.subfolderID) || null : null,
+    bridgeIDList(body.bookmarkIDs),
+  ];
+  await dispatchBridgeWrite(req, res, next, "accessGroupBookmarkMgr", "MoveBookmarksToFolderAndSubfolder", args);
+});
+
+// --- R88 character + social WRITES ------------------------------------------
+// (charMgr / charUnboundMgr / LSC)
+//
+// The Phase-3 "character + social" writes batch, following the R86/R87 pattern.
+// Every write is a TOP-LEVEL call on the held session (heldTopLevelCall) and
+// every route is CONFIRM-GATED via requireWriteConfirmation (from R87): it
+// refuses outright (400 CONFIRMATION_REQUIRED, NO dispatch) unless the browser
+// passes `confirm: true`. A stray click / stray POST cannot mutate anything.
+//
+// ⚠ SCOPE — where the write lands:
+//   • charMgr Set*/Log*/Add/Delete/Block/Unblock/*Note all resolve the acting
+//     character from the SESSION (sessionCharacterID(session)) server-side. The
+//     contact/block/note stores are keyed by the session character, so no
+//     browser arg can redirect the mutation at a FOREIGN character's list. A
+//     note-about-an-item (SetNote(itemID)) / owner-note is the SESSION char's
+//     own note store keyed by that id — session-scoped storage, not a foreign
+//     mutation.
+//   • charUnboundMgr CancelCharacterDeletePrepare(charId) is guarded by
+//     session.userid (cancelCharacterDeletePrepare(charId, userid)); ToggleValidation
+//     is a debug-only session flag (a normal session is a no-op returning true).
+//   • ⚠ charUnboundMgr UpdateCharacterGender(charId,...) / UpdateCharacterBloodline(charId,...)
+//     take a CALLER-SUPPLIED charId and mutate that character record directly with
+//     no ownership check on the record write (only the session-mirror of gender is
+//     account-scoped). These are character-CREATION-flow writes (a pre-birth doll),
+//     but the handler trusts the arg — WRITE-SIDE ARG-INJECTION candidate, flagged
+//     in docs/arg-injection-leak-handoff.md. Kept plumbed (server-side fix + QA
+//     later); confirm-gated here.
+//
+// ⚠ EXTRA-CARE writes — reachable + confirm-gated, NEVER fired on the live world
+// in this plumbing pass: CreateCharacterWithDoll (creates a whole character),
+// LSC.SendMessage (sends an OUTWARD chat message), CancelCharacterDeletePrepare
+// (char-lifecycle).
+//
+// FAST-MODE educated-guess responses: every handler returns null except
+// AddOwnerNote (a new noteID), ToggleValidation (a bool) and CreateCharacterWithDoll
+// (the new characterID) — dispatchBridgeWrite surfaces `result` for those; the
+// decoders (web/src/bridge/{characterProfile,charAccount,chat}.ts) read the acks.
+
+// --- charMgr WRITES (12) — all SESSION-scoped -------------------------------
+
+app.post("/api/bridge/character/set-description", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This updates your character bio. Confirm to continue.")) {
+    return;
+  }
+  const description = typeof (req.body || {}).description === "string" ? req.body.description : "";
+  await dispatchBridgeWrite(req, res, next, "charMgr", "SetCharacterDescription", [description]);
+});
+
+app.post("/api/bridge/character/set-activity-status", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This sets your activity status. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const status = Number(body.status) || 0;
+  const extraInfo = body.extraInfo !== undefined ? body.extraInfo : null;
+  await dispatchBridgeWrite(req, res, next, "charMgr", "SetActivityStatus", [status, extraInfo]);
+});
+
+app.post("/api/bridge/character/log-settings", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This records your settings telemetry. Confirm to continue.")) {
+    return;
+  }
+  const settings = (req.body || {}).settings ?? {};
+  await dispatchBridgeWrite(req, res, next, "charMgr", "LogSettings", [settings]);
+});
+
+app.post("/api/bridge/character/contacts/add", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This adds a contact. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const contactID = Number(body.contactID) || 0;
+  if (contactID <= 0) {
+    res.status(400).json({ ok: false, error: "CONTACT_INVALID", message: "A contact is required." });
+    return;
+  }
+  const args = [contactID, Number(body.relationshipID) || 0, Boolean(body.inWatchlist)];
+  await dispatchBridgeWrite(req, res, next, "charMgr", "AddContact", args);
+});
+
+app.post("/api/bridge/character/contacts/delete", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This removes those contacts. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "charMgr", "DeleteContacts", [bridgeIDList((req.body || {}).contactIDs)]);
+});
+
+app.post("/api/bridge/character/contacts/edit-relationship", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This changes those contacts' standing. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const args = [bridgeIDList(body.contactIDs), Number(body.relationshipID) || 0];
+  await dispatchBridgeWrite(req, res, next, "charMgr", "EditContactsRelationshipID", args);
+});
+
+app.post("/api/bridge/character/block-owners", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This blocks those owners. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "charMgr", "BlockOwners", [bridgeIDList((req.body || {}).ownerIDs)]);
+});
+
+app.post("/api/bridge/character/unblock-owners", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This unblocks those owners. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "charMgr", "UnblockOwners", [bridgeIDList((req.body || {}).ownerIDs)]);
+});
+
+// SetNote(itemID, noteText) — the session char's private note ABOUT an entity.
+app.post("/api/bridge/character/notes/set", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This saves your note. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const itemID = Number(body.itemID) || 0;
+  if (itemID <= 0) {
+    res.status(400).json({ ok: false, error: "NOTE_ITEM_INVALID", message: "A subject item is required." });
+    return;
+  }
+  const noteText = typeof body.note === "string" ? body.note : "";
+  await dispatchBridgeWrite(req, res, next, "charMgr", "SetNote", [itemID, noteText]);
+});
+
+// AddOwnerNote(label, note) — answers the new noteID (surfaced via result).
+app.post("/api/bridge/character/owner-notes/add", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This adds an owner note. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const label = typeof body.label === "string" ? body.label : "";
+  const noteText = typeof body.note === "string" ? body.note : "";
+  await dispatchBridgeWrite(req, res, next, "charMgr", "AddOwnerNote", [label, noteText]);
+});
+
+app.post("/api/bridge/character/owner-notes/edit", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This edits that owner note. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const noteID = Number(body.noteID) || 0;
+  if (noteID <= 0) {
+    res.status(400).json({ ok: false, error: "OWNER_NOTE_INVALID", message: "A note is required." });
+    return;
+  }
+  const label = typeof body.label === "string" ? body.label : "";
+  const noteText = typeof body.note === "string" ? body.note : "";
+  await dispatchBridgeWrite(req, res, next, "charMgr", "EditOwnerNote", [noteID, label, noteText]);
+});
+
+app.post("/api/bridge/character/owner-notes/remove", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This removes that owner note. Confirm to continue.")) {
+    return;
+  }
+  const noteID = Number((req.body || {}).noteID) || 0;
+  if (noteID <= 0) {
+    res.status(400).json({ ok: false, error: "OWNER_NOTE_INVALID", message: "A note is required." });
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "charMgr", "RemoveOwnerNote", [noteID]);
+});
+
+// --- charUnboundMgr WRITES (5) ----------------------------------------------
+
+// ⚠ EXTRA-CARE (char-lifecycle) — reachable + gated, never fired live.
+// CancelCharacterDeletePrepare(charId); server guards on session.userid.
+app.post("/api/bridge/character/cancel-delete-prepare", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This cancels a pending character deletion. This must be confirmed explicitly.")) {
+    return;
+  }
+  const charID = Number((req.body || {}).charID) || 0;
+  if (charID <= 0) {
+    res.status(400).json({ ok: false, error: "CHARACTER_INVALID", message: "A character is required." });
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "charUnboundMgr", "CancelCharacterDeletePrepare", [charID]);
+});
+
+// ToggleValidation() — debug-only creation-flow flag (a normal session no-ops
+// and returns true); surfaced via result.
+app.post("/api/bridge/character/toggle-validation", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This toggles character-creation validation. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "charUnboundMgr", "ToggleValidation", []);
+});
+
+/**
+ * The world's own character-creation tables, off the retail read
+ * charUnboundMgr.GetCharCreationInfo.
+ *
+ * ⚠ THE AUTHORITY ON WHAT IS CREATABLE. CreateCharacterWithDoll derives race,
+ * character typeID, starter corporation, starting station and rookie ship from
+ * the BLOODLINE (resolveCharacterCreationBloodlineProfile / the school lookup
+ * beside it), so a bloodline this read does not name is one the writer cannot
+ * honor. The create route validates against these rows for that reason, rather
+ * than trusting the ids the browser sends.
+ *
+ * Wire shape: {type:"dict"} of "races" -> {type:"list"} of util.KeyVal, and
+ * "bloodlines" -> the same. Decoded to plain rows here because the write path
+ * needs to reason about them; the READ route ships the raw dict on to the
+ * browser untouched, like every other bridge read.
+ */
+function decodeCharCreationTables(result) {
+  const dictEntries =
+    result && result.type === "dict" && Array.isArray(result.entries) ? result.entries : [];
+  const listOf = (key) => {
+    const entry = dictEntries.find((pair) => Array.isArray(pair) && pair[0] === key);
+    const value = entry ? entry[1] : null;
+    return value && Array.isArray(value.items) ? value.items : [];
+  };
+  const readField = (row, field) => {
+    const entries =
+      row && row.args && Array.isArray(row.args.entries) ? row.args.entries : [];
+    const entry = entries.find((pair) => Array.isArray(pair) && pair[0] === field);
+    return entry ? entry[1] : undefined;
+  };
+  const asInt = (value) => {
+    const numeric = Number(value && typeof value === "object" ? value.value : value);
+    return Number.isFinite(numeric) ? Math.trunc(numeric) : 0;
+  };
+  const asText = (value) => (typeof value === "string" ? value : "");
+
+  return {
+    races: listOf("races")
+      .map((row) => ({
+        raceID: asInt(readField(row, "raceID")),
+        raceName: asText(readField(row, "raceName")),
+        shipTypeID: asInt(readField(row, "shipTypeID")),
+        shipName: asText(readField(row, "shipName")),
+      }))
+      .filter((race) => race.raceID > 0),
+    bloodlines: listOf("bloodlines")
+      .map((row) => ({
+        bloodlineID: asInt(readField(row, "bloodlineID")),
+        bloodlineName: asText(readField(row, "bloodlineName")),
+        raceID: asInt(readField(row, "raceID")),
+        corporationID: asInt(readField(row, "corporationID")),
+      }))
+      .filter((bloodline) => bloodline.bloodlineID > 0),
+  };
+}
+
+// GET /api/bridge/char-creation-info — everything the create-character screen
+// needs to offer a choice, from the TWO sources that actually have it.
+//
+// ACCOUNT-LEVEL, not character-level: this is the screen a player reaches with
+// no character online (and, on a fresh account, with no character at all), so it
+// must not sit behind a held session. See accountLevelCall.
+//
+// races + bloodlines come from the retail read (the world's own tables — the
+// authority on what CreateCharacterWithDoll will accept) and ship out raw, like
+// every other bridge read. ancestries come from the SDE, because this world has
+// no ancestry table at all: the writer stores ancestryID verbatim and never
+// validates it. Filtering the SDE's ancestries down to the bloodlines this world
+// actually has is the browser's job — it has both lists.
+app.get("/api/bridge/char-creation-info", requireAuth, async (req, res, next) => {
+  try {
+    const outcome = await accountLevelCall(req, "charUnboundMgr", "GetCharCreationInfo", []);
+    res.json({
+      ok: true,
+      creationInfo: outcome.result ?? null,
+      ancestries: staticData.listAncestries(),
+      notifications: outcome.notifications,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/** A positive int off a JSON body field; 0 when absent or unparseable. */
+function creationBodyID(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric > 0 ? Math.trunc(numeric) : 0;
+}
+
+// ⚠ EXTRA-CARE (creates a whole character) — confirm-gated.
+// POST /api/bridge/character/create-with-doll
+//   { name, raceID, genderID, bloodlineID?, ancestryID?, confirm: true }
+//
+// ACCOUNT-LEVEL (see accountLevelCall): creation necessarily precedes selection,
+// and on a new account there is nothing to select, so this cannot sit behind a
+// held session. The account it creates on is the BFF's own req.account.accountID
+// — the browser never names an account, and the handler itself reads
+// session.userid, so a body cannot aim this at someone else's account.
+//
+// TYPED BODY, NOT RAW ARGS. This used to forward `body.args` verbatim, which was
+// fine for a plumbing probe that never fired, but it means the browser composes
+// the retail tuple — including the doll payloads. The tuple is built here now,
+// from named fields, against the world's own tables:
+//
+//   • bloodlineID must belong to raceID. An unknown or mismatched one is
+//     REFUSED rather than silently corrected, because bloodline is what the
+//     writer derives race / corp / station / rookie ship from — quietly
+//     creating a different character than the one asked for is worse than
+//     saying no. Absent, it is rolled at random within the race.
+//   • ancestryID must belong to the resolved bloodline (checked against the SDE
+//     rows, since the world has no ancestry table). Absent, rolled at random.
+//   • schoolID is sent as 0 so the server picks a school for the race itself
+//     (resolveCharacterCreationSchoolIDForRace). School only chooses the starter
+//     CORPORATION here — every new character starts at the same station
+//     regardless (NEW_CHARACTER_START_OVERRIDE).
+//   • The two paperdoll payloads are hard nulls. This client renders no doll,
+//     and a null pair is what makes the handler record paperDollState 2 ("no
+//     doll") rather than claim an empty one exists.
+//
+// The 7-arg LEGACY signature is deliberate: resolveCreateCharacterSignature only
+// reads args[7] as a raceID for the 8-arg container shapes, and those require
+// both doll payloads to be present. With nulls there, a would-be 8th element is
+// never read — so passing raceID would be passing a number the handler ignores.
+// Race reaches the server through the bloodline, which is where it genuinely
+// lives.
+//
+// The NAME is not pre-validated here. validateCharacterName runs server-side on
+// every create and rejects with CharNameInvalid; the screen calls ValidateNameEx
+// as the player types so the refusal is not a surprise, and this route lets the
+// server have the last word.
+app.post("/api/bridge/character/create-with-doll", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This creates a NEW character. This must be confirmed explicitly.")) {
+    return;
+  }
+  const body = req.body || {};
+  const name = String(body.name || "").trim().replace(/\s+/g, " ");
+  const raceID = creationBodyID(body.raceID);
+  const requestedBloodlineID = creationBodyID(body.bloodlineID);
+  const requestedAncestryID = creationBodyID(body.ancestryID);
+  // 0 (female) is a legal gender, so an absent field defaults to 1 (male) the
+  // way the handler's own normalizeCreationGender does rather than to 0.
+  const genderID = body.genderID === 0 || body.genderID === "0" ? 0 : 1;
+
+  if (!name) {
+    res.status(400).json({ ok: false, error: "NAME_REQUIRED", message: "A character name is required." });
+    return;
+  }
+  if (raceID <= 0) {
+    res.status(400).json({ ok: false, error: "RACE_REQUIRED", message: "A race is required." });
+    return;
+  }
+
+  try {
+    const tables = decodeCharCreationTables(
+      (await accountLevelCall(req, "charUnboundMgr", "GetCharCreationInfo", [])).result,
+    );
+    if (!tables.races.some((race) => race.raceID === raceID)) {
+      res.status(400).json({ ok: false, error: "RACE_UNKNOWN", message: "That race does not exist on this server." });
+      return;
+    }
+
+    const raceBloodlines = tables.bloodlines.filter((bloodline) => bloodline.raceID === raceID);
+    if (raceBloodlines.length === 0) {
+      res.status(409).json({
+        ok: false,
+        error: "NO_BLOODLINE_FOR_RACE",
+        message: "This server has no bloodline for that race.",
+      });
+      return;
+    }
+    let bloodline = null;
+    if (requestedBloodlineID > 0) {
+      bloodline = raceBloodlines.find((row) => row.bloodlineID === requestedBloodlineID) || null;
+      if (!bloodline) {
+        res.status(400).json({
+          ok: false,
+          error: "BLOODLINE_INVALID",
+          message: "That bloodline does not belong to that race.",
+        });
+        return;
+      }
+    } else {
+      bloodline = raceBloodlines[Math.floor(Math.random() * raceBloodlines.length)];
+    }
+
+    const bloodlineAncestries = staticData
+      .listAncestries()
+      .filter((ancestry) => ancestry.bloodlineID === bloodline.bloodlineID);
+    let ancestryID = 0;
+    if (requestedAncestryID > 0) {
+      if (!bloodlineAncestries.some((ancestry) => ancestry.ancestryID === requestedAncestryID)) {
+        res.status(400).json({
+          ok: false,
+          error: "ANCESTRY_INVALID",
+          message: "That ancestry does not belong to that bloodline.",
+        });
+        return;
+      }
+      ancestryID = requestedAncestryID;
+    } else if (bloodlineAncestries.length > 0) {
+      ancestryID =
+        bloodlineAncestries[Math.floor(Math.random() * bloodlineAncestries.length)].ancestryID;
+    }
+
+    const args = [name, bloodline.bloodlineID, genderID, ancestryID, null, null, 0];
+    const outcome = await accountLevelCall(req, "charUnboundMgr", "CreateCharacterWithDoll", args);
+    const characterID = Number(outcome.result) || 0;
+    res.json({
+      ok: true,
+      applied: characterID > 0,
+      result: outcome.result ?? null,
+      characterID: characterID > 0 ? characterID : null,
+      // What the rolls landed on, so the screen can say what it made.
+      bloodlineID: bloodline.bloodlineID,
+      ancestryID: ancestryID || null,
+      notifications: outcome.notifications,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ⚠ WRITE-SIDE ARG-INJECTION (flagged) — UpdateCharacterGender(charId, genderID)
+// mutates the caller-supplied character record directly (creation-flow write).
+app.post("/api/bridge/character/update-gender", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This updates the character's gender. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const charID = Number(body.charID) || 0;
+  if (charID <= 0) {
+    res.status(400).json({ ok: false, error: "CHARACTER_INVALID", message: "A character is required." });
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "charUnboundMgr", "UpdateCharacterGender", [charID, Number(body.genderID) || 1]);
+});
+
+// ⚠ WRITE-SIDE ARG-INJECTION (flagged) — UpdateCharacterBloodline(charId, bloodlineID).
+app.post("/api/bridge/character/update-bloodline", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This updates the character's bloodline. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const charID = Number(body.charID) || 0;
+  if (charID <= 0) {
+    res.status(400).json({ ok: false, error: "CHARACTER_INVALID", message: "A character is required." });
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "charUnboundMgr", "UpdateCharacterBloodline", [charID, Number(body.bloodlineID) || 1]);
+});
+
+// --- The GM console ---------------------------------------------------------
+//
+// ⚠⚠ DEV-ONLY, AND THE WIDEST SURFACE IN THIS FILE. slash.SlashCmd runs this
+// world's own chat commands (eve.js services/chat/chatCommands.js) — ~150 of
+// them, including destructive ones (/suicide), world-spawning ones (/npc) and
+// the item-granting ones this route exists for (/giveitem, /gmships,
+// /gmweapons, /giveskill). eve.js applies NO role gate to any of them.
+//
+// It is here because the web client could not otherwise stage its own test
+// state: no way to give a pilot a ship, a module or a round of ammunition, so
+// features whose subject the test pilot simply does not own could not be
+// exercised at all. That is not a hypothetical — the ammo work is blocked on
+// exactly this, because the only live pilot flies a mining barge whose modules
+// take no charges.
+//
+// The command is forwarded VERBATIM and deliberately so: this is an operator's
+// console, and a BFF that curated the command list would be a worse, staler
+// copy of the server's own. What the route does add is the confirmation gate,
+// and the refusal to let the generic /call seam reach the same pair.
+//
+// The reply is the server's own message string (or its "Command failed: …"),
+// surfaced untouched — the console shows what the world said, never a guess.
+app.post("/api/bridge/gm/slash", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This runs a GM command against the live world. Confirm to continue.")) {
+    return;
+  }
+  const command = String((req.body || {}).command || "").trim();
+  if (!command) {
+    res.status(400).json({ ok: false, error: "COMMAND_REQUIRED", message: "A command is required." });
+    return;
+  }
+  if (!command.startsWith("/") && !command.startsWith(".")) {
+    // The server answers a bare word with its whole command list, which reads as
+    // a wall of noise. Say the one thing that is actually wrong instead.
+    res.status(400).json({
+      ok: false,
+      error: "COMMAND_INVALID",
+      message: "A GM command starts with / (or . for the container commands).",
+    });
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "slash", "SlashCmd", [command]);
+});
+
+// --- LSC WRITES (1) ---------------------------------------------------------
+
+// ⚠ EXTRA-CARE (OUTWARD — sends a live chat message) — reachable + gated, NEVER
+// fired live. SendMessage(channelID, message).
+app.post("/api/bridge/chat/send-message", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This sends a message to that channel. This must be confirmed explicitly.")) {
+    return;
+  }
+  const body = req.body || {};
+  const message = typeof body.message === "string" ? body.message : "";
+  if (!message.trim()) {
+    res.status(400).json({ ok: false, error: "MESSAGE_EMPTY", message: "A message is required." });
+    return;
+  }
+  const channelID = body.channelID !== undefined ? Number(body.channelID) || 0 : 0;
+  await dispatchBridgeWrite(req, res, next, "LSC", "SendMessage", [channelID, message]);
+});
+
+// --- R89 FINANCIAL WRITES ---------------------------------------------------
+// (account / LPSvc / LPStoreMgr / insuranceSvc / bountyProxy / killRightMgr)
+//
+// The Phase-3 "financial" writes batch, following the R86–R88 pattern. Every
+// write is a TOP-LEVEL call on the held session (dispatchBridgeWrite) and every
+// route is CONFIRM-GATED via requireWriteConfirmation: it refuses outright
+// (400 CONFIRMATION_REQUIRED, NO dispatch) unless the browser passes
+// `confirm: true`. A stray click / stray POST cannot move ISK or LP.
+//
+// ⚠⚠ SAFETY — EVERY write here SPENDS/TRANSFERS ISK or LP, or affects a kill
+// right. NONE is ever fired on the live world in the plumbing pass: these routes
+// are verified only for reachability + refuses-without-confirm. The ISK/LP
+// spenders carry an explicit "this spends/transfers ISK/LP" confirm message.
+//
+// ⚠ SCOPE — where the money leaves (all session-scoped, no foreign source):
+//   • account.GiveCash debits session.characterID; GiveCashFromCorpAccount debits
+//     the SESSION's corp wallet (server resolveSessionCorporationID) — the
+//     fromAccountKey only picks a division WITHIN that corp. SetContactCost sets
+//     the session character's contact price.
+//   • LPSvc.TransferLPFromMyWalletToOtherCorp / TransferLPFromMyCorpWalletToOtherCorp
+//     resolve the source from the SESSION (character wallet / session.corporationID
+//     with a corp-role check); the first arg is the RECEIVER corp, the second the
+//     LP issuer namespace — never the source. ExchangeConcordLP is a stub.
+//   • LPStoreMgr.TakeOfferForCharacter spends the SESSION char's LP (corpID selects
+//     the STORE); TakeOfferForCorporation is a stub.
+//   • insuranceSvc.InsureShip debits the session; itemID is the ship to insure.
+//   • bountyProxy.AddToBounty debits the session char's wallet; SellKillRight /
+//     CancelSellKillRight list/withdraw a kill right the session owns.
+//   • killRightMgr.ActivateKillRight / BuyKillRight act on the session character.
+// No caller-supplied FOREIGN source was found — nothing appended to
+// docs/arg-injection-leak-handoff.md for this batch.
+//
+// FAST-MODE educated-guess responses: most handlers return null (GiveCash to a
+// corp answers a [from,to] balance pair; TakeOfferForCharacter a bool) — the
+// decoders (web/src/bridge/{wallet,rewards,lpStore,insurance,bounties,killRights}.ts)
+// read the acks. These are EDUCATED GUESSES, never exercised (never fired live).
+
+// --- account WRITES (3) — session-scoped source -----------------------------
+
+// SetContactCost(cost) — the price other chars pay to add the session char.
+app.post("/api/bridge/account/set-contact-cost", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This sets your contact price. Confirm to continue.")) {
+    return;
+  }
+  const cost = Number((req.body || {}).cost) || 0;
+  await dispatchBridgeWrite(req, res, next, "account", "SetContactCost", [cost]);
+});
+
+// ⚠ FINANCIAL (transfers ISK from YOUR wallet) — reachable + gated, NEVER fired live.
+// GiveCash(toID, amount, reason).
+app.post("/api/bridge/account/give-cash", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This TRANSFERS ISK from your wallet to another party. This must be confirmed explicitly.")) {
+    return;
+  }
+  const body = req.body || {};
+  const toID = Number(body.toID) || 0;
+  const amount = Number(body.amount) || 0;
+  if (toID <= 0 || amount <= 0) {
+    res.status(400).json({ ok: false, error: "TRANSFER_INVALID", message: "A recipient and a positive amount are required." });
+    return;
+  }
+  const reason = typeof body.reason === "string" ? body.reason : "";
+  await dispatchBridgeWrite(req, res, next, "account", "GiveCash", [toID, amount, reason]);
+});
+
+// ⚠ FINANCIAL (transfers ISK from your CORP wallet) — reachable + gated, NEVER fired live.
+// GiveCashFromCorpAccount(toID, amount, fromAccountKey, reason). The source corp
+// is the SESSION's corp (server-resolved); fromAccountKey picks the division.
+app.post("/api/bridge/account/give-cash-from-corp", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This TRANSFERS ISK from your corporation wallet. This must be confirmed explicitly.")) {
+    return;
+  }
+  const body = req.body || {};
+  const toID = Number(body.toID) || 0;
+  const amount = Number(body.amount) || 0;
+  if (toID <= 0 || amount <= 0) {
+    res.status(400).json({ ok: false, error: "TRANSFER_INVALID", message: "A recipient and a positive amount are required." });
+    return;
+  }
+  const fromAccountKey = body.fromAccountKey !== undefined ? Number(body.fromAccountKey) || null : null;
+  const reason = typeof body.reason === "string" ? body.reason : "";
+  await dispatchBridgeWrite(req, res, next, "account", "GiveCashFromCorpAccount", [toID, amount, fromAccountKey, reason]);
+});
+
+// --- LPSvc WRITES (3) — session-scoped source -------------------------------
+
+// ExchangeConcordLP() — a stub in this world; still confirm-gated (LP mover).
+app.post("/api/bridge/lp/exchange-concord", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This EXCHANGES your CONCORD LP. This must be confirmed explicitly.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "LPSvc", "ExchangeConcordLP", []);
+});
+
+// ⚠ FINANCIAL (moves LP from YOUR wallet) — reachable + gated, NEVER fired live.
+// TransferLPFromMyWalletToOtherCorp(receiverCorpID, issuerCorpID, lpAmount).
+app.post("/api/bridge/lp/transfer-from-my-wallet", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This TRANSFERS LP from your wallet to another corporation. This must be confirmed explicitly.")) {
+    return;
+  }
+  const body = req.body || {};
+  const receiverCorpID = Number(body.receiverCorpID) || 0;
+  const lpAmount = Number(body.lpAmount) || 0;
+  if (receiverCorpID <= 0 || lpAmount <= 0) {
+    res.status(400).json({ ok: false, error: "LP_TRANSFER_INVALID", message: "A receiver corporation and a positive LP amount are required." });
+    return;
+  }
+  const issuerCorpID = body.issuerCorpID !== undefined ? Number(body.issuerCorpID) || 0 : 0;
+  await dispatchBridgeWrite(req, res, next, "LPSvc", "TransferLPFromMyWalletToOtherCorp", [receiverCorpID, issuerCorpID, lpAmount]);
+});
+
+// ⚠ FINANCIAL (moves LP from your CORP wallet) — reachable + gated, NEVER fired live.
+// TransferLPFromMyCorpWalletToOtherCorp(receiverCorpID, issuerCorpID, lpAmount).
+// Source corp = the SESSION's corp (role-gated); receiverCorpID is the destination.
+app.post("/api/bridge/lp/transfer-from-my-corp", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This TRANSFERS LP from your corporation wallet. This must be confirmed explicitly.")) {
+    return;
+  }
+  const body = req.body || {};
+  const receiverCorpID = Number(body.receiverCorpID) || 0;
+  const lpAmount = Number(body.lpAmount) || 0;
+  if (receiverCorpID <= 0 || lpAmount <= 0) {
+    res.status(400).json({ ok: false, error: "LP_TRANSFER_INVALID", message: "A receiver corporation and a positive LP amount are required." });
+    return;
+  }
+  const issuerCorpID = body.issuerCorpID !== undefined ? Number(body.issuerCorpID) || 0 : 0;
+  await dispatchBridgeWrite(req, res, next, "LPSvc", "TransferLPFromMyCorpWalletToOtherCorp", [receiverCorpID, issuerCorpID, lpAmount]);
+});
+
+// --- LPStoreMgr WRITES (2) — session-scoped source --------------------------
+
+// ⚠ FINANCIAL (spends YOUR LP on a store offer) — reachable + gated, NEVER fired live.
+// TakeOfferForCharacter(corpID, offerID, numberOfOffers).
+app.post("/api/bridge/lp-store/take-offer-character", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This SPENDS your loyalty points on that store offer. This must be confirmed explicitly.")) {
+    return;
+  }
+  const body = req.body || {};
+  const offerID = Number(body.offerID) || 0;
+  if (offerID <= 0) {
+    res.status(400).json({ ok: false, error: "OFFER_INVALID", message: "A store offer is required." });
+    return;
+  }
+  const corpID = body.corpID !== undefined ? Number(body.corpID) || 0 : 0;
+  const numberOfOffers = Number(body.numberOfOffers) || 1;
+  await dispatchBridgeWrite(req, res, next, "LPStoreMgr", "TakeOfferForCharacter", [corpID, offerID, numberOfOffers]);
+});
+
+// ⚠ FINANCIAL (spends CORP LP on a store offer) — reachable + gated, NEVER fired live.
+// TakeOfferForCorporation(corpID, offerID, numberOfOffers).
+app.post("/api/bridge/lp-store/take-offer-corp", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This SPENDS your corporation's loyalty points on that store offer. This must be confirmed explicitly.")) {
+    return;
+  }
+  const body = req.body || {};
+  const offerID = Number(body.offerID) || 0;
+  if (offerID <= 0) {
+    res.status(400).json({ ok: false, error: "OFFER_INVALID", message: "A store offer is required." });
+    return;
+  }
+  const corpID = body.corpID !== undefined ? Number(body.corpID) || 0 : 0;
+  const numberOfOffers = Number(body.numberOfOffers) || 1;
+  await dispatchBridgeWrite(req, res, next, "LPStoreMgr", "TakeOfferForCorporation", [corpID, offerID, numberOfOffers]);
+});
+
+// --- insuranceSvc WRITES (2) — session-scoped source ------------------------
+
+// ⚠ FINANCIAL (spends ISK on a policy) — reachable + gated, NEVER fired live.
+// InsureShip(itemID, quotedPremium, isCorpItem).
+app.post("/api/bridge/insurance/insure-ship", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This SPENDS ISK to insure that ship. This must be confirmed explicitly.")) {
+    return;
+  }
+  const body = req.body || {};
+  const itemID = Number(body.itemID) || 0;
+  if (itemID <= 0) {
+    res.status(400).json({ ok: false, error: "SHIP_INVALID", message: "A ship is required." });
+    return;
+  }
+  const quotedPremium = Number(body.quotedPremium) || 0;
+  const isCorpItem = body.isCorpItem ? 1 : 0;
+  await dispatchBridgeWrite(req, res, next, "insuranceSvc", "InsureShip", [itemID, quotedPremium, isCorpItem]);
+});
+
+// UnInsureShip(itemID) — voids a policy (no refund); still confirm-gated.
+app.post("/api/bridge/insurance/uninsure-ship", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This VOIDS that ship's insurance policy (no refund). This must be confirmed explicitly.")) {
+    return;
+  }
+  const itemID = Number((req.body || {}).itemID) || 0;
+  if (itemID <= 0) {
+    res.status(400).json({ ok: false, error: "SHIP_INVALID", message: "A ship is required." });
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "insuranceSvc", "UnInsureShip", [itemID]);
+});
+
+// --- bountyProxy WRITES (3) — session-scoped source -------------------------
+
+// ⚠ FINANCIAL (spends ISK to place a bounty) — reachable + gated, NEVER fired live.
+// AddToBounty(targetID, amount).
+app.post("/api/bridge/bounty/add", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This SPENDS ISK to place a bounty. This must be confirmed explicitly.")) {
+    return;
+  }
+  const body = req.body || {};
+  const targetID = Number(body.targetID) || 0;
+  const amount = Number(body.amount) || 0;
+  if (targetID <= 0 || amount <= 0) {
+    res.status(400).json({ ok: false, error: "BOUNTY_INVALID", message: "A target and a positive amount are required." });
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "bountyProxy", "AddToBounty", [targetID, amount]);
+});
+
+// SellKillRight(killRightID, price) — lists a kill right the session owns for sale.
+app.post("/api/bridge/kill-right/sell", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This lists that kill right for sale. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const killRightID = Number(body.killRightID) || 0;
+  if (killRightID <= 0) {
+    res.status(400).json({ ok: false, error: "KILL_RIGHT_INVALID", message: "A kill right is required." });
+    return;
+  }
+  const price = Number(body.price) || 0;
+  await dispatchBridgeWrite(req, res, next, "bountyProxy", "SellKillRight", [killRightID, price]);
+});
+
+// CancelSellKillRight(killRightID) — withdraws a listed kill right.
+app.post("/api/bridge/kill-right/cancel-sell", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This withdraws that kill right from sale. Confirm to continue.")) {
+    return;
+  }
+  const killRightID = Number((req.body || {}).killRightID) || 0;
+  if (killRightID <= 0) {
+    res.status(400).json({ ok: false, error: "KILL_RIGHT_INVALID", message: "A kill right is required." });
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "bountyProxy", "CancelSellKillRight", [killRightID]);
+});
+
+// --- killRightMgr WRITES (2) — session-scoped source ------------------------
+
+// ActivateKillRight(killRightID) — activates a kill right the session owns.
+app.post("/api/bridge/kill-right/activate", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This activates that kill right. This must be confirmed explicitly.")) {
+    return;
+  }
+  const killRightID = Number((req.body || {}).killRightID) || 0;
+  if (killRightID <= 0) {
+    res.status(400).json({ ok: false, error: "KILL_RIGHT_INVALID", message: "A kill right is required." });
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "killRightMgr", "ActivateKillRight", [killRightID]);
+});
+
+// ⚠ FINANCIAL (spends ISK to buy a kill right) — reachable + gated, NEVER fired live.
+// BuyKillRight(killRightID, price).
+app.post("/api/bridge/kill-right/buy", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This SPENDS ISK to buy that kill right. This must be confirmed explicitly.")) {
+    return;
+  }
+  const body = req.body || {};
+  const killRightID = Number(body.killRightID) || 0;
+  if (killRightID <= 0) {
+    res.status(400).json({ ok: false, error: "KILL_RIGHT_INVALID", message: "A kill right is required." });
+    return;
+  }
+  const price = Number(body.price) || 0;
+  await dispatchBridgeWrite(req, res, next, "killRightMgr", "BuyKillRight", [killRightID, price]);
+});
+
+// --- R106 marketProxy FINANCIAL WRITES (3) — CLOSES THE PLUMBING SWEEP -------
+//
+// The three real-value marketProxy writes deferred the WHOLE sweep because each
+// SPENDS or COMMITS real value. The operator EXPLICITLY authorized them on
+// 2026-07-23. marketProxy is TOP-LEVEL (sm.ProxySvc("marketProxy") — no
+// MachoBindObject step), so every write is a plain dispatchBridgeWrite on the
+// held session, exactly like the account.GiveCash financial pattern above. NOT
+// the dead "market" stub — the allowlist refuses that by name.
+//
+// ⚠⚠ SAFETY — EVERY write here spends or commits real value. NONE is ever fired
+// on the live world in the plumbing pass: reachability-only + refuses-without-
+// confirm. Each route is CONFIRM-GATED (requireWriteConfirmation refuses 400
+// CONFIRMATION_REQUIRED with NO dispatch unless confirm:true) and carries an
+// EXTRA-EXPLICIT financial confirm message.
+//
+// ⚠ SCOPE — all session-scoped (no foreign source found; nothing appended to
+// docs/arg-injection-leak-handoff.md for this batch):
+//   • PlacePlexSellOrder lists PLEX FROM the session char's own inventory
+//     (executeSellEntry works off the session; useCorp asserted personal-only).
+//   • ModifyPlexCharOrder delegates to Handle_ModifyCharOrder, which loads the
+//     order via loadCharacterOrderOrThrow — an OWNER CHECK that throws unless
+//     order.owner_id === the session characterID. It cannot re-price a foreign
+//     order.
+//   • BuyMultipleItems debits the SESSION char's wallet (characterID/regionID
+//     read from the session; useCorp asserted personal-only). No caller-supplied
+//     wallet/charID.
+
+// ⚠ FINANCIAL (lists your PLEX for sale on the live market) — reachable + gated, NEVER fired live.
+// PlacePlexSellOrder([entry{itemID,typeID,stationID,price,quantity}, useCorp, durationDays, expectedBrokerFee]).
+app.post("/api/bridge/market/plex/sell", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This LISTS your PLEX for sale on the live market — it commits an asset to a real sell order. This must be confirmed explicitly.")) {
+    return;
+  }
+  const body = req.body || {};
+  const entry = body.entry !== undefined && body.entry !== null && typeof body.entry === "object" ? body.entry : null;
+  if (!entry) {
+    res.status(400).json({ ok: false, error: "SELL_INVALID", message: "A PLEX inventory item entry is required." });
+    return;
+  }
+  const durationDays = Number(body.durationDays) || 0;
+  const expectedBrokerFee = body.expectedBrokerFee !== undefined ? body.expectedBrokerFee : null;
+  await dispatchBridgeWrite(req, res, next, "marketProxy", "PlacePlexSellOrder", [entry, false, durationDays, expectedBrokerFee]);
+});
+
+// ⚠ FINANCIAL (re-prices your live PLEX order) — reachable + gated, NEVER fired live.
+// ModifyPlexCharOrder([orderID, newPrice, ...retail-tail]); the server reads only
+// orderID + newPrice and owner-checks the order, so we forward the clean pair.
+app.post("/api/bridge/market/plex/modify", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This RE-PRICES your live PLEX market order (charges a modification fee). This must be confirmed explicitly.")) {
+    return;
+  }
+  const body = req.body || {};
+  const orderID = Number(body.orderID) || 0;
+  const newPrice = Number(body.newPrice) || 0;
+  if (orderID <= 0 || newPrice <= 0) {
+    res.status(400).json({ ok: false, error: "MODIFY_INVALID", message: "An order and a positive new price are required." });
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "marketProxy", "ModifyPlexCharOrder", [orderID, newPrice]);
+});
+
+// ⚠⚠ FINANCIAL (SPENDS ISK immediately to buy at market) — the most consequential
+// of the three. Reachable + gated, NEVER fired live.
+// BuyMultipleItems([stationID, itemList, useCorp]) — batch instant-buy; the
+// session char's wallet is debited once per list entry.
+app.post("/api/bridge/market/buy-multiple", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This SPENDS ISK immediately to buy at market against existing sell orders — irreversible. This must be confirmed explicitly.")) {
+    return;
+  }
+  const body = req.body || {};
+  const stationID = Number(body.stationID) || 0;
+  const itemList = Array.isArray(body.itemList) ? body.itemList : [];
+  if (stationID <= 0 || itemList.length === 0) {
+    res.status(400).json({ ok: false, error: "BUY_INVALID", message: "A station and at least one item are required." });
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "marketProxy", "BuyMultipleItems", [stationID, itemList, false]);
+});
+
+// --- R90 SHIP + FIGHTER IN-SPACE WRITES -------------------------------------
+// (ship / fighterMgr)
+//
+// The Phase-3 "ship + fighter in-space ops" writes batch, following the R86–R89
+// pattern. Every write is a TOP-LEVEL call on the held session
+// (dispatchBridgeWrite) and every route is CONFIRM-GATED via
+// requireWriteConfirmation: it refuses outright (400 CONFIRMATION_REQUIRED, NO
+// dispatch) unless the browser passes `confirm: true`.
+//
+// ⚡ FAST MODE — Farmer is DOCKED, so most of these return a not-in-space error
+// and are NOT live-exercisable. Routes are verified for reachability +
+// refuses-without-confirm only; the decoders are educated guesses (QA later).
+//
+// ⚠⚠ EXTRA-CARE — NEVER fired on the live world even where reachable:
+//   • ship.Eject / ship.SafeLogoff — change the pilot's session state.
+//   • ship.Jettison / ship.Drop — dump cargo/orbitals to space (could lose items).
+//   • fighterMgr.CmdAbandonFighter — abandons a fighter in space.
+// Their confirm messages say so explicitly.
+//
+// ⚠ SCOPE (all session-scoped — no foreign ship/fighter mutation):
+//   • Every ship write resolves the ACTIVE ship / capsule from the SESSION
+//     (server this._getShipID(session) / ejectSession(session) /
+//     getActiveShipRecord(session.characterID)). AssembleShip / FitShips list the
+//     packaged ships by session characterID (findCharacterShip / char-scoped
+//     multifit lister — ownership-checked). The itemID/objectID-taking ops
+//     (Scoop / ScoopToMobileDepotHold / Jettison / LaunchFromShip /
+//     LaunchFromContainer / Drop) act on space objects near the session's ship,
+//     gated on proximity/owner in the server helpers — no foreign ship boarded.
+//   • Every fighterMgr write resolves the controller HOST from the SESSION and
+//     validates each fighter against that host before moving it — a fighterID the
+//     host does not own is a no-op.
+// No caller-supplied FOREIGN source found — nothing appended to
+// docs/arg-injection-leak-handoff.md for this batch.
+
+// --- ship WRITES (14) -------------------------------------------------------
+
+// ⚠ EXTRA-CARE (changes session state — leaves the ship as a capsule in space).
+// Eject() — no args; the ship is resolved from the session.
+app.post("/api/bridge/ship/eject", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This EJECTS you from your ship, leaving it in space as an abandoned hull. This must be confirmed explicitly.")) {
+    return;
+  }
+  await dispatchShipSwapWrite(req, res, next, "ship", "Eject", []);
+});
+
+// LeaveShip(shipID) — docked: swaps the active ship to the capsule; in space:
+// ejects. An active-ship swap, so the session's hull id is re-adopted after.
+app.post("/api/bridge/ship/leave", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This leaves your current ship. Confirm to continue.")) {
+    return;
+  }
+  const shipID = Number((req.body || {}).shipID) || 0;
+  await dispatchShipSwapWrite(req, res, next, "ship", "LeaveShip", [shipID]);
+});
+
+// CreateNewbieShip() — docked-only: spawns (or reuses) the character's race
+// corvette in the station hangar, applies its starter fit, repairs it if
+// reused, and boards it. The retail station-services "Board my Corvette"
+// action. dogmaIM resolves ship/station from the session (its two optional
+// args are logging-only), so no args cross; the server refuses when not
+// docked (MustBeDocked) or already in a corvette (AlreadyInNewbieShip).
+app.post("/api/bridge/ship/board-corvette", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This boards your corvette, creating one in the hangar if needed. Confirm to continue.")) {
+    return;
+  }
+  await dispatchShipSwapWrite(req, res, next, "dogmaIM", "CreateNewbieShip", []);
+});
+
+// BoardStoredShip(structureID, shipID) — board a ship stored in a maintenance bay.
+app.post("/api/bridge/ship/board-stored", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This boards a stored ship. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const structureID = Number(body.structureID) || 0;
+  const shipID = Number(body.shipID) || 0;
+  await dispatchShipSwapWrite(req, res, next, "ship", "BoardStoredShip", [structureID, shipID], shipID);
+});
+
+// StoreVessel(sourceLocationID) — stow the active ship into a maintenance bay.
+app.post("/api/bridge/ship/store-vessel", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This stores your active ship in a maintenance bay. Confirm to continue.")) {
+    return;
+  }
+  const sourceLocationID = Number((req.body || {}).sourceLocationID) || 0;
+  await dispatchShipSwapWrite(req, res, next, "ship", "StoreVessel", [sourceLocationID]);
+});
+
+// AssembleShip(shipIDs, name?, subSystems?) — unpackage packaged ships (docked).
+app.post("/api/bridge/ship/assemble", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This assembles the selected ship(s). Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const shipIDs = bridgeIDList(body.shipIDs);
+  const name = typeof body.name === "string" ? body.name : "";
+  const subSystems = Array.isArray(body.subSystems) ? body.subSystems : null;
+  await dispatchBridgeWrite(req, res, next, "ship", "AssembleShip", [shipIDs, name, subSystems]);
+});
+
+// FitShips(shipTypeID, fitInfo, itemLocationID, cargoItemsByType, fitRigs, name,
+// numToFit, itemContainerID) — multi-fit packaged ships from a saved fitting.
+app.post("/api/bridge/ship/fit-ships", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This fits the selected ships. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const shipTypeID = Number(body.shipTypeID) || 0;
+  const fitInfo = body.fitInfo && typeof body.fitInfo === "object" ? body.fitInfo : {};
+  const itemLocationID = Number(body.itemLocationID) || 0;
+  const cargoItemsByType = body.cargoItemsByType && typeof body.cargoItemsByType === "object" ? body.cargoItemsByType : {};
+  const fitRigs = body.fitRigs === undefined ? true : Boolean(body.fitRigs);
+  const name = typeof body.name === "string" ? body.name : "";
+  const numToFit = Number(body.numToFit) || 0;
+  const itemContainerID = Number(body.itemContainerID) || 0;
+  await dispatchBridgeWrite(req, res, next, "ship", "FitShips", [shipTypeID, fitInfo, itemLocationID, cargoItemsByType, fitRigs, name, numToFit, itemContainerID]);
+});
+
+// ConfigureShip(config) — set the active ship's SMB / fleet-hangar access flags.
+app.post("/api/bridge/ship/configure", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This changes your ship's access configuration. Confirm to continue.")) {
+    return;
+  }
+  const config = (req.body || {}).config && typeof (req.body || {}).config === "object" ? (req.body || {}).config : {};
+  await dispatchBridgeWrite(req, res, next, "ship", "ConfigureShip", [config]);
+});
+
+// Scoop(objectID, password?) — scoop a deployable/container into cargo.
+app.post("/api/bridge/ship/scoop", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This scoops the target into your cargo. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const objectID = Number(body.objectID) || 0;
+  const password = typeof body.password === "string" ? body.password : "";
+  await dispatchBridgeWrite(req, res, next, "ship", "Scoop", [objectID, password]);
+});
+
+// ScoopToMobileDepotHold(objectID) — scoop a mobile depot into its own hold.
+app.post("/api/bridge/ship/scoop-to-depot-hold", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This scoops the target into the mobile depot hold. Confirm to continue.")) {
+    return;
+  }
+  const objectID = Number((req.body || {}).objectID) || 0;
+  await dispatchBridgeWrite(req, res, next, "ship", "ScoopToMobileDepotHold", [objectID]);
+});
+
+// ⚠ EXTRA-CARE (dumps cargo to space — items can be lost). Jettison(itemIDs).
+app.post("/api/bridge/ship/jettison", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This JETTISONS the selected items into space, where anyone can take them. This must be confirmed explicitly.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "ship", "Jettison", [bridgeIDList((req.body || {}).itemIDs)]);
+});
+
+// LaunchFromShip(itemIDs) — launch orbitals (drones/deployables) from the ship.
+app.post("/api/bridge/ship/launch-from-ship", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This launches the selected items from your ship. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "ship", "LaunchFromShip", [bridgeIDList((req.body || {}).itemIDs)]);
+});
+
+// LaunchFromContainer(sourceLocationID, itemID) — launch a ship from a maintenance bay.
+app.post("/api/bridge/ship/launch-from-container", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This launches a ship from the maintenance bay. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const sourceLocationID = Number(body.sourceLocationID) || 0;
+  const itemID = Number(body.itemID) || 0;
+  await dispatchBridgeWrite(req, res, next, "ship", "LaunchFromContainer", [sourceLocationID, itemID]);
+});
+
+// ⚠ EXTRA-CARE (dumps orbitals to space). Drop(launchRequests, whoseBehalfID?, ignoreWarning?).
+app.post("/api/bridge/ship/drop", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This DROPS the selected orbitals into space, where they can be lost. This must be confirmed explicitly.")) {
+    return;
+  }
+  const body = req.body || {};
+  const launchRequests = Array.isArray(body.launchRequests) ? body.launchRequests : [];
+  const whoseBehalfID = Number(body.whoseBehalfID) || 0;
+  const ignoreWarning = Boolean(body.ignoreWarning);
+  await dispatchBridgeWrite(req, res, next, "ship", "Drop", [launchRequests, whoseBehalfID, ignoreWarning]);
+});
+
+// ⚠ EXTRA-CARE (changes session state — schedules a safe logoff). SafeLogoff().
+app.post("/api/bridge/ship/safe-logoff", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This initiates a SAFE LOGOFF, taking your character offline. This must be confirmed explicitly.")) {
+    return;
+  }
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const outcome = await heldTopLevelCall(held, req.webSessionID, "ship", "SafeLogoff", [], null);
+    const failedConditions = Array.isArray(outcome.result) ? outcome.result : null;
+    const loggedOff = failedConditions !== null && failedConditions.length === 0;
+    if (loggedOff) {
+      // EveJS disconnects the character after serializing this successful
+      // response. Drop the BFF's capability immediately so the browser cannot
+      // keep acting through a stale held-session record.
+      forgetBridgeSession(req.webSessionID);
+    }
+    res.json({
+      ok: true,
+      applied: loggedOff,
+      loggedOff,
+      failedConditions: failedConditions || [],
+      result: outcome.result ?? null,
+      notifications: outcome.notifications,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// --- fighterMgr WRITES (9) --------------------------------------------------
+
+// LoadFightersToTube(fighterID, tubeFlagID).
+app.post("/api/bridge/fighters/load-to-tube", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This loads a fighter squadron into a tube. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const fighterID = Number(body.fighterID) || 0;
+  const tubeFlagID = Number(body.tubeFlagID) || 0;
+  await dispatchBridgeWrite(req, res, next, "fighterMgr", "LoadFightersToTube", [fighterID, tubeFlagID]);
+});
+
+// UnloadTubeToFighterBay(tubeFlagID).
+app.post("/api/bridge/fighters/unload-tube", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This unloads a tube back to the fighter bay. Confirm to continue.")) {
+    return;
+  }
+  const tubeFlagID = Number((req.body || {}).tubeFlagID) || 0;
+  await dispatchBridgeWrite(req, res, next, "fighterMgr", "UnloadTubeToFighterBay", [tubeFlagID]);
+});
+
+// LaunchFightersFromTubes(tubeFlagIDs).
+app.post("/api/bridge/fighters/launch", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This launches fighters from the selected tubes. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "fighterMgr", "LaunchFightersFromTubes", [bridgeIDList((req.body || {}).tubeFlagIDs)]);
+});
+
+// RecallFightersToTubes(fighterIDs).
+app.post("/api/bridge/fighters/recall", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This recalls the selected fighters to their tubes. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "fighterMgr", "RecallFightersToTubes", [bridgeIDList((req.body || {}).fighterIDs)]);
+});
+
+// ExecuteMovementCommandOnFighters(fighterIDs, command, ...rest).
+app.post("/api/bridge/fighters/move", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This commands the selected fighters to move. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const fighterIDs = bridgeIDList(body.fighterIDs);
+  const command = body.command !== undefined ? body.command : null;
+  const rest = Array.isArray(body.rest) ? body.rest : [];
+  await dispatchBridgeWrite(req, res, next, "fighterMgr", "ExecuteMovementCommandOnFighters", [fighterIDs, command, ...rest]);
+});
+
+// CmdActivateAbilitySlots(fighterIDs, slotIndex?, target?).
+app.post("/api/bridge/fighters/activate-ability", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This activates a fighter ability slot. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const fighterIDs = bridgeIDList(body.fighterIDs);
+  const slotIndex = body.slotIndex !== undefined ? Number(body.slotIndex) || 0 : null;
+  const target = body.target !== undefined ? Number(body.target) || 0 : null;
+  await dispatchBridgeWrite(req, res, next, "fighterMgr", "CmdActivateAbilitySlots", [fighterIDs, slotIndex, target]);
+});
+
+// CmdDeactivateAbilitySlots(fighterIDs, slotIndex?).
+app.post("/api/bridge/fighters/deactivate-ability", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This deactivates a fighter ability slot. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const fighterIDs = bridgeIDList(body.fighterIDs);
+  const slotIndex = body.slotIndex !== undefined ? Number(body.slotIndex) || 0 : null;
+  await dispatchBridgeWrite(req, res, next, "fighterMgr", "CmdDeactivateAbilitySlots", [fighterIDs, slotIndex]);
+});
+
+// ⚠ EXTRA-CARE (abandons a fighter in space). CmdAbandonFighter(fighterIDs).
+app.post("/api/bridge/fighters/abandon", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This ABANDONS the selected fighter(s) in space, where they can be lost or scooped by others. This must be confirmed explicitly.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "fighterMgr", "CmdAbandonFighter", [bridgeIDList((req.body || {}).fighterIDs)]);
+});
+
+// CmdScoopAbandonedFighterFromSpace(fighterID, destinationFlagID?).
+app.post("/api/bridge/fighters/scoop-abandoned", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This scoops an abandoned fighter from space. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const fighterID = Number(body.fighterID) || 0;
+  const destinationFlagID = body.destinationFlagID !== undefined ? Number(body.destinationFlagID) || 0 : undefined;
+  const args = destinationFlagID !== undefined ? [fighterID, destinationFlagID] : [fighterID];
+  await dispatchBridgeWrite(req, res, next, "fighterMgr", "CmdScoopAbandonedFighterFromSpace", args);
+});
+
+// --- R91 CONTRACT + FITTING WRITES ------------------------------------------
+//
+// The Phase-3 "contracts + fittings" writes batch, following the R86–R90 pattern.
+// Every write is a TOP-LEVEL call on the held session (heldTopLevelCall via
+// dispatchBridgeWrite) and every route is CONFIRM-GATED (requireWriteConfirmation):
+// it refuses outright (400 CONFIRMATION_REQUIRED, NO dispatch) unless the browser
+// passes `confirm: true`. A stray click or stray POST cannot create, accept,
+// complete, delete, or bid on a contract, nor save/rename/delete a fitting.
+//
+// ⚠ EXTRA-CARE, never fired live in this plumbing pass: AcceptContract / PlaceBid
+// (move ISK/items), DeleteContract / DeleteMultipleContracts / DeleteFitting /
+// DeleteManyFittings (destroy data), GM_ExpireContract (admin — returns false /
+// 403-equivalent for a normal non-GM session; wired + noted).
+//
+// ⚠ ARG-INJECTION — GUARDED server-side (unlike the contract READS, handoff #11):
+//   • contractProxy deleteContract throws unless isIssuedBySession; acceptContract
+//     throws unless canAcceptContract (and refuses your own unassigned contract);
+//     deleteMultipleContracts loops deleteContract so inherits the guard. PlaceBid /
+//     FinishAuction / SplitStack / the two notification deletes are server-side
+//     stubs (null/false). GM_ExpireContract is GM-only.
+//   • charFittingMgr / corpFittingMgr writes resolve the ownerID
+//     (resolveRequestedOwnerID; 0 → the SESSION owner) and then
+//     assertSessionCanMutateOwner BEFORE any store mutation — a foreign ownerID is
+//     a permission throw, never a foreign mutation.
+// Nothing added to arg-injection-leak-handoff.md on the write side — the guards hold.
+
+// --- contractProxy WRITES (11) ----------------------------------------------
+
+app.post("/api/bridge/contracts/create", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This creates a new contract. Confirm to continue.")) {
+    return;
+  }
+  const info = (req.body || {}).info ?? null;
+  await dispatchBridgeWrite(req, res, next, "contractProxy", "CreateContract", [info]);
+});
+
+// ⚠ FINANCIAL — moves ISK and items. Reachable + confirm-gated, never fired live.
+app.post("/api/bridge/contracts/accept", requireAuth, async (req, res, next) => {
+  if (
+    !requireWriteConfirmation(
+      req,
+      res,
+      "Accepting a contract transfers ISK and items and cannot be undone. This must be confirmed explicitly.",
+    )
+  ) {
+    return;
+  }
+  const body = req.body || {};
+  const contractID = Number(body.contractID) || 0;
+  const forCorp = body.forCorp === true;
+  await dispatchBridgeWrite(req, res, next, "contractProxy", "AcceptContract", [contractID, forCorp]);
+});
+
+app.post("/api/bridge/contracts/complete", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This completes that contract. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const contractID = Number(body.contractID) || 0;
+  const args = body.status !== undefined ? [contractID, Number(body.status) || 0] : [contractID];
+  await dispatchBridgeWrite(req, res, next, "contractProxy", "CompleteContract", args);
+});
+
+// ⚠ DESTRUCTIVE — deletes a contract you issued. Reachable + confirm-gated, never fired live.
+app.post("/api/bridge/contracts/delete", requireAuth, async (req, res, next) => {
+  if (
+    !requireWriteConfirmation(
+      req,
+      res,
+      "Deleting a contract is permanent — it cannot be restored. This must be confirmed explicitly.",
+    )
+  ) {
+    return;
+  }
+  const contractID = Number((req.body || {}).contractID) || 0;
+  await dispatchBridgeWrite(req, res, next, "contractProxy", "DeleteContract", [contractID]);
+});
+
+// ⚠ DESTRUCTIVE — bulk delete. Reachable + confirm-gated, never fired live.
+app.post("/api/bridge/contracts/delete-multiple", requireAuth, async (req, res, next) => {
+  if (
+    !requireWriteConfirmation(
+      req,
+      res,
+      "Deleting these contracts is permanent — they cannot be restored. This must be confirmed explicitly.",
+    )
+  ) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "contractProxy", "DeleteMultipleContracts", [
+    bridgeIDList((req.body || {}).contractIDs),
+  ]);
+});
+
+// ⚠ ISK — places a bid (spends ISK). Server-side stub in this world; confirm-gated, never fired live.
+app.post("/api/bridge/contracts/bid", requireAuth, async (req, res, next) => {
+  if (
+    !requireWriteConfirmation(
+      req,
+      res,
+      "Placing a bid commits ISK to that auction. This must be confirmed explicitly.",
+    )
+  ) {
+    return;
+  }
+  const body = req.body || {};
+  const contractID = Number(body.contractID) || 0;
+  const amount = body.amount !== undefined ? Number(body.amount) || 0 : undefined;
+  const args = amount !== undefined ? [contractID, amount] : [contractID];
+  await dispatchBridgeWrite(req, res, next, "contractProxy", "PlaceBid", args);
+});
+
+app.post("/api/bridge/contracts/finish-auction", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This finishes that auction. Confirm to continue.")) {
+    return;
+  }
+  const contractID = Number((req.body || {}).contractID) || 0;
+  await dispatchBridgeWrite(req, res, next, "contractProxy", "FinishAuction", [contractID]);
+});
+
+app.post("/api/bridge/contracts/split-stack", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This splits that stack. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const itemID = Number(body.itemID) || 0;
+  const quantity = Number(body.quantity) || 0;
+  await dispatchBridgeWrite(req, res, next, "contractProxy", "SplitStack", [itemID, quantity]);
+});
+
+app.post("/api/bridge/contracts/notification/delete", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This dismisses that contract notification. Confirm to continue.")) {
+    return;
+  }
+  const notificationID = Number((req.body || {}).notificationID) || 0;
+  await dispatchBridgeWrite(req, res, next, "contractProxy", "DeleteNotification", [notificationID]);
+});
+
+app.post("/api/bridge/contracts/notification/delete-contract", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This dismisses that contract's notification. Confirm to continue.")) {
+    return;
+  }
+  const contractID = Number((req.body || {}).contractID) || 0;
+  await dispatchBridgeWrite(req, res, next, "contractProxy", "DeleteContractNotification", [contractID]);
+});
+
+// ⚠ ADMIN — GM-only. A normal session gets a false / 403-equivalent from the
+// handler (it is NOT a GM). Wired + confirm-gated for completeness; never fired live.
+app.post("/api/bridge/contracts/gm-expire", requireAuth, async (req, res, next) => {
+  if (
+    !requireWriteConfirmation(
+      req,
+      res,
+      "GM-force-expiring a contract is an admin action. This must be confirmed explicitly.",
+    )
+  ) {
+    return;
+  }
+  const contractID = Number((req.body || {}).contractID) || 0;
+  await dispatchBridgeWrite(req, res, next, "contractProxy", "GM_ExpireContract", [contractID]);
+});
+
+// --- charFittingMgr / corpFittingMgr WRITES (5) -----------------------------
+// ownerID defaults to 0 → the SESSION owner (resolveRequestedOwnerID); a foreign
+// ownerID is a server-side permission throw (assertSessionCanMutateOwner).
+
+app.post("/api/bridge/fittings/save-many", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This saves these fittings to your library. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const ownerID = Number(body.ownerID) || 0;
+  const fittings = body.fittings ?? [];
+  await dispatchBridgeWrite(req, res, next, "charFittingMgr", "SaveManyFittings", [ownerID, fittings]);
+});
+
+// ⚠ DESTRUCTIVE — deletes a saved fitting. Reachable + confirm-gated, never fired live.
+app.post("/api/bridge/fittings/delete", requireAuth, async (req, res, next) => {
+  if (
+    !requireWriteConfirmation(
+      req,
+      res,
+      "Deleting a saved fitting is permanent — it cannot be restored. This must be confirmed explicitly.",
+    )
+  ) {
+    return;
+  }
+  const body = req.body || {};
+  const ownerID = Number(body.ownerID) || 0;
+  const fittingID = Number(body.fittingID) || 0;
+  await dispatchBridgeWrite(req, res, next, "charFittingMgr", "DeleteFitting", [ownerID, fittingID]);
+});
+
+// ⚠ DESTRUCTIVE — bulk delete saved fittings. Reachable + confirm-gated, never fired live.
+app.post("/api/bridge/fittings/delete-many", requireAuth, async (req, res, next) => {
+  if (
+    !requireWriteConfirmation(
+      req,
+      res,
+      "Deleting these saved fittings is permanent — they cannot be restored. This must be confirmed explicitly.",
+    )
+  ) {
+    return;
+  }
+  const body = req.body || {};
+  const ownerID = Number(body.ownerID) || 0;
+  await dispatchBridgeWrite(req, res, next, "charFittingMgr", "DeleteManyFittings", [
+    ownerID,
+    bridgeIDList(body.fittingIDs),
+  ]);
+});
+
+app.post("/api/bridge/fittings/update-name", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This renames or re-describes that fitting. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const fittingID = Number(body.fittingID) || 0;
+  const ownerID = Number(body.ownerID) || 0;
+  const name = typeof body.name === "string" ? body.name : "";
+  const description = typeof body.description === "string" ? body.description : "";
+  await dispatchBridgeWrite(req, res, next, "charFittingMgr", "UpdateNameAndDescription", [
+    fittingID,
+    ownerID,
+    name,
+    description,
+  ]);
+});
+
+app.post("/api/bridge/corp-fittings/save-many", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This saves these fittings to your corp library. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const ownerID = Number(body.ownerID) || 0;
+  const fittings = body.fittings ?? [];
+  await dispatchBridgeWrite(req, res, next, "corpFittingMgr", "SaveManyFittings", [ownerID, fittings]);
+});
+
+// --- R92 IN-SPACE SERVICE WRITES --------------------------------------------
+//
+// The Phase-3 "in-space services" writes batch, following the R86-R91 pattern:
+// allowlist pair + confirm-gated BFF route (dispatchBridgeWrite) + educated-guess
+// decoder + basic test. Sixteen writes across four TOP-LEVEL services (sovMgr /
+// essMgr / abyssalMgr / pvpFilamentMgr — sm.RemoteSvc / ProxySvc, no bound-object
+// step). Farmer is DOCKED so NONE is live-exercisable — reachability + refusal
+// only. Every route is confirm-gated (no `confirm:true` => 400, no dispatch).
+//
+// ⚠ NEVER FIRED LIVE: sov DestroySkyhooks / AcquireSkyhooks (destructive
+// sovereignty mutations) and ess RequestUnlockReserveBank (ISK payout).
+//
+// ⚠ ARG-INJECTION (flagged, kept plumbed — see docs/arg-injection-leak-handoff.md):
+// the three sovMgr writes take a CALLER-SUPPLIED solarSystemID / skyhookID list with
+// NO session scope check and NO handler-level admin gate. The ESS bank writes resolve
+// solarSystemID from the SESSION; the abyssal + pvp actions are server-side
+// rejection/no-op stubs (no runtime abyssal content in this world).
+
+// --- sovMgr WRITES (3) — ⚠ caller-supplied scope, no admin gate --------------
+
+app.post("/api/bridge/sov/hub/set-fuel-access-group", requireAuth, async (req, res, next) => {
+  if (
+    !requireWriteConfirmation(
+      req,
+      res,
+      "This changes the fuel-access group of a sovereignty hub. Confirm to continue.",
+    )
+  ) {
+    return;
+  }
+  const body = req.body || {};
+  const solarSystemID = Number(body.solarSystemID) || 0;
+  const fuelAccessGroupID = Number(body.fuelAccessGroupID) || 0;
+  await dispatchBridgeWrite(req, res, next, "sovMgr", "SetSovHubFuelAccessGroup", [
+    solarSystemID,
+    fuelAccessGroupID,
+  ]);
+});
+
+// ⚠ DESTRUCTIVE — reachable + confirm-gated, NEVER fired on the live world in this
+// plumbing pass. DestroySkyhooks deletes the named skyhooks outright.
+app.post("/api/bridge/sov/skyhooks/destroy", requireAuth, async (req, res, next) => {
+  if (
+    !requireWriteConfirmation(
+      req,
+      res,
+      "Destroying skyhooks is permanent and cannot be undone. This must be confirmed explicitly.",
+    )
+  ) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "sovMgr", "DestroySkyhooks", [
+    bridgeIDList((req.body || {}).skyhookIDs),
+  ]);
+});
+
+// ⚠ DESTRUCTIVE — reachable + confirm-gated, NEVER fired live. AcquireSkyhooks
+// reassigns the named skyhooks into the session's own corp/system.
+app.post("/api/bridge/sov/skyhooks/acquire", requireAuth, async (req, res, next) => {
+  if (
+    !requireWriteConfirmation(
+      req,
+      res,
+      "Acquiring these skyhooks reassigns them to your corporation. This must be confirmed explicitly.",
+    )
+  ) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "sovMgr", "AcquireSkyhooks", [
+    bridgeIDList(body.skyhookIDs),
+    Number(body.fuelAccessGroupID) || 0,
+  ]);
+});
+
+// --- essMgr WRITES (5) — session-resolved solarSystemID ----------------------
+
+app.post("/api/bridge/ess/main-bank/link", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This links your ship to the ESS main bank. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "essMgr", "AttemptLinkToMainBank", []);
+});
+
+app.post("/api/bridge/ess/reserve-bank/link", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This links your ship to the ESS reserve bank. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "essMgr", "AttemptLinkToReserveBank", []);
+});
+
+app.post("/api/bridge/ess/main-bank/unlink", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This unlinks the ESS main bank. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "essMgr", "RequestMainBankUnlink", []);
+});
+
+app.post("/api/bridge/ess/reserve-bank/unlink", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This unlinks the ESS reserve bank. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "essMgr", "RequestReserveBankUnlink", []);
+});
+
+// ⚠ ISK PAYOUT — reachable + confirm-gated, NEVER fired on the live world in this
+// plumbing pass. RequestUnlockReserveBank consumes a key and pays out the reserve.
+app.post("/api/bridge/ess/reserve-bank/unlock", requireAuth, async (req, res, next) => {
+  if (
+    !requireWriteConfirmation(
+      req,
+      res,
+      "Unlocking the reserve bank consumes a key and pays out ISK. This must be confirmed explicitly.",
+    )
+  ) {
+    return;
+  }
+  const keyTypeID = Number((req.body || {}).keyTypeID) || 0;
+  await dispatchBridgeWrite(req, res, next, "essMgr", "RequestUnlockReserveBank", [keyTypeID]);
+});
+
+// --- abyssalMgr WRITES (5) — server-side rejection/no-op stubs ----------------
+// No runtime abyssal content exists in this world, so the four gate/deploy actions
+// throw an abyss error and ClientIsReady returns null. Args are forwarded verbatim
+// but ignored by the (rejecting) handlers.
+
+app.post("/api/bridge/abyssal/entrance/deploy", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This deploys an abyssal filament entrance. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "abyssalMgr", "AbyssalEntranceDeployment", bridgeArgs(req));
+});
+
+app.post("/api/bridge/abyssal/entrance/activate", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This activates the abyssal entrance gate. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "abyssalMgr", "AbyssalEntranceGateActivation", bridgeArgs(req));
+});
+
+app.post("/api/bridge/abyssal/gate/activate", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This activates an abyssal pocket gate. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "abyssalMgr", "AbyssalGateActivation", bridgeArgs(req));
+});
+
+app.post("/api/bridge/abyssal/end-gate/activate", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This activates the abyssal exit gate. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "abyssalMgr", "AbyssalEndGateActivation", bridgeArgs(req));
+});
+
+app.post("/api/bridge/abyssal/client-ready", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This signals the client is ready in the abyssal pocket. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "abyssalMgr", "ClientIsReady", []);
+});
+
+// --- pvpFilamentMgr WRITES (3) — server-side rejection/no-op stubs ------------
+// No active Proving Grounds event in this world: JoinPVPQueue and
+// AbyssalPVPEndGateActivation throw; LeavePVPQueue returns null.
+
+app.post("/api/bridge/pvp/queue/join", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This joins the abyssal PvP (Proving Grounds) queue. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "pvpFilamentMgr", "JoinPVPQueue", bridgeArgs(req));
+});
+
+app.post("/api/bridge/pvp/queue/leave", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This leaves the abyssal PvP queue. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "pvpFilamentMgr", "LeavePVPQueue", []);
+});
+
+app.post("/api/bridge/pvp/end-gate/activate", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This activates the abyssal PvP exit gate. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "pvpFilamentMgr", "AbyssalPVPEndGateActivation", bridgeArgs(req));
+});
+
+// --- R93 MISC UTILITY WRITES ------------------------------------------------
+//
+// The Phase-3 "misc utility" writes batch, following the R86-R92 pattern:
+// allowlist pair + confirm-gated BFF route (dispatchBridgeWrite) + educated-guess
+// decoder + basic test. Thirteen writes across six TOP-LEVEL services whose READS
+// were wired earlier (agentMgr R64 / petitioner R70 / industryManager R15 /
+// planetMgr + structureAssetSafety R71 / structureDirectory R63). Every route is
+// confirm-gated (no `confirm:true` => 400, no dispatch). Farmer is DOCKED so the
+// nav writes return not-in-space and none of the consequential writes is
+// live-exercisable — reachability + refusal only.
+//
+// ⚠ NEVER FIRED LIVE (extra-care): planetMgr.DeleteLaunch (destructive), the three
+// structureAssetSafety MOVE writes (relocate assets), and petitioner.CreatePetition
+// (opens a support ticket — outward). Reachable + confirm-gated only.
+//
+// ⚠ ARG-INJECTION (checked): SetStructureDescription is GUARDED server-side
+// (canManageStructure throws for a structure the session cannot manage); the
+// asset-safety moves resolve the owner from the SESSION (not a caller id);
+// DeleteLaunch passes session.characterID to the store. No new unguarded
+// caller-supplied-id write in this batch.
+
+// --- agentMgr nav/journal WRITES (4) — docked => not-in-space -----------------
+
+app.post("/api/bridge/agent/journal/remove-offer", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This removes the declined offer from your agent journal. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "agentMgr", "RemoveOfferFromJournal", []);
+});
+
+// GotoLocation(locationType, [deviationOverride], [referringAgentID]).
+app.post("/api/bridge/agent/goto-location", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This moves your ship toward the agent mission location. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "agentMgr", "GotoLocation", [
+    typeof body.locationType === "string" ? body.locationType : (body.locationType ?? null),
+    body.deviationOverride ?? null,
+    Number(body.referringAgentID) || 0,
+  ]);
+});
+
+// WarpToLocation(locationType, [itemID], [warpRange], [deviation], [referringAgentID]).
+app.post("/api/bridge/agent/warp-to-location", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This warps your ship to the agent mission location. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "agentMgr", "WarpToLocation", [
+    typeof body.locationType === "string" ? body.locationType : (body.locationType ?? null),
+    body.itemID ?? null,
+    Number(body.warpRange) || 0,
+    body.deviation ?? null,
+    Number(body.referringAgentID) || 0,
+  ]);
+});
+
+// WarpToAgentInSpace([agentID]) — warp to the bound agent's in-space location.
+app.post("/api/bridge/agent/warp-to-agent", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This warps your ship to the agent in space. Confirm to continue.")) {
+    return;
+  }
+  const agentID = Number((req.body || {}).agentID) || 0;
+  await dispatchBridgeWrite(req, res, next, "agentMgr", "WarpToAgentInSpace", [agentID]);
+});
+
+// --- petitioner support WRITES (3) ------------------------------------------
+
+// ⚠ OUTWARD — CreatePetition opens a support ticket. Reachable + confirm-gated,
+// NEVER fired live in this plumbing pass. In this stub world it records an audit
+// event and returns false (rejected). Args: (subject, body, categoryID, ...kwargs).
+app.post("/api/bridge/petition/create", requireAuth, async (req, res, next) => {
+  if (
+    !requireWriteConfirmation(
+      req,
+      res,
+      "Creating a petition opens a support ticket. This must be confirmed explicitly.",
+    )
+  ) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "petitioner", "CreatePetition", [
+    typeof body.subject === "string" ? body.subject : "",
+    typeof body.body === "string" ? body.body : "",
+    Number(body.categoryID) || 0,
+  ]);
+});
+
+// PetitionerChat(petitionID, message) — post a message on a ticket.
+app.post("/api/bridge/petition/chat", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This posts a message on the support ticket. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "petitioner", "PetitionerChat", [
+    Number(body.petitionID) || 0,
+    typeof body.message === "string" ? body.message : "",
+  ]);
+});
+
+// CancelPetition(petitionID) — withdraw a ticket.
+app.post("/api/bridge/petition/cancel", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This cancels the support ticket. Confirm to continue.")) {
+    return;
+  }
+  const petitionID = Number((req.body || {}).petitionID) || 0;
+  await dispatchBridgeWrite(req, res, next, "petitioner", "CancelPetition", [petitionID]);
+});
+
+// --- industryManager WRITES (1) ---------------------------------------------
+
+// CompleteManyJobs(jobs) — the BATCH delivery. `jobs` is a list of job entries
+// (each a jobID or a job dict); the handler delivers each and returns the list of
+// delivered job payloads. Forwarded verbatim as a single positional arg.
+app.post("/api/bridge/industry/complete-many", requireAuth, async (req, res, next) => {
+  if (
+    !requireWriteConfirmation(
+      req,
+      res,
+      "This delivers ALL the selected industry jobs at once. Confirm to continue.",
+    )
+  ) {
+    return;
+  }
+  const jobs = Array.isArray((req.body || {}).jobs) ? req.body.jobs : [];
+  await dispatchBridgeWrite(req, res, next, "industryManager", "CompleteManyJobs", [jobs]);
+});
+
+// --- planetMgr WRITES (1) — ⚠ DESTRUCTIVE -----------------------------------
+
+// ⚠ DESTRUCTIVE — DeleteLaunch removes a customs-office launch by id. Reachable +
+// confirm-gated, NEVER fired on the live world in this plumbing pass. The store
+// scopes deletion to session.characterID.
+app.post("/api/bridge/planet/launch/delete", requireAuth, async (req, res, next) => {
+  if (
+    !requireWriteConfirmation(
+      req,
+      res,
+      "Deleting a planetary launch is permanent and cannot be undone. This must be confirmed explicitly.",
+    )
+  ) {
+    return;
+  }
+  const launchID = Number((req.body || {}).launchID) || 0;
+  await dispatchBridgeWrite(req, res, next, "planetMgr", "DeleteLaunch", [launchID]);
+});
+
+// --- structureDirectory WRITES (1) — canManageStructure-guarded --------------
+
+// SetStructureDescription(structureID, description). GUARDED server-side
+// (canManageStructure throws StructureManagementDenied for a structure the session
+// cannot manage). Returns null; a panel re-reads GetStructureDescription.
+app.post("/api/bridge/structure/set-description", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This changes the structure's description. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "structureDirectory", "SetStructureDescription", [
+    Number(body.structureID) || 0,
+    typeof body.description === "string" ? body.description : "",
+  ]);
+});
+
+// --- structureAssetSafety MOVE WRITES (3) — ⚠ consequential ------------------
+// Owner is resolved from the SESSION (personal => session character, corp =>
+// session corp), not a caller-supplied id. Each returns null. ⚠ NEVER fired live.
+
+app.post("/api/bridge/asset-safety/move-personal", requireAuth, async (req, res, next) => {
+  if (
+    !requireWriteConfirmation(
+      req,
+      res,
+      "This relocates your personal assets to asset safety. This must be confirmed explicitly.",
+    )
+  ) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "structureAssetSafety", "MovePersonalAssetsToSafety", [
+    Number(body.solarSystemID) || 0,
+    Number(body.structureID) || 0,
+  ]);
+});
+
+app.post("/api/bridge/asset-safety/move-corp", requireAuth, async (req, res, next) => {
+  if (
+    !requireWriteConfirmation(
+      req,
+      res,
+      "This relocates your corporation's assets to asset safety. This must be confirmed explicitly.",
+    )
+  ) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "structureAssetSafety", "MoveCorpAssetsToSafety", [
+    Number(body.solarSystemID) || 0,
+    Number(body.structureID) || 0,
+  ]);
+});
+
+// MoveSafetyWrapToStructure(assetWrapID, solarSystemID) + kwargs{ destinationID }.
+app.post("/api/bridge/asset-safety/deliver-wrap", requireAuth, async (req, res, next) => {
+  if (
+    !requireWriteConfirmation(
+      req,
+      res,
+      "This delivers the asset-safety wrap to a structure. This must be confirmed explicitly.",
+    )
+  ) {
+    return;
+  }
+  const body = req.body || {};
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const outcome = await heldTopLevelCall(
+      held,
+      req.webSessionID,
+      "structureAssetSafety",
+      "MoveSafetyWrapToStructure",
+      [Number(body.assetWrapID) || 0, Number(body.solarSystemID) || 0],
+      { destinationID: Number(body.destinationID) || 0 },
+    );
+    res.json({ ok: true, applied: true, result: outcome.result ?? null, notifications: outcome.notifications });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// --- R94 FLEET TOP-LEVEL WRITES (fleetObjectHandler / fleetProxy / fleetMgr) --
+//
+// The LAST Phase-3 top-level writes batch (CLOSES Phase-3 top-level writes; the
+// 3 deferred PLEX writes aside), following the R86-R93 pattern: allowlist pair +
+// confirm-gated BFF route (dispatchBridgeWrite) + educated-guess decoder
+// (fleetWrites.ts) + basic test. Eleven writes across three fleet services whose
+// seams were wired earlier (fleetProxy READS R69 / fleetObjectHandler bind R72 +
+// bound reads R85). Every route is confirm-gated (no `confirm:true` => 400, no
+// dispatch). Farmer is DOCKED + fleetless, so the fleet-management writes return a
+// not-in-fleet error and none is live-exercisable — reachability + refusal only.
+//
+// ⚠ EXTRA-CARE OUTWARD PAIR: fleetMgr.BroadcastToBubble / BroadcastToSystem send a
+// message to every fleet member in the session char's bubble / system. Reachable +
+// confirm-gated but NEVER broadcast on the live world in this plumbing pass.
+// fleetObjectHandler.CreateFleet mints a whole fleet — likewise reachable + gated
+// but NEVER fired live.
+//
+// ⚠ ARG-INJECTION (checked): the advert / management / broadcast writes resolve the
+// fleet from the SESSION (session.characterID / session.fleetid), not a caller id.
+// ApplyToJoinFleet takes a caller-supplied fleetID — but that is the TARGET public
+// advert to apply to (intended fleet-finder semantics), not a foreign-fleet
+// mutation; noted in the R94 arg-injection addendum, kept plumbed.
+
+// fleetObjectHandler.CreateFleet — mints a new fleet for the session character
+// (no args). ⚠ NEVER fired live (it would actually create a fleet).
+// ⚠ CREATING A FLEET IS TWO CALLS, AND THE SECOND IS NOT OPTIONAL.
+//
+// This route used to be a bare `CreateFleet`, which answers ok:true and leaves
+// the caller in NO FLEET — caught live: the creator's own bound-fleet read still
+// said FleetNotFound and the very next Invite refused for the same reason.
+//
+// `Handle_CreateFleet` (fleetObjectHandlerService.js) mints the fleet record and
+// returns a BOUND object for it, but `createFleetRecord` (fleetRuntime.js) adds
+// no member row and no characterToFleet mapping. It is `Init` on that bound
+// object that calls `fleet.members.set(...)` + `characterToFleet.set(...)` and
+// makes the creator the boss. CreateFleet alone builds a fleet nobody is in —
+// which from outside is indistinguishable from no fleet at all.
+//
+// So: bind THROUGH CreateFleet (the mint IS the bind — it returns the OID), then
+// Init on that handle. Both Init args are optional; it falls back to the
+// session's own ship type. The bind key is unique per request so a second create
+// mints a second fleet rather than re-initialising a stale handle.
+app.post("/api/bridge/fleet/create", requireAuth, async (req, res, next) => {
+  if (
+    !requireWriteConfirmation(
+      req,
+      res,
+      "Creating a fleet forms a new fleet under your character. This must be confirmed explicitly.",
+    )
+  ) {
+    return;
+  }
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const bindSpec = {
+    key: `fleet-create:${Date.now()}:${Math.random().toString(36).slice(2)}`,
+    service: "fleetObjectHandler",
+    method: "CreateFleet",
+    args: [],
+    kwargs: null,
+  };
+  try {
+    const outcome = await boundCall(held, req.webSessionID, bindSpec, "Init", [null, null], null);
+    invalidateFleetBoundHandles(held);
+    res.json({ ok: true, applied: true, result: outcome.result ?? null, notifications: outcome.notifications });
+  } catch (error) {
+    invalidateFleetBoundHandles(held);
+    if (error && error.code === "SESSION_NOT_FOUND") {
+      forgetBridgeSession(req.webSessionID);
+    }
+    next(error);
+  }
+});
+
+// fleetProxy fleet-finder WRITES ---------------------------------------------
+
+// ApplyToJoinFleet(fleetID, [autoAccept]) — apply to a PUBLIC advertised fleet.
+app.post("/api/bridge/fleet/apply", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This applies to join that advertised fleet. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "fleetProxy", "ApplyToJoinFleet", [
+    Number(body.fleetID) || 0,
+    body.autoAccept === true,
+  ]);
+});
+
+// AddFleetFinderAdvert(advertData) — post the session fleet's public advert.
+app.post("/api/bridge/fleet/advert/add", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This posts a public fleet-finder advert for your fleet. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const advertData =
+    body.advertData && typeof body.advertData === "object" ? body.advertData : {};
+  await dispatchBridgeWrite(req, res, next, "fleetProxy", "AddFleetFinderAdvert", [advertData]);
+});
+
+// RemoveFleetFinderAdvert() — pull the session fleet's public advert (no args).
+app.post("/api/bridge/fleet/advert/remove", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This removes your fleet's public advert. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "fleetProxy", "RemoveFleetFinderAdvert", []);
+});
+
+// UpdateAdvertInfo(numMembers, [allowedDiff]) — edit the session fleet's advert.
+app.post("/api/bridge/fleet/advert/update", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This updates your fleet's public advert. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const allowedDiff =
+    body.allowedDiff && typeof body.allowedDiff === "object" ? body.allowedDiff : {};
+  await dispatchBridgeWrite(req, res, next, "fleetProxy", "UpdateAdvertInfo", [
+    Number(body.numMembers) || 0,
+    allowedDiff,
+  ]);
+});
+
+// fleetMgr fleet-management WRITES -------------------------------------------
+
+// ForceLeaveFleet() — remove the session char from its fleet (no args).
+app.post("/api/bridge/fleet/leave", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This removes you from your current fleet. Confirm to continue.")) {
+    return;
+  }
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const outcome = await heldTopLevelCall(held, req.webSessionID, "fleetMgr", "ForceLeaveFleet", [], null);
+    invalidateFleetBoundHandles(held);
+    res.json({ ok: true, applied: true, result: outcome.result ?? null, notifications: outcome.notifications });
+  } catch (error) {
+    // The remote write may have committed before transport failure; never retain a
+    // membership-scoped handle across an uncertain outcome.
+    invalidateFleetBoundHandles(held);
+    next(error);
+  }
+});
+
+// AddToWatchlist(charIDs, favorites) — tune the session fleet watchlist.
+app.post("/api/bridge/fleet/watchlist/add", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This adds those members to your fleet watchlist. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "fleetMgr", "AddToWatchlist", [
+    bridgeIDList(body.charIDs),
+    body.favorites === true,
+  ]);
+});
+
+// RemoveFromWatchlist(charID, favorites).
+app.post("/api/bridge/fleet/watchlist/remove", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This removes that member from your fleet watchlist. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "fleetMgr", "RemoveFromWatchlist", [
+    Number(body.charID) || 0,
+    body.favorites === true,
+  ]);
+});
+
+// RegisterForDamageUpdates(favorites) — session-scoped damage-update subscription.
+app.post("/api/bridge/fleet/damage-updates", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This registers your fleet for damage updates. Confirm to continue.")) {
+    return;
+  }
+  const favorites = (req.body || {}).favorites === true;
+  await dispatchBridgeWrite(req, res, next, "fleetMgr", "RegisterForDamageUpdates", [favorites]);
+});
+
+// ⚠ EXTRA-CARE OUTWARD — BroadcastToBubble / BroadcastToSystem message the fleet.
+// Reachable + confirm-gated but NEVER broadcast on the live world. Args to
+// sendBroadcast: (name, scope, itemID, typeID).
+app.post("/api/bridge/fleet/broadcast/bubble", requireAuth, async (req, res, next) => {
+  if (
+    !requireWriteConfirmation(
+      req,
+      res,
+      "This BROADCASTS a message to every fleet member in your bubble. This must be confirmed explicitly.",
+    )
+  ) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "fleetMgr", "BroadcastToBubble", [
+    typeof body.name === "string" ? body.name : "",
+    body.scope ?? null,
+    Number(body.itemID) || 0,
+    Number(body.typeID) || 0,
+  ]);
+});
+
+app.post("/api/bridge/fleet/broadcast/system", requireAuth, async (req, res, next) => {
+  if (
+    !requireWriteConfirmation(
+      req,
+      res,
+      "This BROADCASTS a message to every fleet member in your solar system. This must be confirmed explicitly.",
+    )
+  ) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "fleetMgr", "BroadcastToSystem", [
+    typeof body.name === "string" ? body.name : "",
+    body.scope ?? null,
+    Number(body.itemID) || 0,
+    Number(body.typeID) || 0,
+  ]);
+});
+
+// --- R95 Phase-4 top-level WRITES — skills + clones + safety ----------------
+//
+// The FIRST Phase-4 batch: 17 writes across the SAME three session-scoped
+// services the R73/R76/R78 reads opened — skillHandler (WB-SKILL, 8),
+// jumpCloneSvc (WB-CLONE, 8), crimewatch (WB-CRIME, 1). Every one dispatches on
+// the ORDINARY top-level /call seam (dispatchBridgeWrite → heldTopLevelCall),
+// NOT a bound two-step, exactly like its sibling reads. Every route is
+// CONFIRM-GATED via requireWriteConfirmation (no `confirm: true` ⇒ 400
+// CONFIRMATION_REQUIRED, no dispatch). The destructive/financial ones
+// (ExtractSkills / InjectSkillIntoBrain destroy SP / consume a skillbook;
+// InstallCloneInStation/Structure / CloneJump spend ISK; DestroyInstalledClone
+// destroys a clone) carry an extra-explicit message and are reachability +
+// refuses-without-confirm ONLY — never fired on the live world in this pass.
+//
+// ⚠ ALL SESSION-SCOPED. Each handler derives the character from the session; the
+// id args they take (injector itemID, jumpCloneID, safety level) resolve against
+// the session's OWN records, so a foreign id misses ("not found"), never mutates
+// another character. See docs/arg-injection-leak-handoff.md — no new leak here.
+
+// WB-SKILL (skillHandler) ----------------------------------------------------
+
+// CharStartTrainingSkill(itemID, [toLevel]) — queues a skillbook item's skill to
+// train (args[0] = skillbook itemID; optional target level).
+app.post("/api/bridge/skills/start-training", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This queues that skill for training. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const itemID = Number(body.itemID) || 0;
+  const toLevel = Number(body.toLevel) || null;
+  await dispatchBridgeWrite(req, res, next, "skillHandler", "CharStartTrainingSkill", [itemID, toLevel]);
+});
+
+// AbortTraining() — stops the current training (reversible; re-queue any time).
+app.post("/api/bridge/skills/abort-training", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This stops your current skill training. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "skillHandler", "AbortTraining", []);
+});
+
+// ApplyFreeSkillPoints(skills, points) — spends unallocated free SP into skills.
+app.post("/api/bridge/skills/apply-free-points", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This spends your free skill points. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "skillHandler", "ApplyFreeSkillPoints", [
+    body.skills ?? null,
+    body.points ?? null,
+  ]);
+});
+
+// ⚠ DESTRUCTIVE — ExtractSkills(skills, injectorTypeID) turns trained SP into a
+// skill extractor, permanently removing SP. Reachable + gated, never fired live.
+app.post("/api/bridge/skills/extract", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "Extracting skills permanently DESTROYS trained skill points into an extractor. This must be confirmed explicitly.")) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "skillHandler", "ExtractSkills", [
+    body.skills ?? null,
+    Number(body.injectorTypeID) || 0,
+  ]);
+});
+
+// InjectSkillpoints(amount, quantity) — applies large-skill-injector SP.
+app.post("/api/bridge/skills/inject-skillpoints", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This injects skill points from an injector. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "skillHandler", "InjectSkillpoints", [
+    Number(body.amount) || 0,
+    Number(body.quantity) || 1,
+  ]);
+});
+
+// SplitSkillInjector(itemID, quantity) — splits a large injector into smalls.
+app.post("/api/bridge/skills/split-injector", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This splits that skill injector. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "skillHandler", "SplitSkillInjector", [
+    Number(body.itemID) || 0,
+    Number(body.quantity) || 1,
+  ]);
+});
+
+// CombineSkillInjector(itemID, quantity) — combines smalls into a large injector.
+app.post("/api/bridge/skills/combine-injector", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This combines those skill injectors. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "skillHandler", "CombineSkillInjector", [
+    Number(body.itemID) || 0,
+    Number(body.quantity) || 1,
+  ]);
+});
+
+// ⚠ CONSUMES A SKILLBOOK — InjectSkillIntoBrain(itemIDs) learns skillbook items,
+// destroying them. Reachable + gated, never fired live.
+app.post("/api/bridge/skills/inject-skillbook", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "Injecting a skillbook CONSUMES it permanently. This must be confirmed explicitly.")) {
+    return;
+  }
+  const itemIDs = bridgeIDList((req.body || {}).itemIDs);
+  await dispatchBridgeWrite(req, res, next, "skillHandler", "InjectSkillIntoBrain", [itemIDs]);
+});
+
+// WB-CLONE (jumpCloneSvc) ----------------------------------------------------
+
+// ⚠ FINANCIAL — InstallCloneInStation() installs a jump clone at the current
+// station for an ISK fee. Reachable + gated, never fired live.
+app.post("/api/bridge/clones/install-station", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "Installing a jump clone SPENDS ISK (the install fee). This must be confirmed explicitly.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "jumpCloneSvc", "InstallCloneInStation", []);
+});
+
+// ⚠ FINANCIAL — InstallCloneInStructure() installs a jump clone at the current
+// structure for an ISK fee. Reachable + gated, never fired live.
+app.post("/api/bridge/clones/install-structure", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "Installing a jump clone SPENDS ISK (the install fee). This must be confirmed explicitly.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "jumpCloneSvc", "InstallCloneInStructure", []);
+});
+
+// ⚠ FINANCIAL/DESTRUCTIVE — CloneJump(destLocationID, cloneID, cost, confirmed)
+// jumps the pilot's consciousness to a jump clone (leaves the current body
+// behind; may incur a cost). Reachable + gated, never fired live.
+app.post("/api/bridge/clones/jump", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "Jumping clones moves you to another clone and leaves your current body behind. This must be confirmed explicitly.")) {
+    return;
+  }
+  const body = req.body || {};
+  const destinationLocationID = Number(body.destinationLocationID) || 0;
+  if (destinationLocationID <= 0) {
+    res.status(400).json({ ok: false, error: "INVALID_CLONE_DESTINATION", message: "A positive clone destination is required." });
+    return;
+  }
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const expected = { destinationLocationID };
+  const commandNotifications = [];
+  let issuedTransitionKind = null;
+  try {
+    const before = await readHeldFlight(held, req.webSessionID);
+    if (before.flight.docked !== true) {
+      res.status(409).json({
+        ok: false,
+        error: "CLONE_JUMP_REQUIRES_DOCKED",
+        message: "Jump clones can only be activated while docked in a station or structure.",
+      });
+      return;
+    }
+    if (typeof before.flight.shipIsCapsule !== "boolean") {
+      res.status(409).json({
+        ok: false,
+        error: "ACTIVE_SHIP_TYPE_UNAVAILABLE",
+        message: "The active ship type could not be verified; reselect the character before jumping clones.",
+      });
+      return;
+    }
+
+    // Retail's CloneJump flow leaves a normal hull first, waits for the capsule
+    // session to become usable, then waits out the next-session-change timer
+    // before issuing CloneJump. Keep the two transitions distinct so neither
+    // command can be duplicated on an uncertain response.
+    if (before.flight.shipIsCapsule === false) {
+      const fromShipID = Number(before.flight.shipID) || 0;
+      if (fromShipID <= 0) {
+        res.status(409).json({
+          ok: false,
+          error: "NO_ACTIVE_SHIP",
+          message: "No active ship is available to leave before the clone jump.",
+        });
+        return;
+      }
+      const boardExpected = { fromShipID };
+      if (!await acquireRouteTransition(res, held, "board", boardExpected)) {
+        return;
+      }
+      issuedTransitionKind = "board";
+      const leaveOutcome = await heldTopLevelCall(
+        held,
+        req.webSessionID,
+        "ship",
+        "LeaveShip",
+        [fromShipID],
+        null,
+      );
+      commandNotifications.push(...(leaveOutcome.notifications || []));
+      markTransitionAccepted(held);
+      const boarded = await awaitRouteTransition(
+        held,
+        req.webSessionID,
+        "board",
+        boardExpected,
+      );
+      if (!boarded.ok) {
+        sendTransitionTimeout(res, boarded, commandNotifications);
+        return;
+      }
+      commandNotifications.push(...(boarded.notifications || []));
+      issuedTransitionKind = null;
+      if (boarded.flight.shipIsCapsule !== true) {
+        markTransitionFailed(held, "The active capsule could not be verified after leaving the ship.");
+        res.status(409).json({
+          ok: false,
+          error: "SESSION_CHANGE_UNVERIFIED",
+          message: "The active capsule could not be verified; reselect the character before retrying.",
+          transition: publicTransition(held),
+          notifications: commandNotifications,
+        });
+        return;
+      }
+    }
+
+    if (!await acquireRouteTransition(res, held, "clone", expected)) {
+      return;
+    }
+    issuedTransitionKind = "clone";
+    const outcome = await heldTopLevelCall(
+      held,
+      req.webSessionID,
+      "jumpCloneSvc",
+      "CloneJump",
+      [destinationLocationID, Number(body.cloneID) || 0, body.cost ?? null, body.confirmed === true],
+      null,
+    );
+    markTransitionAccepted(held);
+    const after = await awaitRouteTransition(held, req.webSessionID, "clone", expected);
+    if (!after.ok) {
+      sendTransitionTimeout(res, after, [...commandNotifications, ...outcome.notifications]);
+      return;
+    }
+    issuedTransitionKind = null;
+    res.json({
+      ok: true,
+      applied: true,
+      result: outcome.result ?? null,
+      flight: { ...after.flight, transition: after.transition },
+      transition: after.transition,
+      notifications: [...commandNotifications, ...outcome.notifications, ...after.notifications],
+    });
+  } catch (error) {
+    if (
+      issuedTransitionKind &&
+      held.transition &&
+      held.transition.kind === issuedTransitionKind
+    ) {
+      if (held.transition.phase === "requested") {
+        cancelHeldTransition(held);
+      } else if (held.transition.phase !== "failed") {
+        markTransitionFailed(held, error && error.message);
+      }
+    }
+    next(error);
+  }
+});
+
+// ⚠ DESTRUCTIVE — DestroyInstalledClone(cloneID) removes one of your own jump
+// clones. Reachable + gated, never fired live. Foreign cloneID misses (own-only).
+app.post("/api/bridge/clones/destroy", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "Destroying a jump clone is permanent. This must be confirmed explicitly.")) {
+    return;
+  }
+  const cloneID = Number((req.body || {}).cloneID) || 0;
+  await dispatchBridgeWrite(req, res, next, "jumpCloneSvc", "DestroyInstalledClone", [cloneID]);
+});
+
+// SetJumpCloneName(cloneID, name) — renames one of your own jump clones.
+app.post("/api/bridge/clones/set-name", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This renames that jump clone. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "jumpCloneSvc", "SetJumpCloneName", [
+    Number(body.cloneID) || 0,
+    typeof body.name === "string" ? body.name : "",
+  ]);
+});
+
+// OfferShipCloneInstallation(targetCharID) — offers to install a ship clone for
+// another character (a handshake; Accept/Cancel below complete it).
+app.post("/api/bridge/clones/ship/offer", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This offers a ship-clone installation. Confirm to continue.")) {
+    return;
+  }
+  const targetCharID = Number((req.body || {}).targetCharID) || 0;
+  await dispatchBridgeWrite(req, res, next, "jumpCloneSvc", "OfferShipCloneInstallation", [targetCharID]);
+});
+
+// AcceptShipCloneInstallation() — accepts a pending ship-clone offer.
+app.post("/api/bridge/clones/ship/accept", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This accepts the ship-clone installation. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "jumpCloneSvc", "AcceptShipCloneInstallation", []);
+});
+
+// CancelShipCloneInstallation() — cancels a pending ship-clone offer.
+app.post("/api/bridge/clones/ship/cancel", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This cancels the ship-clone installation. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "jumpCloneSvc", "CancelShipCloneInstallation", []);
+});
+
+// WB-CRIME (crimewatch) ------------------------------------------------------
+
+// SetSafetyLevel(level) — sets the character's weapons-safety flag (session-
+// scoped; safe-ish and reversible, but confirm-gated for consistency).
+app.post("/api/bridge/safety/set-level", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This changes your weapons safety setting. Confirm to continue.")) {
+    return;
+  }
+  const level = Number((req.body || {}).level);
+  await dispatchBridgeWrite(req, res, next, "crimewatch", "SetSafetyLevel", [
+    Number.isFinite(level) ? level : 2,
+  ]);
+});
+
+// --- R96 Phase-4 top-level WRITES — corpRegistry batch A ---------------------
+//
+// WB-CORPREG split 1 of ~3: bulletins (4) + labels (5) + contacts (4) + titles
+// (2), 15 writes on the SAME "corpRegistry" service the R80/R81/R82 reads opened.
+// Every one dispatches on the ORDINARY top-level /call seam (dispatchBridgeWrite →
+// heldTopLevelCall), NOT a bound two-step: each server handler resolves the corp
+// from the SESSION (resolveCorporationID(session)), so there is no MachoBindObject
+// step and no way for the browser to steer a FOREIGN corp — a bulletinID/labelID/
+// titleID/contactID that is not in the session-corp table simply MISSES (no-op).
+// Every route is CONFIRM-GATED via requireWriteConfirmation (no `confirm: true` ⇒
+// 400 CONFIRMATION_REQUIRED, no dispatch).
+//
+// ⚠ ROLE-GATED: corpRegistry writes are CEO/director-role-gated server-side; a
+// session lacking the role gets a role refusal / error return — CORRECT server
+// behavior, surfaced as a non-applied ack / thrown error, NOT a bridge bug.
+//
+// ⚠⚠ EXTRA-CARE — NEVER fired on the live world (reachability + refuses-without-
+// confirm only): DeleteBulletin, DeleteLabel, RemoveCorporateContacts. Their
+// confirm messages say so explicitly.
+//
+// FAST-MODE educated-guess decoders (writesCorpRegistry.ts): AddBulletin /
+// UpdateBulletin return a bulletinID, CreateLabel a labelID; the rest return null.
+
+// Bulletins (4) --------------------------------------------------------------
+
+// AddBulletin(title, body, [bulletinID], [editDateTime]) — posts a bulletin;
+// returns the allocated bulletinID.
+app.post("/api/bridge/corpreg/bulletin/add", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This posts a corporation bulletin. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const title = typeof body.title === "string" ? body.title : "";
+  const bulletinBody = typeof body.body === "string" ? body.body : "";
+  const bulletinID = Number(body.bulletinID) || null;
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "AddBulletin", [
+    title,
+    bulletinBody,
+    bulletinID,
+    body.editDateTime ?? null,
+  ]);
+});
+
+// UpdateBulletin(bulletinID, title, body, [editDateTime]) — edits an existing
+// bulletin (the handler reorders to AddBulletin under the hood); returns bulletinID.
+app.post("/api/bridge/corpreg/bulletin/update", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This edits that corporation bulletin. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const bulletinID = Number(body.bulletinID) || 0;
+  const title = typeof body.title === "string" ? body.title : "";
+  const bulletinBody = typeof body.body === "string" ? body.body : "";
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "UpdateBulletin", [
+    bulletinID,
+    title,
+    bulletinBody,
+    body.editDateTime ?? null,
+  ]);
+});
+
+// UpdateBulletinOrder(newOrder) — reorders bulletins by a list of bulletinIDs.
+app.post("/api/bridge/corpreg/bulletin/reorder", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This reorders the corporation bulletins. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "UpdateBulletinOrder", [
+    bridgeIDList((req.body || {}).order),
+  ]);
+});
+
+// ⚠ EXTRA-CARE (destructive — permanently removes a bulletin). DeleteBulletin(bulletinID).
+app.post("/api/bridge/corpreg/bulletin/delete", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "Deleting a corporation bulletin is permanent. This must be confirmed explicitly.")) {
+    return;
+  }
+  const bulletinID = Number((req.body || {}).bulletinID) || 0;
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "DeleteBulletin", [bulletinID]);
+});
+
+// Contact labels (5) ---------------------------------------------------------
+
+// CreateLabel(name, color) — creates a corp-contact label; returns the labelID.
+app.post("/api/bridge/corpreg/label/create", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This creates a corporation contact label. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const name = typeof body.name === "string" ? body.name : "";
+  const color = Number(body.color) || 0;
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "CreateLabel", [name, color]);
+});
+
+// EditLabel(labelID, [name], [color]) — renames / recolors a contact label.
+app.post("/api/bridge/corpreg/label/edit", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This edits that corporation contact label. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const labelID = Number(body.labelID) || 0;
+  const args = [labelID];
+  if (typeof body.name === "string") {
+    args.push(body.name);
+    if (body.color !== undefined) {
+      args.push(Number(body.color) || 0);
+    }
+  }
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "EditLabel", args);
+});
+
+// ⚠ EXTRA-CARE (destructive — removes the label and clears it from every contact).
+// DeleteLabel(labelID).
+app.post("/api/bridge/corpreg/label/delete", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "Deleting a corporation contact label is permanent. This must be confirmed explicitly.")) {
+    return;
+  }
+  const labelID = Number((req.body || {}).labelID) || 0;
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "DeleteLabel", [labelID]);
+});
+
+// AssignLabels(contactIDs, labelMask) — adds a label mask to the given contacts.
+app.post("/api/bridge/corpreg/label/assign", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This assigns labels to those corporation contacts. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "AssignLabels", [
+    bridgeIDList(body.contactIDs),
+    Number(body.labelMask) || 0,
+  ]);
+});
+
+// RemoveLabels(contactIDs, labelMask) — clears a label mask from the given contacts.
+app.post("/api/bridge/corpreg/label/remove", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This removes labels from those corporation contacts. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "RemoveLabels", [
+    bridgeIDList(body.contactIDs),
+    Number(body.labelMask) || 0,
+  ]);
+});
+
+// Corporate contacts (4) -----------------------------------------------------
+
+// AddCorporateContact(contactID, relationshipID) — adds a corp contact.
+app.post("/api/bridge/corpreg/contact/add", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This adds a corporation contact. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "AddCorporateContact", [
+    Number(body.contactID) || 0,
+    Number(body.relationshipID) || 0,
+  ]);
+});
+
+// EditCorporateContact(contactID, relationshipID) — updates a corp contact
+// (server alias of AddCorporateContact).
+app.post("/api/bridge/corpreg/contact/edit", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This edits that corporation contact. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "EditCorporateContact", [
+    Number(body.contactID) || 0,
+    Number(body.relationshipID) || 0,
+  ]);
+});
+
+// ⚠ EXTRA-CARE (destructive — removes corp contacts). RemoveCorporateContacts(contactIDs).
+app.post("/api/bridge/corpreg/contact/remove", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "Removing corporation contacts is permanent. This must be confirmed explicitly.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "RemoveCorporateContacts", [
+    bridgeIDList((req.body || {}).contactIDs),
+  ]);
+});
+
+// EditContactsRelationshipID(contactIDs, relationshipID) — sets standing on contacts.
+app.post("/api/bridge/corpreg/contact/set-standing", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This changes those corporation contacts' standing. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "EditContactsRelationshipID", [
+    bridgeIDList(body.contactIDs),
+    Number(body.relationshipID) || 0,
+  ]);
+});
+
+// Titles (2) -----------------------------------------------------------------
+
+// UpdateTitle(titleID, titleName, roles, grantableRoles, rolesAtHQ,
+// grantableRolesAtHQ, rolesAtBase, grantableRolesAtBase, rolesAtOther,
+// grantableRolesAtOther) — edits a corp title's name + role masks.
+app.post("/api/bridge/corpreg/title/update", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This updates a corporation title's roles. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const roleAt = (key) => (body[key] === undefined ? 0 : body[key]);
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "UpdateTitle", [
+    Number(body.titleID) || 0,
+    typeof body.titleName === "string" ? body.titleName : "",
+    roleAt("roles"),
+    roleAt("grantableRoles"),
+    roleAt("rolesAtHQ"),
+    roleAt("grantableRolesAtHQ"),
+    roleAt("rolesAtBase"),
+    roleAt("grantableRolesAtBase"),
+    roleAt("rolesAtOther"),
+    roleAt("grantableRolesAtOther"),
+  ]);
+});
+
+// UpdateTitles(titles) — bulk title update: a list of per-title row arrays, each
+// shaped like UpdateTitle's positional args.
+app.post("/api/bridge/corpreg/title/update-many", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This updates multiple corporation titles' roles. Confirm to continue.")) {
+    return;
+  }
+  const titles = Array.isArray((req.body || {}).titles) ? (req.body || {}).titles : [];
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "UpdateTitles", [titles]);
+});
+
+// --- R97 Phase-4 top-level WRITES — corpRegistry batch B ---------------------
+//
+// WB-CORPREG split 2 of ~3: member config (2) + corp config (4) + member/corp
+// settings (6) + titles-delete (1) + a generic corp-action executor (1) = 14
+// writes on the SAME "corpRegistry" service the R80-82 reads and the R96 batch-A
+// writes opened. Every one dispatches on the ORDINARY top-level /call seam
+// (dispatchBridgeWrite → heldTopLevelCall), NOT a bound two-step: each handler
+// resolves the corp from the SESSION (resolveCorporationID(session)), so there is
+// no MachoBindObject step and no way for the browser to steer a FOREIGN corp.
+// UpdateMember/UpdateMembers scope the target member to the SESSION-CORP runtime
+// (runtime.members[memberID]); a memberID not in this corp simply MISSES (no-op),
+// so there is no cross-corp mutation vector. Every route is CONFIRM-GATED via
+// requireWriteConfirmation (no `confirm: true` ⇒ 400 CONFIRMATION_REQUIRED).
+//
+// ⚠ ROLE-GATED: corpRegistry writes are CEO/director-role-gated server-side; a
+// session lacking the role gets a role refusal / error return — CORRECT server
+// behavior, NOT a bridge bug.
+//
+// ⚠⚠ EXTRA-CARE — NEVER fired on the live world (reachability + refuses-without-
+// confirm only): DeleteTitle (destructive) and ExecuteActions (a generic corp-
+// action executor that can drive multiple role-gated member mutations). Their
+// confirm messages say so explicitly.
+//
+// FAST-MODE educated-guess decoders (writesCorpRegistryConfig.ts): all but two
+// return null (SetAccountKey echoes a boolean; RegisterNewAggressionSettings
+// echoes an aggression-settings payload) — the panel re-reads to prove the edit.
+
+// Member config (2) ----------------------------------------------------------
+
+// UpdateMember(memberID, [title], [divisionID], [squadronID], [roles],
+// [grantableRoles], [rolesAtHQ], [grantableRolesAtHQ], [rolesAtBase],
+// [grantableRolesAtBase], [rolesAtOther], [grantableRolesAtOther], [baseID],
+// [titleMask], [blockRoles]) — edits one member of the SESSION corp; a memberID
+// not in this corp misses. FAST-MODE: absent named fields pass as null.
+app.post("/api/bridge/corpreg/member/update", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This updates a corporation member's roles/assignment. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "UpdateMember", [
+    Number(body.memberID) || 0,
+    body.title ?? null,
+    body.divisionID ?? null,
+    body.squadronID ?? null,
+    body.roles ?? null,
+    body.grantableRoles ?? null,
+    body.rolesAtHQ ?? null,
+    body.grantableRolesAtHQ ?? null,
+    body.rolesAtBase ?? null,
+    body.grantableRolesAtBase ?? null,
+    body.rolesAtOther ?? null,
+    body.grantableRolesAtOther ?? null,
+    body.baseID ?? null,
+    body.titleMask ?? null,
+    body.blockRoles ?? null,
+  ]);
+});
+
+// UpdateMembers(rows) — bulk member update: a list of per-member row arrays, each
+// shaped like UpdateMember's positional args. Each row is scoped to the session corp.
+app.post("/api/bridge/corpreg/member/update-many", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This updates multiple corporation members. Confirm to continue.")) {
+    return;
+  }
+  const rows = Array.isArray((req.body || {}).members) ? (req.body || {}).members : [];
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "UpdateMembers", [rows]);
+});
+
+// Corp config (4) ------------------------------------------------------------
+
+// UpdateCorporation(description, url, taxRate, applicationsEnabled, lpTaxRate) —
+// edits the session corp's description/url/tax/recruitment.
+app.post("/api/bridge/corpreg/corp/update", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This updates your corporation's description/URL/tax rate. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "UpdateCorporation", [
+    typeof body.description === "string" ? body.description : "",
+    typeof body.url === "string" ? body.url : "",
+    Number(body.taxRate) || 0,
+    body.applicationsEnabled ? 1 : 0,
+    Number(body.loyaltyPointTaxRate) || 0,
+  ]);
+});
+
+// UpdateCorporationAbilities(applicationsEnabled) — toggles whether the corp
+// accepts membership applications.
+app.post("/api/bridge/corpreg/corp/abilities", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This changes whether your corporation accepts applications. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "UpdateCorporationAbilities", [
+    (req.body || {}).applicationsEnabled ? 1 : 0,
+  ]);
+});
+
+// UpdateLogo(shape1, shape2, shape3, color1, color2, color3, typeface) — sets the
+// corp emblem shapes/colors.
+app.post("/api/bridge/corpreg/corp/logo", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This updates your corporation logo. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const n = (key) => (body[key] === undefined ? null : Number(body[key]) || null);
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "UpdateLogo", [
+    n("shape1"), n("shape2"), n("shape3"),
+    n("color1"), n("color2"), n("color3"),
+    n("typeface"),
+  ]);
+});
+
+// UpdateDivisionNames(name1 … name14) — renames the corp's 14 wallet/hangar divisions.
+app.post("/api/bridge/corpreg/corp/division-names", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This renames your corporation's divisions. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const names = Array.isArray(body.names) ? body.names : [];
+  const args = [];
+  for (let i = 0; i < 14; i += 1) {
+    args.push(typeof names[i] === "string" ? names[i] : null);
+  }
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "UpdateDivisionNames", args);
+});
+
+// Member / corp settings (6) -------------------------------------------------
+
+// SetAccountKey(accountKey) — sets the calling member's active corp-wallet
+// division key. Returns a boolean.
+app.post("/api/bridge/corpreg/member/account-key", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This changes your active corporation wallet division. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "SetAccountKey", [
+    Number((req.body || {}).accountKey) || 1000,
+  ]);
+});
+
+// SetCorpWelcomeMail(welcomeMail) — sets the corp's new-member welcome mail body.
+app.post("/api/bridge/corpreg/corp/welcome-mail", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This updates your corporation's welcome mail. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "SetCorpWelcomeMail", [
+    typeof (req.body || {}).welcomeMail === "string" ? (req.body || {}).welcomeMail : "",
+  ]);
+});
+
+// SetStructureReinforceDefault(hour) — sets the corp's default structure
+// reinforcement hour.
+app.post("/api/bridge/corpreg/corp/reinforce-default", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This updates your corporation's default structure reinforcement timer. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "SetStructureReinforceDefault", [
+    Number((req.body || {}).hour) || 0,
+  ]);
+});
+
+// RegisterNewAggressionSettings(friendlyFireLegal) — schedules the corp's
+// friendly-fire (aggression) setting. Returns an aggression-settings payload.
+app.post("/api/bridge/corpreg/settings/aggression", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This changes your corporation's friendly-fire (aggression) setting. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "RegisterNewAggressionSettings", [
+    (req.body || {}).friendlyFireLegal ? true : false,
+  ]);
+});
+
+// RegisterNewAcceptStructureSettings(acceptStructures) — toggles whether the corp
+// accepts anchored structures.
+app.post("/api/bridge/corpreg/settings/accept-structures", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This changes whether your corporation accepts structures. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "RegisterNewAcceptStructureSettings", [
+    (req.body || {}).acceptStructures ? true : false,
+  ]);
+});
+
+// RegisterNewCorpMailRestrictionSettings(restrictCorpMails) — toggles who may send
+// corp mails.
+app.post("/api/bridge/corpreg/settings/mail-restriction", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This changes your corporation's mail restriction setting. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "RegisterNewCorpMailRestrictionSettings", [
+    (req.body || {}).restrictCorpMails ? true : false,
+  ]);
+});
+
+// Titles-delete (1) + generic executor (1) — EXTRA-CARE ----------------------
+
+// ⚠ EXTRA-CARE (destructive — permanently removes a corp title). DeleteTitle(titleID).
+app.post("/api/bridge/corpreg/title/delete", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "Deleting a corporation title is permanent. This must be confirmed explicitly.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "DeleteTitle", [
+    Number((req.body || {}).titleID) || 0,
+  ]);
+});
+
+// ⚠ EXTRA-CARE (a generic corp-action executor — drives multiple role-gated member
+// mutations, e.g. kick/apply-title). ExecuteActions(targetIDs, actions).
+app.post("/api/bridge/corpreg/member/execute-actions", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This runs corporation member actions (which may kick members or change roles). This must be confirmed explicitly.")) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "ExecuteActions", [
+    bridgeIDList(body.targetIDs),
+    body.actions ?? null,
+  ]);
+});
+
+// --- R98 Phase-4 top-level WRITES — corpRegistry batch C ---------------------
+//
+// WB-CORPREG split 3 of 3 (CLOSES corpRegistry writes at 43/43): shares (2) +
+// dividend (1) + kicks (2) + CEO-resign (1) + applications (3) + alliance (3) +
+// war (1) + corp-creation (1) = 14 writes on the SAME "corpRegistry" service the
+// R80-82 reads and the R96/R97 batch-A/B writes opened. Every one dispatches on
+// the ORDINARY top-level /call seam (dispatchBridgeWrite → heldTopLevelCall), NOT
+// a bound two-step: the DECLARER / ACTOR / SPENDER is derived from the SESSION
+// (resolveCorporationID / resolveCharacterID server-side), so corpRegistry.
+// MachoBindObject is NOT allowlisted and the browser cannot steer a FOREIGN corp
+// as the acting party. Every route is CONFIRM-GATED via requireWriteConfirmation
+// (no `confirm: true` ⇒ 400 CONFIRMATION_REQUIRED, nothing dispatches).
+//
+// ⚠⚠ EVERY ONE IS FINANCIAL OR DESTRUCTIVE — reachability + refuses-without-
+// confirm ONLY, NEVER fired on the live world (no shares moved, no dividend paid,
+// no member kicked, no CEO resigned, no corp/alliance created, no war declared):
+//   PayoutDividend / AddCorporation / CreateAlliance / DeclareWarAgainst spend ISK;
+//   KickOutMember / KickOutMembers / ResignFromCEO are destructive;
+//   MoveCompanyShares / MovePrivateShares move share-asset ownership;
+//   the application / alliance writes mutate membership state.
+// The confirm messages say so explicitly.
+//
+// ⚠ ROLE-GATED server-side (CEO/director) — a role refusal is CORRECT, not a bug.
+//
+// ⚠ ARG-INJECTION (flagged in docs/arg-injection-leak-handoff.md, not fixed here):
+// server-side _MoveShares reads args[0] as a caller-supplied corporationID
+// (defaulting to the session corp). These dedicated routes pass NO corporationID
+// (arg[0] = null) so the handler resolves the SESSION corp — but the generic
+// /api/bridge/call seam could still steer a foreign corp's company-share treasury.
+// InsertApplication/UpdateApplicationOffer legitimately take a target corporationID
+// (you apply to OTHER corps); UpdateApplicationOffer's caller-supplied corp on the
+// RESPONDER side is noted in the handoff.
+//
+// FAST-MODE educated-guess decoders (writesCorpRegistryShareWar.ts): the share
+// moves / kicks / alliance-deletes answer null; the ID-returning writes
+// (InsertApplication → applicationID, InsertInvitation → invitationID,
+// AddCorporation → corporationID, CreateAlliance → allianceID, DeclareWarAgainst →
+// war record) pass their raw return through `result`. Never fired, so never QA'd.
+
+// Shares (2) — MoveCompanyShares/MovePrivateShares(corporationID, toShareholderID,
+// numberOfShares). ⚠ Pass corporationID = null so the handler resolves the SESSION
+// corp (never a caller-supplied foreign corp treasury).
+app.post("/api/bridge/corpreg/shares/move-company", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This moves your corporation's company shares to another shareholder. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "MoveCompanyShares", [
+    null,
+    Number(body.toShareholderID) || 0,
+    Number(body.numberOfShares) || 0,
+  ]);
+});
+
+app.post("/api/bridge/corpreg/shares/move-private", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This moves your own shares to another shareholder. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "MovePrivateShares", [
+    null,
+    Number(body.toShareholderID) || 0,
+    Number(body.numberOfShares) || 0,
+  ]);
+});
+
+// Dividend (1) — ⚠ SPENDS ISK. PayoutDividend(payShareholders, payoutAmount) —
+// pays out of the SESSION corp's master wallet (corp derived server-side).
+app.post("/api/bridge/corpreg/dividend/payout", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This pays an ISK dividend out of your corporation's wallet. This spends corporation ISK and must be confirmed explicitly.")) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "PayoutDividend", [
+    body.payShareholders === false ? 0 : 1,
+    Number(body.payoutAmount) || 0,
+  ]);
+});
+
+// Kicks + CEO-resign (3) — ⚠ DESTRUCTIVE. Actor corp derived server-side.
+app.post("/api/bridge/corpreg/member/kick", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "Kicking a member out of your corporation is destructive. This must be confirmed explicitly.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "KickOutMember", [
+    Number((req.body || {}).characterID) || 0,
+  ]);
+});
+
+app.post("/api/bridge/corpreg/member/kick-many", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "Kicking multiple members out of your corporation is destructive. This must be confirmed explicitly.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "KickOutMembers", [
+    bridgeIDList((req.body || {}).characterIDs),
+  ]);
+});
+
+// ResignFromCEO(newCEOID) — ⚠ DESTRUCTIVE (hands the corp to another member).
+app.post("/api/bridge/corpreg/ceo/resign", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "Resigning as CEO hands your corporation to another member. This is irreversible and must be confirmed explicitly.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "ResignFromCEO", [
+    Number((req.body || {}).newCEOID) || 0,
+  ]);
+});
+
+// Applications (3) --------------------------------------------------------------
+
+// InsertApplication(corporationID, applicationText) — apply to JOIN a corp; the
+// target corp is legitimately caller-supplied (you apply to another corp), the
+// applicant is the SESSION character (server-side). Returns applicationID.
+app.post("/api/bridge/corpreg/application/insert", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This files a membership application to a corporation on your behalf. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "InsertApplication", [
+    Number(body.corporationID) || 0,
+    typeof body.applicationText === "string" ? body.applicationText : "",
+  ]);
+});
+
+// InsertInvitation(characterID) — invite a character into the SESSION corp
+// (corp derived server-side). Returns invitationID.
+app.post("/api/bridge/corpreg/application/invite", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This invites a character to join your corporation. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "InsertInvitation", [
+    Number((req.body || {}).characterID) || 0,
+  ]);
+});
+
+// UpdateApplicationOffer(applicationID, characterID, corporationID, applicationText,
+// status, customMessage) — the corp responds to an application (accept/reject may
+// add a member). ⚠ corporationID is caller-supplied on this responder side (noted
+// in the arg-injection handoff).
+app.post("/api/bridge/corpreg/application/update-offer", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This responds to a corporation membership application (accepting one adds a member). Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "UpdateApplicationOffer", [
+    Number(body.applicationID) || 0,
+    Number(body.characterID) || 0,
+    Number(body.corporationID) || 0,
+    typeof body.applicationText === "string" ? body.applicationText : "",
+    Number(body.status) || 0,
+    typeof body.customMessage === "string" ? body.customMessage : "",
+  ]);
+});
+
+// Alliance (3) ------------------------------------------------------------------
+
+// AddCorporation(name, ticker, description, url, taxRate, shape1..3, color1..3,
+// typeface, applicationsEnabled, friendlyFireEnabled, lpTaxRate) — ⚠ SPENDS ISK
+// (founding fee debited from the SESSION character's wallet server-side) and
+// CREATES a corp. 15 positional args; absent fields pass null.
+app.post("/api/bridge/corpreg/corp/create", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This founds a new corporation, debiting the founding fee from your ISK wallet. This spends ISK and creates a corporation, and must be confirmed explicitly.")) {
+    return;
+  }
+  const body = req.body || {};
+  const orNull = (v) => (v === undefined ? null : v);
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "AddCorporation", [
+    typeof body.name === "string" ? body.name : "",
+    typeof body.tickerName === "string" ? body.tickerName : "",
+    typeof body.description === "string" ? body.description : "",
+    typeof body.url === "string" ? body.url : "",
+    Number(body.taxRate) || 0,
+    orNull(body.shape1), orNull(body.shape2), orNull(body.shape3),
+    orNull(body.color1), orNull(body.color2), orNull(body.color3),
+    orNull(body.typeface),
+    body.applicationsEnabled ? 1 : 0,
+    body.friendlyFireEnabled ? 1 : 0,
+    Number(body.loyaltyPointTaxRate) || 0,
+  ]);
+});
+
+// CreateAlliance(name, shortName, description, url) — ⚠ SPENDS ISK and CREATES an
+// alliance for the SESSION corp (corp/spender derived server-side).
+app.post("/api/bridge/corpreg/alliance/create", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This founds a new alliance, debiting the founding fee. This spends ISK and creates an alliance, and must be confirmed explicitly.")) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "CreateAlliance", [
+    typeof body.name === "string" ? body.name : "",
+    typeof body.shortName === "string" ? body.shortName : "",
+    typeof body.description === "string" ? body.description : "",
+    typeof body.url === "string" ? body.url : "",
+  ]);
+});
+
+// ApplyToJoinAlliance(allianceID, applicationText) — the SESSION corp applies to
+// an alliance (applicant corp derived server-side; target alliance caller-supplied).
+app.post("/api/bridge/corpreg/alliance/apply", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This applies for your corporation to join an alliance. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "ApplyToJoinAlliance", [
+    Number(body.allianceID) || 0,
+    typeof body.applicationText === "string" ? body.applicationText : "",
+  ]);
+});
+
+// DeleteAllianceApplication(allianceID) — withdraws the SESSION corp's pending
+// alliance application (corp derived server-side).
+app.post("/api/bridge/corpreg/alliance/delete-application", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This withdraws your corporation's alliance application. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "DeleteAllianceApplication", [
+    Number((req.body || {}).allianceID) || 0,
+  ]);
+});
+
+// War (1) — ⚠ SPENDS ISK + DECLARES WAR. DeclareWarAgainst(againstID, warHQ) —
+// the DECLARER is the SESSION corp (server-side); againstID is the caller-supplied
+// target (declaring war is intentionally cross-entity). Bill debits the session corp.
+app.post("/api/bridge/corpreg/war/declare", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This declares war on another entity on behalf of your corporation, filing a CONCORD war bill (spends ISK). This must be confirmed explicitly.")) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "corpRegistry", "DeclareWarAgainst", [
+    Number(body.againstID) || 0,
+    body.warHQ === undefined ? null : Number(body.warHQ) || null,
+  ]);
+});
+
+// --- R99 Phase-4 top-level WRITES: allianceRegistry + warRegistry + corpStationMgr ---
+//
+// WB-ALLYREG (10) + WB-WARREG (9) + WB-CORPSTN (1) = 20 writes. Like the R83/R84
+// allianceRegistry reads and the R79 warRegistry/corpStationMgr reads, each of these
+// three services dispatches on the ORDINARY top-level /call seam (heldTopLevelCall) —
+// NO MachoBindObject two-step is opened. The acting ALLIANCE derives from the SESSION
+// (resolveAllianceIDFromSession), the acting WAR ENTITY from the SESSION
+// (resolveWarEntityID), and the acting CORP from the SESSION (resolveCorporationID),
+// so a browser cannot name a FOREIGN alliance/war/corp as the ACTING party.
+//
+// Every route is CONFIRM-GATED (requireWriteConfirmation: no `confirm:true` ⇒ 400
+// CONFIRMATION_REQUIRED, nothing dispatches). allianceRegistry/warRegistry writes are
+// exec-role-gated server-side — a role refusal is CORRECT, not a bug.
+//
+// ⚠⚠ FINANCIAL / DESTRUCTIVE / CONSEQUENTIAL — reachable + refused-without-confirm ONLY,
+// NEVER fired on the live world in this plumbing pass:
+//   • allianceRegistry.PayBill (spends ISK), .DeleteRelationship (destroys)
+//   • warRegistry.AcceptAllyNegotiation (spends ISK), .AcceptSurrender /
+//     .DeclineSurrender (end / change a war), .RetractMutualWar (ends a war)
+//   • corpStationMgr.MoveCorpHQHere (moves the corp HQ — consequential)
+// The rest are governance writes (confirm-gated; exec-role-gated).
+//
+// ⚠ ARG-INJECTION (flagged in docs/arg-injection-leak-handoff.md, NOT fixed here): the
+// warRegistry accept/decline/retract/set verbs and allianceRegistry.UpdateAlliance act
+// on a CALLER-SUPPLIED warNegotiationID / warID / allianceID with no session-party gate.
+// The dedicated routes pass the natural payload; a fix + QA come later server-side.
+//
+// FAST-MODE educated-guess decoders (writesAllianceWarStation.ts): every one of these
+// handlers returns null (AddBulletin edits in place and also returns null), so `applied`
+// is the confirm-gate's did-not-throw signal and a panel re-reads to confirm. Never
+// fired, so never QA'd.
+
+// allianceRegistry (10) — acting ALLIANCE derived from the session server-side.
+app.post("/api/bridge/ally/relationship/set", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This sets your alliance's standing toward another entity. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "allianceRegistry", "SetRelationship", [
+    Number(body.relationship) || 0,
+    Number(body.toID) || 0,
+  ]);
+});
+
+// ⚠ DESTRUCTIVE — removes a standing your alliance holds.
+app.post("/api/bridge/ally/relationship/delete", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "Deleting an alliance relationship is destructive. This must be confirmed explicitly.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "allianceRegistry", "DeleteRelationship", [
+    Number((req.body || {}).toID) || 0,
+  ]);
+});
+
+app.post("/api/bridge/ally/contact/add", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This adds an alliance contact. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "allianceRegistry", "AddAllianceContact", [
+    Number(body.contactID) || 0,
+    Number(body.relationshipID) || 0,
+  ]);
+});
+
+// AddBulletin(title, body, bulletinID?) — omit bulletinID (null) to create; a
+// bulletinID edits that bulletin in place. Alliance derived server-side.
+app.post("/api/bridge/ally/bulletin/add", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This posts an alliance bulletin. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "allianceRegistry", "AddBulletin", [
+    typeof body.title === "string" ? body.title : "",
+    typeof body.body === "string" ? body.body : "",
+    body.bulletinID === undefined ? null : Number(body.bulletinID) || null,
+  ]);
+});
+
+// UpdateApplication(corporationID, applicationText, state) — the alliance responds
+// to a CORP's membership application (state 2 accepts it → adds the corp). Alliance
+// derived server-side; corporationID is the applicant corp being responded to.
+app.post("/api/bridge/ally/application/update", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This responds to a corporation's alliance-membership application (accepting one adds the corporation to your alliance). Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "allianceRegistry", "UpdateApplication", [
+    Number(body.corporationID) || 0,
+    typeof body.applicationText === "string" ? body.applicationText : "",
+    Number(body.state) || 0,
+  ]);
+});
+
+// ⚠ SPENDS ISK — PayBill(billID) pays out of the SESSION corp's wallet (payer =
+// session.corporationID server-side; billID is the bill being settled). Optional
+// fromAccountKey second arg.
+app.post("/api/bridge/ally/bill/pay", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This pays an alliance bill out of your corporation's wallet. This spends ISK and must be confirmed explicitly.")) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "allianceRegistry", "PayBill", [
+    Number(body.billID) || 0,
+    body.fromAccountKey === undefined ? 1000 : Number(body.fromAccountKey) || 1000,
+  ]);
+});
+
+app.post("/api/bridge/ally/prime-hour/set", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This sets your alliance's sovereignty prime hour. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "allianceRegistry", "SetPrimeHour", [
+    Number((req.body || {}).hour) || 0,
+  ]);
+});
+
+app.post("/api/bridge/ally/capital-system/set", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This sets your alliance's capital system. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "allianceRegistry", "SetCapitalSystem", [
+    Number((req.body || {}).solarSystemID) || 0,
+  ]);
+});
+
+// DeclareExecutorSupport(chosenExecutorCorporationID) — the SESSION corp votes which
+// member corp should be alliance executor (supporter corp derived server-side).
+app.post("/api/bridge/ally/executor-support/declare", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This declares your corporation's support for an alliance executor. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "allianceRegistry", "DeclareExecutorSupport", [
+    Number((req.body || {}).chosenExecutorCorporationID) || 0,
+  ]);
+});
+
+// UpdateAlliance(description, url) — edits the SESSION alliance's public description /
+// url. ⚠ ARG-INJECTION: the server's resolveAllianceIDFromArgs reads args[0] as a
+// possible allianceID before falling back to the session alliance — a numeric-string
+// description could steer a foreign alliance. Flagged; not fixed here.
+app.post("/api/bridge/ally/update", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This edits your alliance's description and url. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "allianceRegistry", "UpdateAlliance", [
+    typeof body.description === "string" ? body.description : "",
+    typeof body.url === "string" ? body.url : "",
+  ]);
+});
+
+// warRegistry (9) — acting WAR ENTITY (corp/alliance) derived from the session.
+// ⚠ ARG-INJECTION: the accept/decline/retract/set verbs act on the caller-supplied
+// warNegotiationID / warID with NO session-party gate (flagged, not fixed).
+
+// CreateWarAllyOffer(warID, iskValue, defenderID, description) — offers to fight as an
+// ally in a war; iskValue is the fee the offeror requests. Owner derived server-side.
+app.post("/api/bridge/war/ally-offer/create", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This creates a war ally offer. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "warRegistry", "CreateWarAllyOffer", [
+    Number(body.warID) || 0,
+    Number(body.iskValue) || 0,
+    Number(body.defenderID) || 0,
+    typeof body.description === "string" ? body.description : "",
+  ]);
+});
+
+app.post("/api/bridge/war/ally-offer/retract", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This retracts a war ally offer. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "warRegistry", "RetractWarAllyOffer", [
+    Number((req.body || {}).warNegotiationID) || 0,
+  ]);
+});
+
+// CreateSurrenderNegotiation(warID, iskValue, description) — offers surrender terms
+// (iskValue is the reparation offered). Owner derived server-side.
+app.post("/api/bridge/war/surrender/create", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This opens a surrender negotiation, offering reparation terms to end a war. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "warRegistry", "CreateSurrenderNegotiation", [
+    Number(body.warID) || 0,
+    Number(body.iskValue) || 0,
+    typeof body.description === "string" ? body.description : "",
+  ]);
+});
+
+// ⚠ CONSEQUENTIAL + SPENDS ISK — accepting an ally negotiation debits the accepting
+// party's wallet (CONCORD fee + ally fee) and binds the ally to the war.
+app.post("/api/bridge/war/ally-negotiation/accept", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "Accepting a war ally negotiation binds an ally and debits the CONCORD + ally fee from the paying wallet. This spends ISK and changes a war, and must be confirmed explicitly.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "warRegistry", "AcceptAllyNegotiation", [
+    Number((req.body || {}).warNegotiationID) || 0,
+  ]);
+});
+
+app.post("/api/bridge/war/ally-offer/decline", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This declines a war ally offer. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "warRegistry", "DeclineAllyOffer", [
+    Number((req.body || {}).warNegotiationID) || 0,
+  ]);
+});
+
+// ⚠ CONSEQUENTIAL — accepting a surrender ENDS a war.
+app.post("/api/bridge/war/surrender/accept", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "Accepting a surrender ends the war. This changes a war and must be confirmed explicitly.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "warRegistry", "AcceptSurrender", [
+    Number((req.body || {}).warNegotiationID) || 0,
+  ]);
+});
+
+// ⚠ CONSEQUENTIAL — declining a surrender changes a war negotiation's state.
+app.post("/api/bridge/war/surrender/decline", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "Declining a surrender changes a war negotiation. This must be confirmed explicitly.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "warRegistry", "DeclineSurrender", [
+    Number((req.body || {}).warNegotiationID) || 0,
+  ]);
+});
+
+// ⚠ CONSEQUENTIAL — retracting a mutual war ENDS it. RetractMutualWar(warID);
+// retractedBy derived from the session.
+app.post("/api/bridge/war/mutual/retract", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "Retracting a mutual war ends it. This changes a war and must be confirmed explicitly.")) {
+    return;
+  }
+  await dispatchBridgeWrite(req, res, next, "warRegistry", "RetractMutualWar", [
+    Number((req.body || {}).warID) || 0,
+  ]);
+});
+
+// SetOpenForAllies(warID, state) — toggles whether a war accepts allies.
+app.post("/api/bridge/war/open-for-allies/set", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This toggles whether a war is open for allies. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  await dispatchBridgeWrite(req, res, next, "warRegistry", "SetOpenForAllies", [
+    Number(body.warID) || 0,
+    body.state === true,
+  ]);
+});
+
+// corpStationMgr (1) — ⚠ CONSEQUENTIAL/ISK. MoveCorpHQHere(stationID?) — moves the
+// SESSION corp's HQ (corp derived server-side); stationID defaults to the session's
+// current station when omitted.
+app.post("/api/bridge/corpstn/hq/move-here", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This moves your corporation's headquarters to this station. This is consequential and must be confirmed explicitly.")) {
+    return;
+  }
+  const stationID = Number((req.body || {}).stationID) || null;
+  await dispatchBridgeWrite(req, res, next, "corpStationMgr", "MoveCorpHQHere", [stationID]);
+});
+
+// --- R100 WB-DOGMA batch A: the 11 Phase-4 BOUND dogma module-op WRITES -------
+//
+// These ride the SAME dogmaIM.MachoBindObject bind the R74 reads use (dogmaBindSpec
+// / boundCall — the real bound two-step; the BFF holds the OID handle, the browser
+// never sees it). Unlike the R99 top-level writes above (dispatchBridgeWrite over
+// heldTopLevelCall), each of these dispatches as a BOUND method off the dogma bind.
+// Ship-module ops — target-drop, module overload / stop-overload, nanite module-
+// repair, weapon-bank link/merge — all reversible-ish in-space actions, no ISK, no
+// permanent asset destruction. Every route is confirm-gated: without `confirm:true`
+// it answers 400 CONFIRMATION_REQUIRED and NOTHING dispatches.
+//
+// FAST-MODE (R86–R99 pattern): none fired live this batch (operator owns EveJS; no
+// server restart). The handlers' returns vary (null / itemID / bool / moduleID list
+// / a [success, missingCharges, failed] triple / a weapon-bank state dict); the ack
+// carries `result` through untouched for a future ship/fitting UI to decode.
+//
+// ⚠ ARG-INJECTION: RemoveTargets/ClearTargets and the overload/module-repair ops
+// resolve their scene/ship from the SESSION (spaceRuntime.<op>(session, …) /
+// _startModuleRepair(session, itemID)). LinkWeapons/MergeModuleGroups accept a
+// caller-supplied shipID as args[0] (falling back to _getShipID(session)) — flagged
+// in docs/arg-injection-leak-handoff.md for a server-side session-scoping fix + QA;
+// kept plumbed + confirm-gated. This BFF passes only the session ship's own module
+// ids from a future UI, but the handler does not enforce that.
+
+/** Dispatch one confirm-gated BOUND dogma write off the dogma bind; uniform ack. */
+async function dispatchBoundDogmaWrite(req, res, next, method, args) {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const outcome = await boundCall(held, req.webSessionID, dogmaBindSpec(), method, args, null);
+    res.json({ ok: true, applied: true, result: outcome.result ?? null, notifications: outcome.notifications });
+  } catch (error) {
+    if (error && error.code === "SESSION_NOT_FOUND") {
+      forgetBridgeSession(req.webSessionID);
+    }
+    next(error);
+  }
+}
+
+// --- Dedicated ammo writes -------------------------------------------------
+//
+// The raw dogma calls accept a ship id and arbitrary inventory location ids:
+//   LoadAmmo(shipID, moduleIDs, chargeItemIDs, ammoLocationID)
+//   UnloadAmmo(shipID, moduleIDs, destination, quantity?)
+// Those arguments are too broad for a browser route. These dedicated routes
+// therefore accept only the semantic places the current client can actually
+// operate on: this session's ACTIVE ship cargo or its CURRENT docked station /
+// structure hangar. The concrete ids and inventory flags are pinned here after
+// a live flight read; caller-supplied ship/location ids are never forwarded.
+
+function strictPositiveID(value) {
+  if (
+    (typeof value !== "number" && typeof value !== "string")
+    || (typeof value === "string" && value.trim() === "")
+  ) {
+    return null;
+  }
+  const numeric = Number(value);
+  return Number.isSafeInteger(numeric) && numeric > 0 ? numeric : null;
+}
+
+/** A non-empty id list where every member is a positive safe integer. */
+function strictPositiveIDList(value) {
+  if (!Array.isArray(value) || value.length === 0) {
+    return null;
+  }
+  const ids = value.map(strictPositiveID);
+  if (ids.some((id) => id === null)) {
+    return null;
+  }
+  return [...new Set(ids)];
+}
+
+function sendDedicatedWriteInputError(res, error, message) {
+  res.status(400).json({ ok: false, error, message });
+}
+
+/**
+ * Read and pin the active ship before an argument-injectable write.
+ *
+ * held.activeShipID is updated only by the authoritative board/leave flow. The
+ * live flight read must agree with it; a mismatch is a transition/stale-tab
+ * condition, not permission to silently switch the route to another hull.
+ */
+async function readPinnedActiveShip(held, webSessionID, res) {
+  const current = await readHeldFlight(held, webSessionID);
+  const pinnedShipID = strictPositiveID(held.activeShipID);
+  const liveShipID = strictPositiveID(current && current.flight && current.flight.shipID);
+  if (pinnedShipID === null || liveShipID === null) {
+    res.status(409).json({
+      ok: false,
+      error: "NO_ACTIVE_SHIP",
+      message: "No active ship is available for this action.",
+    });
+    return null;
+  }
+  if (liveShipID !== pinnedShipID) {
+    res.status(409).json({
+      ok: false,
+      error: "ACTIVE_SHIP_CHANGED",
+      message: "The active ship changed. Refresh before trying this action again.",
+    });
+    return null;
+  }
+  return {
+    shipID: pinnedShipID,
+    characterID: strictPositiveID(held.characterID),
+    flight: current.flight,
+  };
+}
+
+/** Resolve cargo or the current dock/structure hangar without accepting an id. */
+function resolvePinnedAmmoPlace(res, context, place) {
+  if (place === "cargo") {
+    return {
+      locationID: context.shipID,
+      destination: [context.shipID, context.characterID, ITEM_FLAG_CARGO_HOLD],
+    };
+  }
+  if (place !== "hangar") {
+    sendDedicatedWriteInputError(
+      res,
+      "INVALID_AMMO_LOCATION",
+      "location must be 'cargo' or 'hangar'.",
+    );
+    return null;
+  }
+  const flight = context.flight || {};
+  const dockedLocationID =
+    strictPositiveID(flight.structureID) ?? strictPositiveID(flight.stationID);
+  if (flight.docked !== true || flight.inSpace === true || dockedLocationID === null) {
+    res.status(409).json({
+      ok: false,
+      error: "NOT_DOCKED",
+      message: "The current station or structure hangar is available only while docked.",
+    });
+    return null;
+  }
+  return {
+    locationID: dockedLocationID,
+    destination: [dockedLocationID, context.characterID, ITEM_FLAG_HANGAR],
+  };
+}
+
+// LoadAmmo on the session's pinned active ship. `source` is deliberately a
+// two-value word, never a location id. A bank master may expand server-side to
+// every linked module, which is why this remains confirm-gated.
+app.post("/api/bridge/dogma/ammo/load", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This reloads the selected module or linked weapon bank and moves ammunition from the chosen inventory. Confirm to continue.")) {
+    return;
+  }
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const body = req.body || {};
+  const moduleIDs = strictPositiveIDList(body.moduleIDs);
+  const chargeItemIDs = strictPositiveIDList(body.chargeItemIDs);
+  const source = typeof body.source === "string" ? body.source : "";
+  if (moduleIDs === null) {
+    sendDedicatedWriteInputError(res, "INVALID_MODULE_IDS", "moduleIDs must be a non-empty list of positive integers.");
+    return;
+  }
+  if (chargeItemIDs === null) {
+    sendDedicatedWriteInputError(res, "INVALID_CHARGE_IDS", "chargeItemIDs must be a non-empty list of positive integers.");
+    return;
+  }
+  if (source !== "cargo" && source !== "hangar") {
+    sendDedicatedWriteInputError(res, "INVALID_AMMO_LOCATION", "source must be 'cargo' or 'hangar'.");
+    return;
+  }
+  try {
+    const context = await readPinnedActiveShip(held, req.webSessionID, res);
+    if (!context) {
+      return;
+    }
+    const sourcePlace = resolvePinnedAmmoPlace(res, context, source);
+    if (!sourcePlace) {
+      return;
+    }
+    const outcome = await heldTopLevelCall(
+      held,
+      req.webSessionID,
+      "dogmaIM",
+      "LoadAmmo",
+      [context.shipID, moduleIDs, chargeItemIDs, sourcePlace.locationID],
+      null,
+    );
+    res.json({ ok: true, applied: true, result: outcome.result ?? null, notifications: outcome.notifications });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// UnloadAmmo from the session's pinned active ship. An omitted quantity unloads
+// the selected module(s) completely; a supplied quantity must be a positive
+// safe integer. The destination tuple's location and flag are both server-owned.
+app.post("/api/bridge/dogma/ammo/unload", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This unloads ammunition from the selected module or linked weapon bank into the chosen inventory. Confirm to continue.")) {
+    return;
+  }
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const body = req.body || {};
+  const moduleIDs = strictPositiveIDList(body.moduleIDs);
+  const destination = typeof body.destination === "string" ? body.destination : "";
+  const hasQuantity = body.quantity !== undefined && body.quantity !== null;
+  const quantity = hasQuantity ? strictPositiveID(body.quantity) : null;
+  if (moduleIDs === null) {
+    sendDedicatedWriteInputError(res, "INVALID_MODULE_IDS", "moduleIDs must be a non-empty list of positive integers.");
+    return;
+  }
+  if (destination !== "cargo" && destination !== "hangar") {
+    sendDedicatedWriteInputError(res, "INVALID_AMMO_LOCATION", "destination must be 'cargo' or 'hangar'.");
+    return;
+  }
+  if (hasQuantity && quantity === null) {
+    sendDedicatedWriteInputError(res, "INVALID_QUANTITY", "quantity must be a positive integer when supplied.");
+    return;
+  }
+  try {
+    const context = await readPinnedActiveShip(held, req.webSessionID, res);
+    if (!context) {
+      return;
+    }
+    const destinationPlace = resolvePinnedAmmoPlace(res, context, destination);
+    if (!destinationPlace) {
+      return;
+    }
+    const args = [context.shipID, moduleIDs, destinationPlace.destination];
+    if (hasQuantity) {
+      args.push(quantity);
+    }
+    const outcome = await heldTopLevelCall(
+      held,
+      req.webSessionID,
+      "dogmaIM",
+      "UnloadAmmo",
+      args,
+      null,
+    );
+    res.json({ ok: true, applied: true, result: outcome.result ?? null, notifications: outcome.notifications });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// RemoveTargets([targetIDs]) — drop a set of locks in one call. Session-scoped.
+app.post("/api/bridge/dogma/targets/remove", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This drops those target locks. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBoundDogmaWrite(req, res, next, "RemoveTargets", [bridgeIDList((req.body || {}).targetIDs)]);
+});
+
+// ClearTargets() — drop EVERY lock in one call. Session-scoped, no args.
+app.post("/api/bridge/dogma/targets/clear", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This drops all your target locks. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBoundDogmaWrite(req, res, next, "ClearTargets", []);
+});
+
+// Overload(moduleID, effectID) — overload one module's effect.
+app.post("/api/bridge/dogma/module/overload", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This overloads that module. Confirm to continue.")) {
+    return;
+  }
+  const moduleID = Number((req.body || {}).moduleID) || 0;
+  const effectID = Number((req.body || {}).effectID) || 0;
+  await dispatchBoundDogmaWrite(req, res, next, "Overload", [moduleID, effectID]);
+});
+
+// OverloadRack(moduleID) — overload the whole rack the module belongs to.
+app.post("/api/bridge/dogma/module/overload-rack", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This overloads that module's whole rack. Confirm to continue.")) {
+    return;
+  }
+  const moduleID = Number((req.body || {}).moduleID) || 0;
+  await dispatchBoundDogmaWrite(req, res, next, "OverloadRack", [moduleID]);
+});
+
+// StopOverload(moduleID, effectID) — stop overloading one module's effect.
+app.post("/api/bridge/dogma/module/stop-overload", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This stops overloading that module. Confirm to continue.")) {
+    return;
+  }
+  const moduleID = Number((req.body || {}).moduleID) || 0;
+  const effectID = Number((req.body || {}).effectID) || 0;
+  await dispatchBoundDogmaWrite(req, res, next, "StopOverload", [moduleID, effectID]);
+});
+
+// StopOverloadRack(moduleID) — stop overloading the module's whole rack.
+app.post("/api/bridge/dogma/module/stop-overload-rack", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This stops overloading that module's whole rack. Confirm to continue.")) {
+    return;
+  }
+  const moduleID = Number((req.body || {}).moduleID) || 0;
+  await dispatchBoundDogmaWrite(req, res, next, "StopOverloadRack", [moduleID]);
+});
+
+// InitiateModuleRepair(moduleID) — start a nanite paste repair on one module.
+app.post("/api/bridge/dogma/module/repair/start", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This starts a nanite repair on that module (consumes repair paste). Confirm to continue.")) {
+    return;
+  }
+  const moduleID = Number((req.body || {}).moduleID) || 0;
+  await dispatchBoundDogmaWrite(req, res, next, "InitiateModuleRepair", [moduleID]);
+});
+
+// InitiateModuleRepairMany([moduleIDs]) — start repairs on several modules at once.
+app.post("/api/bridge/dogma/module/repair/start-many", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This starts nanite repairs on those modules (consumes repair paste). Confirm to continue.")) {
+    return;
+  }
+  await dispatchBoundDogmaWrite(req, res, next, "InitiateModuleRepairMany", [bridgeIDList((req.body || {}).moduleIDs)]);
+});
+
+// StopModuleRepair(moduleID) — stop an in-progress module repair.
+app.post("/api/bridge/dogma/module/repair/stop", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This stops that module's repair. Confirm to continue.")) {
+    return;
+  }
+  const moduleID = Number((req.body || {}).moduleID) || 0;
+  await dispatchBoundDogmaWrite(req, res, next, "StopModuleRepair", [moduleID]);
+});
+
+/**
+ * The session's OWN active ship — what every weapon-bank write is pinned to.
+ *
+ * ⚠ THIS CLOSES A FLAGGED ARG-INJECTION. All seven bank writes take a shipID,
+ * and the BFF used to forward whatever the browser sent (see
+ * docs/arg-injection-leak-handoff.md). There is no legitimate reason for a
+ * browser to name a hull here: banking only ever applies to the ship you are
+ * flying, and the server resolves the modules against it. 0 when there is no
+ * held session, which the handler refuses on its own.
+ */
+function sessionActiveShipID(req) {
+  const held = bridgeSessions.get(req.webSessionID) || null;
+  return held ? Number(held.activeShipID) || 0 : 0;
+}
+
+// LinkWeapons(shipID, masterModuleID, slaveModuleID) — bank a slave weapon to a
+// master. shipID is the SESSION's active ship (sessionActiveShipID), never the
+// browser's — the arg-injection flag on these routes is closed.
+app.post("/api/bridge/dogma/weapons/link", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This links those weapons into one bank. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const shipID = sessionActiveShipID(req);
+  const masterModuleID = Number(body.masterModuleID) || 0;
+  const slaveModuleID = Number(body.slaveModuleID) || 0;
+  await dispatchBoundDogmaWrite(req, res, next, "LinkWeapons", [shipID, masterModuleID, slaveModuleID]);
+});
+
+// MergeModuleGroups(shipID, targetMasterID, sourceMasterID) — merge two weapon
+// banks. ⚠ shipID is caller-supplied (arg-injection-flagged), as LinkWeapons.
+app.post("/api/bridge/dogma/weapons/merge-groups", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This merges those two weapon banks. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const shipID = sessionActiveShipID(req);
+  const targetMasterID = Number(body.targetMasterID) || 0;
+  const sourceMasterID = Number(body.sourceMasterID) || 0;
+  await dispatchBoundDogmaWrite(req, res, next, "MergeModuleGroups", [shipID, targetMasterID, sourceMasterID]);
+});
+
+// --- R101 WB-DOGMA batch B: the 11 remaining Phase-4 BOUND dogma WRITES --------
+// (CLOSES WB-DOGMA, 22/22)
+//
+// Same bind as R100 (dispatchBoundDogmaWrite → boundCall(dogmaBindSpec(), …)):
+// weapon-bank link/unlink/destroy, probe launch, drone settings, and the char-
+// brain implant/booster/skill ops. Every route is confirm-gated; the destructive /
+// consumable ones (DestroyWeaponBank / InjectSkillIntoBrain / InjectImplant /
+// DestroyImplant / UseBooster) carry an EXTRA-EXPLICIT confirm message. FAST-MODE:
+// none fired live this batch (operator owns EveJS; no restart); `result` carries
+// each handler's varied return through untouched for a future ship/brain UI.
+//
+// ⚠ ARG-INJECTION: LaunchProbes / ChangeDroneSettings resolve ship+char from the
+// SESSION (args are the probe launcher moduleID+count / a drone-settings dict);
+// InjectSkillIntoBrain / InjectImplant / DestroyImplant / UseBooster act on the
+// SESSION char (_getCharID(session)) with caller-supplied item ids only. The
+// weapon-bank quintet (PeelAndLink / UnlinkModule / LinkAllWeapons /
+// UnlinkAllModules / DestroyWeaponBank) accepts a caller-supplied shipID (args[0]
+// → _getShipID(session) fallback) — same pattern as R100's LinkWeapons /
+// MergeModuleGroups, flagged in docs/arg-injection-leak-handoff.md.
+
+// PeelAndLink(shipID, targetMasterID, sourceMasterID) — peel a weapon off a bank
+// and link it to another master. ⚠ shipID caller-supplied (arg-injection-flagged).
+app.post("/api/bridge/dogma/weapons/peel-and-link", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This re-links that weapon into a different bank. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const shipID = sessionActiveShipID(req);
+  const targetMasterID = Number(body.targetMasterID) || 0;
+  const sourceMasterID = Number(body.sourceMasterID) || 0;
+  await dispatchBoundDogmaWrite(req, res, next, "PeelAndLink", [shipID, targetMasterID, sourceMasterID]);
+});
+
+// UnlinkModule(shipID, masterModuleID) — peel one module out of its weapon bank.
+// ⚠ shipID caller-supplied (arg-injection-flagged).
+app.post("/api/bridge/dogma/weapons/unlink-module", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This unlinks that module from its weapon bank. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const shipID = sessionActiveShipID(req);
+  const masterModuleID = Number(body.masterModuleID) || 0;
+  await dispatchBoundDogmaWrite(req, res, next, "UnlinkModule", [shipID, masterModuleID]);
+});
+
+// LinkAllWeapons(shipID) — bank every compatible weapon on the ship in one call.
+// ⚠ shipID caller-supplied (arg-injection-flagged).
+app.post("/api/bridge/dogma/weapons/link-all", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This links all your weapons into banks. Confirm to continue.")) {
+    return;
+  }
+  const shipID = sessionActiveShipID(req);
+  await dispatchBoundDogmaWrite(req, res, next, "LinkAllWeapons", [shipID]);
+});
+
+// UnlinkAllModules(shipID) — break every weapon bank on the ship in one call.
+// ⚠ shipID caller-supplied (arg-injection-flagged).
+app.post("/api/bridge/dogma/weapons/unlink-all", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This breaks all your weapon banks. Confirm to continue.")) {
+    return;
+  }
+  const shipID = sessionActiveShipID(req);
+  await dispatchBoundDogmaWrite(req, res, next, "UnlinkAllModules", [shipID]);
+});
+
+// ⚠ DESTRUCTIVE. DestroyWeaponBank(shipID, masterModuleID) — tear a whole bank
+// down. ⚠ shipID caller-supplied (arg-injection-flagged).
+app.post("/api/bridge/dogma/weapons/destroy-bank", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This DESTROYS that weapon bank grouping. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const shipID = sessionActiveShipID(req);
+  const masterModuleID = Number(body.masterModuleID) || 0;
+  await dispatchBoundDogmaWrite(req, res, next, "DestroyWeaponBank", [shipID, masterModuleID]);
+});
+
+// LaunchProbes(moduleID, requestedCount) — launch scanner probes from a probe
+// launcher. Session-scoped (ship+char+system resolved from the session).
+app.post("/api/bridge/dogma/probes/launch", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This launches scanner probes into space. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const moduleID = Number(body.moduleID) || 0;
+  const requestedCount = Math.max(1, Number(body.count) || 1);
+  await dispatchBoundDogmaWrite(req, res, next, "LaunchProbes", [moduleID, requestedCount]);
+});
+
+// ChangeDroneSettings(settings) — persist the session char's drone behavior dict.
+// Session-scoped; args[0] is a plain settings map (aggression / focus-fire / etc).
+app.post("/api/bridge/dogma/drones/settings", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This changes your drone settings. Confirm to continue.")) {
+    return;
+  }
+  const settings = (req.body || {}).settings;
+  await dispatchBoundDogmaWrite(req, res, next, "ChangeDroneSettings", [settings && typeof settings === "object" ? settings : {}]);
+});
+
+// ⚠ CONSUMES A SKILLBOOK. InjectSkillIntoBrain([itemIDs]) — inject one or more
+// skillbook items into the session char's brain. Acts on _getCharID(session).
+app.post("/api/bridge/dogma/brain/inject-skill", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This CONSUMES those skillbooks, injecting them permanently. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBoundDogmaWrite(req, res, next, "InjectSkillIntoBrain", [bridgeIDList((req.body || {}).itemIDs)]);
+});
+
+// ⚠ INSTALLS AN IMPLANT (a plugged implant is consumed on removal). InjectImplant(itemID)
+// — plug an implant into the session char's brain. Acts on _getCharID(session).
+app.post("/api/bridge/dogma/implant/inject", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This plugs that implant into your clone. Confirm to continue.")) {
+    return;
+  }
+  const itemID = Number((req.body || {}).itemID) || 0;
+  await dispatchBoundDogmaWrite(req, res, next, "InjectImplant", [itemID]);
+});
+
+// ⚠ DESTRUCTIVE. DestroyImplant(itemID) — rip a plugged implant out (destroys it).
+// Acts on the session char (_getCharID(session)).
+app.post("/api/bridge/dogma/implant/destroy", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This DESTROYS that plugged-in implant permanently. Confirm to continue.")) {
+    return;
+  }
+  const itemID = Number((req.body || {}).itemID) || 0;
+  await dispatchBoundDogmaWrite(req, res, next, "DestroyImplant", [itemID]);
+});
+
+// ⚠ CONSUMES A BOOSTER. UseBooster(itemID, locationID) — pop a combat booster.
+// Acts on the session char (_getCharID(session)).
+app.post("/api/bridge/dogma/booster/use", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This CONSUMES that booster, applying its effects (and side-effects). Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const itemID = Number(body.itemID) || 0;
+  const locationID = Number(body.locationID) || 0;
+  await dispatchBoundDogmaWrite(req, res, next, "UseBooster", [itemID, locationID]);
+});
+
+// --- R102 WB-ENTITY: the 4 Phase-4 BOUND drone-command WRITES ----------------
+//
+// These ride the entity.MachoBindObject bind (wired R72; entityBindSpec()), the
+// SAME bound two-step the dogma writes use — the BFF holds the OID handle, the
+// browser never sees it. Each dispatches as a BOUND Cmd* method off the entity
+// bind. Drone orders — recall home, salvage, abandon, reconnect. Every route is
+// confirm-gated: without `confirm:true` it answers 400 CONFIRMATION_REQUIRED and
+// NOTHING dispatches.
+//
+// FAST-MODE (R86–R101 pattern): none fired live this batch (operator owns EveJS;
+// no server restart). The handlers return a per-drone multi-result dict; the ack
+// carries `result` through untouched for a future drone UI to decode.
+//
+// ⚠ ARG-INJECTION: SESSION-SCOPED. All four resolve the acting ship + scene from
+// the session (getShipStateForSession) and droneRuntime rejects any caller droneID
+// whose controllerID !== the session ship's itemID ("not currently under this
+// ship's control"). A foreign droneID cannot be commanded — no handoff-doc flag.
+
+/** Dispatch one confirm-gated BOUND entity write off the entity bind; uniform ack. */
+async function dispatchBoundEntityWrite(req, res, next, method, args) {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const outcome = await boundCall(held, req.webSessionID, entityBindSpec(), method, args, null);
+    res.json({ ok: true, applied: true, result: outcome.result ?? null, notifications: outcome.notifications });
+  } catch (error) {
+    if (error && error.code === "SESSION_NOT_FOUND") {
+      forgetBridgeSession(req.webSessionID);
+    }
+    next(error);
+  }
+}
+
+// CmdReturnHome([droneIDs]) — recall those drones to their home/orbit point.
+app.post("/api/bridge/entity/drones/return-home", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This recalls those drones. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBoundEntityWrite(req, res, next, "CmdReturnHome", [bridgeIDList((req.body || {}).droneIDs)]);
+});
+
+// CmdSalvage([droneIDs], targetID) — order salvage drones onto a wreck (targetID
+// optional; 0 lets the runtime auto-pick a salvageable wreck).
+app.post("/api/bridge/entity/drones/salvage", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This sends those drones to salvage. Confirm to continue.")) {
+    return;
+  }
+  const targetID = Number((req.body || {}).targetID) || 0;
+  await dispatchBoundEntityWrite(req, res, next, "CmdSalvage", [bridgeIDList((req.body || {}).droneIDs), targetID]);
+});
+
+// ⚠ ABANDONS DRONES. CmdAbandonDrone([droneIDs]) — PERMANENTLY DISOWNS those
+// drones; they become free salvage for anyone. Session-scoped (own drones only).
+app.post("/api/bridge/entity/drones/abandon", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This ABANDONS those drones permanently — they become anyone's salvage and cannot be recovered. This is destructive and must be confirmed explicitly.")) {
+    return;
+  }
+  await dispatchBoundEntityWrite(req, res, next, "CmdAbandonDrone", [bridgeIDList((req.body || {}).droneIDs)]);
+});
+
+// CmdReconnectToDrones([droneIDs]) — re-establish control over abandoned/orphaned
+// drones the session ship can still reach.
+app.post("/api/bridge/entity/drones/reconnect", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This reconnects to those drones. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBoundEntityWrite(req, res, next, "CmdReconnectToDrones", [bridgeIDList((req.body || {}).droneIDs)]);
+});
+
+// --- R102 WB-INV: the 7 Phase-4 BOUND inventory WRITES -----------------------
+//
+// These ride the invbroker inventory-MANAGER moniker (inventoryManagerBindSpec —
+// Moniker("invbroker", (stationID, groupStation)), the TrashItems handle) the R75
+// reads use. Label / fit / unfit / container / corp-delivery ops. Each dispatches
+// as a BOUND method off that manager bind (the BFF holds the handle). Every route
+// is confirm-gated; StripFitting (unfits a whole ship) carries an extra-explicit
+// message. FAST-MODE: none fired live (operator owns EveJS). Most handlers return
+// null / true / a change list; the ack carries `result` through for a future
+// fitting/inventory UI to decode. Args are EDUCATED-GUESS from the handler shapes.
+//
+// ⚠ ARG-INJECTION: SetLabel has an explicit ItemNotYours owner guard, StripFitting
+// is session/bound-scoped, AssembleCargoContainer/BreakPlasticWrap/DeliverToCorp
+// Member are server-side no-ops. FitFitting (caller shipID falls back past the
+// session-char scope) and DeliverToCorpHangar (caller itemIDs looked up with no
+// owner check) mutate caller-supplied item/ship ids with no session-ownership gate
+// — flagged in docs/arg-injection-leak-handoff.md (server-side fix + QA later; kept
+// plumbed + confirm-gated).
+
+/** Dispatch one confirm-gated BOUND inventory write off the manager bind. */
+async function dispatchBoundInventoryWrite(req, res, next, method, args, kwargs = null) {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    // Sync held station/ship to the live position first so the manager bind
+    // targets the CURRENT station (matching /api/bridge/bound-inventory).
+    await readHeldFlight(held, req.webSessionID);
+    const outcome = await boundCall(held, req.webSessionID, inventoryManagerBindSpec(held), method, args, kwargs);
+    res.json({ ok: true, applied: true, result: outcome.result ?? null, notifications: outcome.notifications });
+  } catch (error) {
+    if (error && error.code === "SESSION_NOT_FOUND") {
+      forgetBridgeSession(req.webSessionID);
+    }
+    next(error);
+  }
+}
+
+// SetLabel(itemID, label) — rename an item / ship the session char owns (handler
+// enforces ownership, throwing ItemNotYours for a foreign item).
+app.post("/api/bridge/inventory/set-label", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This renames that item. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const itemID = Number(body.itemID) || 0;
+  const label = String(body.label ?? "");
+  await dispatchBoundInventoryWrite(req, res, next, "SetLabel", [itemID, label]);
+});
+
+// ⚠ UNFITS THE SHIP. StripFitting() — removes every fitted module from the
+// session's active ship into the hangar. Session/bound-scoped (no caller id).
+app.post("/api/bridge/inventory/strip-fitting", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This UNFITS your entire ship — every fitted module is stripped to the hangar. This is consequential and must be confirmed explicitly.")) {
+    return;
+  }
+  await dispatchBoundInventoryWrite(req, res, next, "StripFitting", []);
+});
+
+// FitFitting(shipID, …, itemsByType, sourceLocationID, modulesByFlag, cargoByType,
+// fitRigs) — apply a saved fitting to a ship. Educated-guess positional shape.
+app.post("/api/bridge/inventory/fit-fitting", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This applies that fitting to the ship (moves/fits modules). Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const shipID = Number(body.shipID) || 0;
+  const sourceLocationID = Number(body.sourceLocationID) || 0;
+  const itemsByType = body.itemsByType && typeof body.itemsByType === "object" ? body.itemsByType : {};
+  const modulesByFlag = body.modulesByFlag && typeof body.modulesByFlag === "object" ? body.modulesByFlag : {};
+  const cargoItemsByType = body.cargoItemsByType && typeof body.cargoItemsByType === "object" ? body.cargoItemsByType : {};
+  const fitRigs = body.fitRigs === undefined ? true : Boolean(body.fitRigs);
+  await dispatchBoundInventoryWrite(req, res, next, "FitFitting", [shipID, null, itemsByType, sourceLocationID, modulesByFlag, cargoItemsByType, fitRigs]);
+});
+
+// AssembleCargoContainer(itemID) — assemble a packaged cargo container. Server-side
+// no-op today; plumbed for parity.
+app.post("/api/bridge/inventory/assemble-container", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This assembles that cargo container. Confirm to continue.")) {
+    return;
+  }
+  const itemID = Number((req.body || {}).itemID) || 0;
+  await dispatchBoundInventoryWrite(req, res, next, "AssembleCargoContainer", [itemID]);
+});
+
+// BreakPlasticWrap(itemID) — unpackage a plastic-wrapped (sealed) item. Server-side
+// no-op today; plumbed for parity.
+app.post("/api/bridge/inventory/break-plastic-wrap", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This breaks the plastic wrap on that item. Confirm to continue.")) {
+    return;
+  }
+  const itemID = Number((req.body || {}).itemID) || 0;
+  await dispatchBoundInventoryWrite(req, res, next, "BreakPlasticWrap", [itemID]);
+});
+
+// DeliverToCorpHangar([itemIDs], officeID, flag) — move items into a corp hangar
+// division. Args passed as kwargs so the handler reads them unambiguously.
+app.post("/api/bridge/inventory/deliver-to-corp-hangar", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This delivers those items into your corporation's hangar. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const itemIDs = bridgeIDList(body.itemIDs);
+  const officeID = Number(body.officeID) || 0;
+  const flag = Number(body.flag) || 0;
+  const qty = body.quantity === undefined ? null : Number(body.quantity) || null;
+  await dispatchBoundInventoryWrite(
+    req,
+    res,
+    next,
+    "DeliverToCorpHangar",
+    [],
+    { itemIDs, officeID, flag, qty },
+  );
+});
+
+// DeliverToCorpMember([itemIDs], memberID) — deliver items to a corp member's
+// hangar. Server-side no-op today; plumbed for parity (kwargs-shaped).
+app.post("/api/bridge/inventory/deliver-to-corp-member", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This delivers those items to that corporation member. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const itemIDs = bridgeIDList(body.itemIDs);
+  const memberID = Number(body.memberID) || 0;
+  await dispatchBoundInventoryWrite(
+    req,
+    res,
+    next,
+    "DeliverToCorpMember",
+    [itemIDs, memberID],
+    { itemIDs, memberID },
+  );
+});
+
+// --- R103 WB-PI: the 4 Phase-4 BOUND planet colony-op WRITES ------------------
+//
+// These ride the SAME planetMgr.MachoBindObject(planetID) bind (planetBindSpec —
+// keyed per planetID) the R77 RB-PI reads use. The browser sends the target
+// planetID; the BFF binds it (holding the OID handle server-side, the browser
+// never sees it) and dispatches each write as a BOUND method off that handle —
+// mirroring dispatchBoundInventoryWrite / dispatchBoundDogmaWrite. Every route is
+// confirm-gated; UserAbandonPlanet — which DESTROYS the colony — carries an
+// extra-explicit message. FAST-MODE: none fired live (operator owns EveJS). The
+// handlers return a serialized colony / a [simTime,runTime] pair / null; the ack
+// carries `result` through for a future PI UI to decode. Args are EDUCATED-GUESS
+// from the handler shapes (planetID comes from the bind, allowArgs:false).
+//
+// ⚠ ARG-INJECTION: the planetID is caller-supplied via the bind, BUT every handler
+// forces ownerID = getSessionCharacterID(session) (UserAbandonPlanet →
+// abandonColony(planetID, session.characterID)). The colony operated on is always
+// (planetID, SESSION-char), so — UNLIKE the R77 READ leak #18-#20 where
+// GetFullNetworkForOwner took a caller-supplied ownerID and returned a FOREIGN
+// owner's colony — these writes cannot reconfigure or abandon another player's
+// colony; a caller can only touch its OWN colony on the chosen planet. Owner-gated,
+// so NOT the write realization of #18-#20; no handoff-doc flag added.
+
+/** Dispatch one confirm-gated BOUND planet write off the planetMgr planetID bind. */
+async function dispatchBoundPlanetWrite(req, res, next, planetID, method, args, kwargs = null) {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const pid = Number(planetID) || 0;
+  if (pid <= 0) {
+    res.status(400).json({
+      ok: false,
+      error: "INVALID_PLANET",
+      message: "A positive planetID is required.",
+    });
+    return;
+  }
+  try {
+    const outcome = await boundCall(held, req.webSessionID, planetBindSpec(pid), method, args, kwargs);
+    res.json({ ok: true, applied: true, result: outcome.result ?? null, notifications: outcome.notifications });
+  } catch (error) {
+    if (error && error.code === "SESSION_NOT_FOUND") {
+      forgetBridgeSession(req.webSessionID);
+    }
+    next(error);
+  }
+}
+
+// UserUpdateNetwork(serializedChanges) — apply a colony network edit (build/move/
+// remove pins + links). `changes` is the serialized command list; the planetID is
+// bound. Debits the construction cost from the PI wallet server-side.
+app.post("/api/bridge/planet/network/update", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This applies that colony network edit (may debit construction cost). Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const planetID = Number(body.planetID) || 0;
+  const changes = Array.isArray(body.changes) ? body.changes : [];
+  await dispatchBoundPlanetWrite(req, res, next, planetID, "UserUpdateNetwork", [changes]);
+});
+
+// UserLaunchCommodities(commandPinID, commodities) — launch commodities off the
+// colony to space (customs-office export). Debits export tax server-side.
+app.post("/api/bridge/planet/commodities/launch", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This launches those commodities from the colony (debits export tax). Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const planetID = Number(body.planetID) || 0;
+  const commandPinID = Number(body.commandPinID) || 0;
+  const commodities = body.commodities && typeof body.commodities === "object" ? body.commodities : {};
+  await dispatchBoundPlanetWrite(req, res, next, planetID, "UserLaunchCommodities", [commandPinID, commodities]);
+});
+
+// UserTransferCommodities(path, commodities) — route commodities between pins
+// along `path` (an ordered pin id list). Session colony only.
+app.post("/api/bridge/planet/commodities/transfer", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This transfers those commodities between colony pins. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const planetID = Number(body.planetID) || 0;
+  const path = Array.isArray(body.path) ? body.path : [];
+  const commodities = body.commodities && typeof body.commodities === "object" ? body.commodities : {};
+  await dispatchBoundPlanetWrite(req, res, next, planetID, "UserTransferCommodities", [path, commodities]);
+});
+
+// ⚠ ABANDONS THE COLONY. UserAbandonPlanet() — PERMANENTLY DESTROYS the caller's
+// colony on the bound planet: all structures lost, cannot be recovered. Owner is
+// forced to the session char server-side (only your OWN colony can be abandoned).
+app.post("/api/bridge/planet/abandon", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This ABANDONS the colony — all structures are lost and cannot be recovered. This is destructive and must be confirmed explicitly.")) {
+    return;
+  }
+  const planetID = Number((req.body || {}).planetID) || 0;
+  await dispatchBoundPlanetWrite(req, res, next, planetID, "UserAbandonPlanet", []);
+});
+
+// --- R104 WB-SCAN: the 9 Phase-4 BOUND probe / scan-control WRITES ------------
+//
+// These ride the SAME scanMgr.GetSystemScanMgr bind (systemScanBindSpec — the R72
+// RB-SCAN gateway) the scan reads use. Unlike planetMgr.MachoBindObject(planetID),
+// GetSystemScanMgr takes NO caller args: it always binds the SESSION's OWN current-
+// system scan manager (server-derived), so the bind CANNOT be pointed at a foreign
+// system — the good security property. The BFF holds the OID handle server-side; the
+// browser never sees it. Each write dispatches as a BOUND method off that handle,
+// mirroring dispatchBoundInventoryWrite / dispatchBoundPlanetWrite. Every route is
+// confirm-gated; DestroyProbe — which destroys a launched probe — carries an extra-
+// explicit message. FAST-MODE: none fired live (operator owns EveJS). The handlers
+// return null / a directional-scan list (ConeScan) / a recovered-probeID list
+// (RecoverProbes); the ack carries `result` through for a future scan UI to decode.
+// Args are EDUCATED-GUESS from the handler shapes.
+//
+// ⚠ ARG-INJECTION: the bind is session-scoped (no caller args), AND every handler
+// resolves characterID = this._getCharacterID(session) and operates on
+// probeRuntimeState keyed on THAT characterID. The caller-supplied probeIDs
+// (SetProbeDestination / SetProbeRangeStep / DestroyProbe / RecoverProbes /
+// SetActivityState) only ever SELECT among the session char's OWN probes
+// (getCharacterSystemProbes / removeCharacterProbes / synchronizeCharacterProbeGeometry
+// are all characterID-scoped), so a foreign probeID launched by another char simply
+// MISSES — it cannot mutate or destroy another player's probes. Probes are inherently
+// session-scoped; no handoff-doc flag added.
+
+/** Dispatch one confirm-gated BOUND scan write off the session-scoped scanMgr bind. */
+async function dispatchBoundScanWrite(req, res, next, method, args, kwargs = null) {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const outcome = await boundCall(held, req.webSessionID, systemScanBindSpec(), method, args, kwargs);
+    res.json({ ok: true, applied: true, result: outcome.result ?? null, notifications: outcome.notifications });
+  } catch (error) {
+    if (error && error.code === "SESSION_NOT_FOUND") {
+      forgetBridgeSession(req.webSessionID);
+    }
+    next(error);
+  }
+}
+
+// SignalTrackerRegister() — register the session char as a signal-tracker listener
+// for its current system (server pushes OnSignalTrackerFullState). No caller args.
+app.post("/api/bridge/scan/signal-tracker/register", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This registers you for live signal-tracker updates. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBoundScanWrite(req, res, next, "SignalTrackerRegister", []);
+});
+
+// SetProbeDestination(probeID, destination) — move one of the session char's own
+// probes to a destination. A foreign probeID misses the caller's probe set (no-op).
+app.post("/api/bridge/scan/probe/set-destination", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This repositions that scan probe. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const probeID = Number(body.probeID) || 0;
+  const destination = body.destination === undefined ? null : body.destination;
+  await dispatchBoundScanWrite(req, res, next, "SetProbeDestination", [probeID, destination]);
+});
+
+// SetProbeRangeStep(probeID, rangeStep) — set the scan range step of one of the
+// session char's own probes. Clamped server-side to the probe type's range table.
+app.post("/api/bridge/scan/probe/set-range-step", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This changes that probe's scan range. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const probeID = Number(body.probeID) || 0;
+  const rangeStep = Number(body.rangeStep) || 0;
+  await dispatchBoundScanWrite(req, res, next, "SetProbeRangeStep", [probeID, rangeStep]);
+});
+
+// ConeScan(angle, range, dx, dy, dz) — run a directional (D-scan) sweep from the
+// session's own ship. Returns the visible-entity list; session/scene-scoped.
+app.post("/api/bridge/scan/cone-scan", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This runs a directional scan. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const angle = Number(body.angle) || 0;
+  const range = Number(body.range) || 0;
+  const dx = Number(body.dx) || 0;
+  const dy = Number(body.dy) || 0;
+  const dz = Number(body.dz) || 0;
+  await dispatchBoundScanWrite(req, res, next, "ConeScan", [angle, range, dx, dy, dz]);
+});
+
+// RequestScans(probeMap) — run a probe scan for the session char's own probes
+// (probeMap keyed by probeID → geometry). Foreign probeIDs are dropped server-side.
+app.post("/api/bridge/scan/request-scans", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This launches a probe scan. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const probeMap = body.probeMap && typeof body.probeMap === "object" ? body.probeMap : {};
+  await dispatchBoundScanWrite(req, res, next, "RequestScans", [probeMap]);
+});
+
+// ReconnectToLostProbes() — replay lost-probe notifications for the session char's
+// own probes in its current system. No caller args.
+app.post("/api/bridge/scan/probe/reconnect", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This reconnects to your lost probes. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBoundScanWrite(req, res, next, "ReconnectToLostProbes", []);
+});
+
+// ⚠ DESTROYS A PROBE. DestroyProbe(probeID) — permanently destroys one of the
+// session char's own launched probes (removeCharacterProbes, characterID-scoped —
+// a foreign probeID cannot be destroyed). Extra-explicit confirm.
+app.post("/api/bridge/scan/probe/destroy", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This DESTROYS that launched scan probe — it is gone and cannot be recovered. This is destructive and must be confirmed explicitly.")) {
+    return;
+  }
+  const probeID = Number((req.body || {}).probeID) || 0;
+  await dispatchBoundScanWrite(req, res, next, "DestroyProbe", [probeID]);
+});
+
+// RecoverProbes([probeIDs]) — recover the session char's own launched probes back
+// to the ship (restores charges). characterID-scoped; returns the removed-probeID list.
+app.post("/api/bridge/scan/probe/recover", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This recovers those launched probes to your ship. Confirm to continue.")) {
+    return;
+  }
+  const probeIDs = bridgeIDList((req.body || {}).probeIDs);
+  await dispatchBoundScanWrite(req, res, next, "RecoverProbes", [probeIDs]);
+});
+
+// SetActivityState([probeIDs], active) — toggle the active/idle state of the session
+// char's own probes. characterID-scoped; foreign probeIDs are ignored.
+app.post("/api/bridge/scan/probe/set-activity", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This changes those probes' activity state. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const probeIDs = bridgeIDList(body.probeIDs);
+  const active = body.active === true;
+  await dispatchBoundScanWrite(req, res, next, "SetActivityState", [probeIDs, active]);
+});
+
+// --- Product scanner actions ------------------------------------------------
+//
+// The routes above deliberately preserve the complete retail call plumbing.
+// These four routes are the narrower product surface used by Scanner Center and
+// Bot Builder. EveJS supplies the authoritative launcher, probe IDs, and probe
+// geometry for the held session; request-body values cannot redirect an action
+// to another module/probe or alter the scan geometry.
+
+function scannerConflict(res, error, message, scanner) {
+  res.status(409).json({ ok: false, error, message, scanner: scanner || null });
+}
+
+async function runAuthoritativeScannerWrite(req, res, next, kind) {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const before = await readHeldScanner(held, req.webSessionID);
+    const scanner = before.scanner || {};
+    if (scanner.inSpace !== true) {
+      scannerConflict(res, "SCANNER_NOT_IN_SPACE", "Scanner actions require a ship in space.", scanner);
+      return;
+    }
+
+    let outcome;
+    if (kind === "launch") {
+      const moduleID = strictPositiveID(scanner.launcher && scanner.launcher.moduleID);
+      const launchCount = Math.max(0, Math.trunc(Number(scanner.launcher && scanner.launcher.launchCount) || 0));
+      if (moduleID === null) {
+        scannerConflict(res, "NO_PROBE_LAUNCHER", "No online scan-probe launcher is fitted.", scanner);
+        return;
+      }
+      if (launchCount <= 0) {
+        scannerConflict(res, "NO_LAUNCHABLE_PROBES", "No loaded probe can be launched into an available slot.", scanner);
+        return;
+      }
+      outcome = await boundCall(
+        held,
+        req.webSessionID,
+        dogmaBindSpec(),
+        "LaunchProbes",
+        [moduleID, launchCount],
+        null,
+      );
+    } else {
+      const probes = Array.isArray(scanner.probes) ? scanner.probes : [];
+      const probeIDs = probes.map((probe) => strictPositiveID(probe && probe.probeID));
+      if (probeIDs.length <= 0 || probeIDs.some((probeID) => probeID === null)) {
+        scannerConflict(res, "NO_ACTIVE_PROBES", "No active probes are available for this action.", scanner);
+        return;
+      }
+      if (kind === "recover") {
+        outcome = await boundCall(
+          held,
+          req.webSessionID,
+          systemScanBindSpec(),
+          "RecoverProbes",
+          [probeIDs],
+          null,
+        );
+      } else if (kind === "analyze") {
+        const probeMap = Object.fromEntries(
+          probes.map((probe) => [String(probe.probeID), {
+            typeID: Number(probe.typeID) || 0,
+            pos: Array.isArray(probe.pos) ? probe.pos.slice(0, 3).map(Number) : [0, 0, 0],
+            destination: Array.isArray(probe.destination)
+              ? probe.destination.slice(0, 3).map(Number)
+              : [0, 0, 0],
+            scanRange: Number(probe.scanRange) || 0,
+            rangeStep: Number(probe.rangeStep) || 0,
+            state: Number(probe.state) || 0,
+            expiry: String(probe.expiry || "0"),
+          }]),
+        );
+        outcome = await boundCall(
+          held,
+          req.webSessionID,
+          systemScanBindSpec(),
+          "RequestScans",
+          [probeMap],
+          null,
+        );
+      }
+    }
+
+    const after = await readHeldScanner(held, req.webSessionID);
+    res.json({
+      ok: true,
+      applied: true,
+      result: outcome.result ?? null,
+      scanner: after.scanner,
+      notifications: [
+        ...(Array.isArray(outcome.notifications) ? outcome.notifications : []),
+        ...(Array.isArray(after.notifications) ? after.notifications : []),
+      ],
+    });
+  } catch (error) {
+    if (error && error.code === "SESSION_NOT_FOUND") {
+      forgetBridgeSession(req.webSessionID);
+    }
+    next(error);
+  }
+}
+
+app.get("/api/bridge/scanner/state", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const outcome = await readHeldScanner(held, req.webSessionID);
+    res.json({ ok: true, scanner: outcome.scanner, notifications: outcome.notifications });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/bridge/scanner/launch", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This launches probes from your current ship. Confirm to continue.")) {
+    return;
+  }
+  await runAuthoritativeScannerWrite(req, res, next, "launch");
+});
+
+app.post("/api/bridge/scanner/recover", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This recovers all active probes to your current ship. Confirm to continue.")) {
+    return;
+  }
+  await runAuthoritativeScannerWrite(req, res, next, "recover");
+});
+
+app.post("/api/bridge/scanner/analyze", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This analyzes signatures using your current probe formation. Confirm to continue.")) {
+    return;
+  }
+  await runAuthoritativeScannerWrite(req, res, next, "analyze");
+});
+
+app.post("/api/bridge/scanner/reconnect", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This reconnects to probes belonging to your current session. Confirm to continue.")) {
+    return;
+  }
+  await runAuthoritativeScannerWrite(req, res, next, "reconnect");
+});
+
+// --- R105 Phase-4 BOUND fleet WRITES — WB-FLEET (16) ------------------------
+//
+// The 16 fleet composition / membership / broadcast writes off the R72
+// fleetObjectHandler.MachoBindObject bind (the same bind the R85 bound reads on
+// /api/bridge/bound-fleet ride). They back the Fleet Center and bot fleet blocks.
+// The separate Latest parity review records the intentionally deferred fleet methods.
+//
+// Each write dispatches as a BOUND method off fleetBindSpec() (dispatchBoundFleetWrite
+// below), mirroring dispatchBoundScanWrite / dispatchBoundInventoryWrite. The BFF holds
+// the OID handle; the browser never sees it.
+//
+// ⚠ OWNERSHIP: most routes bind the SESSION's OWN fleet through fleetBindSpec().
+// AcceptInvite / RejectInvite instead bind the fleetID carried by OnFleetInvite, and
+// Reconnect binds the saved pre-disconnect fleetID, because the current session has no
+// fleetID yet. Those targeted binds are not authority: the runtime requires a matching
+// pending invite or an existing member row before changing session state. Every other
+// roster mutator is role-gated server-side by the session char's fleet job/role before it
+// touches the roster (KickMember/MoveMember/CreateSquad → ensureCommanderOrBoss;
+// DisbandFleet/MakeLeader/CreateWing/SetOptions → ensureFleetBoss; the rest →
+// ensureFleetMembership); UpdateMemberInfo acts on the SESSION char only (args[0] is a
+// shipTypeID, not a memberID). A non-boss cannot kick/disband/promote — no privilege-
+// escalation-within-fleet path, so no handoff-doc flag.
+//
+// Every route is confirm-gated (refuses without `confirm:true`). ⚠ DisbandFleet (destroys
+// the whole fleet) and KickMember (removes another char) carry EXTRA-EXPLICIT confirm
+// messages. FAST-MODE: none fired live (operator owns EveJS; no server restart) — the
+// handlers return true / null / an ack, carried through `result`. Args are EDUCATED-GUESS
+// from the fleetObjectHandlerService handler shapes.
+
+/** Dispatch one confirm-gated BOUND fleet write off the session-scoped fleet bind. */
+async function dispatchBoundFleetWrite(req, res, next, method, args, kwargs = null) {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const outcome = await boundCall(held, req.webSessionID, fleetBindSpec(), method, args, kwargs);
+    invalidateFleetBoundHandles(held);
+    res.json({ ok: true, applied: true, result: outcome.result ?? null, notifications: outcome.notifications });
+  } catch (error) {
+    // A rejected response is not proof that the server made no state change.
+    invalidateFleetBoundHandles(held);
+    if (error && error.code === "SESSION_NOT_FOUND") {
+      forgetBridgeSession(req.webSessionID);
+    }
+    next(error);
+  }
+}
+
+/**
+ * Dispatch an invite/reconnect write against an explicitly named fleet. The
+ * pending-invite/member check in the runtime is the authority; the bind only
+ * selects the record on which that check runs. Never retain this handle across
+ * a membership boundary, including an uncertain failed response.
+ */
+async function dispatchFleetIDBoundWrite(req, res, next, fleetID, method, args, kwargs = null) {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const outcome = await boundCall(
+      held,
+      req.webSessionID,
+      fleetIDBindSpec(fleetID),
+      method,
+      args,
+      kwargs,
+    );
+    invalidateFleetBoundHandles(held);
+    res.json({ ok: true, applied: true, result: outcome.result ?? null, notifications: outcome.notifications });
+  } catch (error) {
+    invalidateFleetBoundHandles(held);
+    if (error && error.code === "SESSION_NOT_FOUND") {
+      forgetBridgeSession(req.webSessionID);
+    }
+    next(error);
+  }
+}
+
+// CreateWing() — add a wing to the session's own fleet (boss-only server-side). No args.
+app.post("/api/bridge/fleet/wing/create", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This creates a new wing in your fleet. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBoundFleetWrite(req, res, next, "CreateWing", []);
+});
+
+// CreateSquad(wingID) — add a squad under a wing of the session's own fleet (boss/
+// commander-only server-side; an unknown wingID errors FleetNotFound).
+app.post("/api/bridge/fleet/squad/create", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This creates a new squad in that wing. Confirm to continue.")) {
+    return;
+  }
+  const wingID = Number((req.body || {}).wingID) || 0;
+  await dispatchBoundFleetWrite(req, res, next, "CreateSquad", [wingID]);
+});
+
+// MoveMember(characterID, wingID, squadID, role) — relocate a member within the
+// session's own fleet (boss/commander-only server-side).
+app.post("/api/bridge/fleet/member/move", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This moves that member to a new wing/squad. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const characterID = Number(body.characterID) || 0;
+  const wingID = Number(body.wingID) || 0;
+  const squadID = Number(body.squadID) || 0;
+  const role = body.role === undefined ? null : body.role;
+  await dispatchBoundFleetWrite(req, res, next, "MoveMember", [characterID, wingID, squadID, role]);
+});
+
+// ⚠ REMOVES A MEMBER. KickMember(characterID) — removes another char from the session's
+// own fleet (boss/commander-only server-side). Extra-explicit confirm.
+app.post("/api/bridge/fleet/member/kick", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This KICKS that character out of your fleet — they are removed immediately. This affects another player and must be confirmed explicitly.")) {
+    return;
+  }
+  const characterID = Number((req.body || {}).characterID) || 0;
+  await dispatchBoundFleetWrite(req, res, next, "KickMember", [characterID]);
+});
+
+// MakeLeader(characterID) — hand fleet-boss to another member of the session's own
+// fleet (current-boss-only server-side).
+app.post("/api/bridge/fleet/member/make-leader", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This hands fleet command to that member — you stop being boss. Confirm to continue.")) {
+    return;
+  }
+  const characterID = Number((req.body || {}).characterID) || 0;
+  await dispatchBoundFleetWrite(req, res, next, "MakeLeader", [characterID]);
+});
+
+// LeaveFleet() — the session char leaves its own fleet. No args. ⚠ Distinct PATH from
+// the R94 /api/bridge/fleet/leave (fleetMgr.ForceLeaveFleet, a top-level write) — this is
+// the BOUND fleetObjectHandler.LeaveFleet variant off the session fleet bind.
+app.post("/api/bridge/fleet/member/leave", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This removes you from your fleet. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBoundFleetWrite(req, res, next, "LeaveFleet", []);
+});
+
+// ⚠ DESTROYS THE FLEET. DisbandFleet() — destroys the session's own fleet entirely
+// (boss-only server-side). A disbanded fleet is re-formable, but every member is
+// dropped. Extra-explicit confirm.
+app.post("/api/bridge/fleet/disband", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This DISBANDS the entire fleet — every member is removed and the fleet is destroyed. This is destructive and must be confirmed explicitly.")) {
+    return;
+  }
+  await dispatchBoundFleetWrite(req, res, next, "DisbandFleet", []);
+});
+
+// SetOptions(options) — set the session fleet's options (free-move, voice, registration,
+// …; boss-only server-side).
+app.post("/api/bridge/fleet/options", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This changes your fleet's options. Confirm to continue.")) {
+    return;
+  }
+  const options = (req.body || {}).options;
+  await dispatchBoundFleetWrite(req, res, next, "SetOptions", [options && typeof options === "object" ? options : {}]);
+});
+
+// SetMotdEx(motd) — set the session fleet's message of the day (any member server-side).
+app.post("/api/bridge/fleet/motd", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This updates your fleet's message of the day. Confirm to continue.")) {
+    return;
+  }
+  const motd = String((req.body || {}).motd ?? "");
+  await dispatchBoundFleetWrite(req, res, next, "SetMotdEx", [motd]);
+});
+
+// UpdateMemberInfo(shipTypeID) — refresh the SESSION char's own member row (ship/system/
+// station derived from the session). args[0] is a shipTypeID, NOT a memberID.
+app.post("/api/bridge/fleet/member/update-info", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This refreshes your own fleet member info. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const shipTypeID = body.shipTypeID === undefined ? null : Number(body.shipTypeID) || null;
+  await dispatchBoundFleetWrite(req, res, next, "UpdateMemberInfo", [shipTypeID]);
+});
+
+// SendBroadcast(name, scope, itemID, typeID) — send a fleet broadcast in the session's
+// own fleet (any member server-side).
+app.post("/api/bridge/fleet/broadcast", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This sends a broadcast to your fleet. Confirm to continue.")) {
+    return;
+  }
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const body = req.body || {};
+  const name = String(body.name ?? "");
+  const scope = body.scope === undefined ? null : body.scope;
+  const itemID = body.itemID === undefined ? null : Number(body.itemID) || null;
+  const typeID = body.typeID === undefined ? null : Number(body.typeID) || null;
+  try {
+    const outcome = await boundCall(
+      held,
+      req.webSessionID,
+      fleetBindSpec(),
+      "SendBroadcast",
+      [name, scope, itemID, typeID],
+      null,
+    );
+    invalidateFleetBoundHandles(held);
+    // Remember for miners on this companion (EveJS has no GetBroadcast).
+    let fleetID = Number(held.fleetID) || 0;
+    if (!fleetID) {
+      try {
+        const init = await boundCall(held, req.webSessionID, fleetBindSpec(), "GetInitState", [], null);
+        const raw = init && init.result;
+        const fid = extractFleetIDFromInitResult(raw);
+        fleetID = Number(fid) || 0;
+        if (fleetID) held.fleetID = fleetID;
+      } catch (_) {
+        /* best-effort */
+      }
+    }
+    if (fleetID && itemID) {
+      lastFleetBroadcastByFleetID.set(fleetID, {
+        fleetID,
+        itemID,
+        typeID: typeID || null,
+        name,
+        scope: scope == null ? null : String(scope),
+        atMs: Date.now(),
+        fromCharacterID: held.characterID || null,
+      });
+    }
+    res.json({
+      ok: true,
+      applied: true,
+      result: outcome.result ?? null,
+      notifications: outcome.notifications,
+    });
+  } catch (error) {
+    invalidateFleetBoundHandles(held);
+    if (error && error.code === "SESSION_NOT_FOUND") {
+      forgetBridgeSession(req.webSessionID);
+    }
+    next(error);
+  }
+});
+
+// Fork read: last remembered SendBroadcast for the session fleet (miner warp-to-broadcast).
+app.get("/api/bridge/fleet/last-broadcast", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    let fleetID = Number(held.fleetID) || 0;
+    if (!fleetID) {
+      try {
+        const init = await boundCall(held, req.webSessionID, fleetBindSpec(), "GetInitState", [], null);
+        const fid = extractFleetIDFromInitResult(init && init.result);
+        fleetID = Number(fid) || 0;
+        if (fleetID) held.fleetID = fleetID;
+      } catch (_) {
+        fleetID = 0;
+      }
+    }
+    const last = fleetID ? lastFleetBroadcastByFleetID.get(fleetID) || null : null;
+    res.json({ ok: true, fleetID: fleetID || null, lastBroadcast: last });
+  } catch (error) {
+    if (error && error.code === "SESSION_NOT_FOUND") {
+      forgetBridgeSession(req.webSessionID);
+    }
+    next(error);
+  }
+});
+
+
+// Invite(inviteeCharID, wingID, squadID, role) — invite a character into the session's
+// own fleet (any member server-side; inviting others is normal).
+app.post("/api/bridge/fleet/invite", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This invites that character to your fleet. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const inviteeCharID = Number(body.inviteeCharID) || 0;
+  // ⚠ NULL, NOT 0, WHEN NO WING OR SQUAD IS NAMED. `Number(undefined) || 0` reads
+  // as "put them in wing 0", and wing ids are allocated from 1 — so wing 0 is a
+  // position nobody can hold. The server stored such an invite happily and then
+  // refused the ACCEPT with FleetNoPositionFound, an error that points at the
+  // fleet rather than at the caller who asked for a wing that never existed.
+  // (The server now ignores a non-positive id as well — EveOffline
+  // fix/fleet-join-no-position — but sending nonsense and trusting the far end to
+  // disregard it is not a contract.)
+  const wingID = Number(body.wingID) > 0 ? Number(body.wingID) : null;
+  const squadID = Number(body.squadID) > 0 ? Number(body.squadID) : null;
+  const role = body.role === undefined ? null : body.role;
+  await dispatchBoundFleetWrite(req, res, next, "Invite", [inviteeCharID, wingID, squadID, role]);
+});
+
+// MassInvite([characterIDs], wingID, squadID, role) — invite several characters into the
+// session's own fleet at once (any member server-side).
+app.post("/api/bridge/fleet/mass-invite", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This invites those characters to your fleet. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const characterIDs = bridgeIDList(body.characterIDs);
+  const wingID = Number(body.wingID) || 0;
+  const squadID = Number(body.squadID) || 0;
+  const role = body.role === undefined ? null : body.role;
+  await dispatchBoundFleetWrite(req, res, next, "MassInvite", [characterIDs, wingID, squadID, role]);
+});
+
+// AcceptInvite(shipTypeID) — accept a pending fleet invite for the session char.
+// ⚠ ACCEPTING NEEDS THE FLEET'S OWN ID, AND THE INVITEE DOES NOT HAVE ONE YET.
+//
+// `acceptInvite` (fleetRuntime.js) refuses unless the fleetID it is called with
+// MATCHES the pending invite's. The handler resolves that id from the caller's
+// bound object, falling back to `session.fleetid` — which for someone not yet in
+// a fleet is nothing. So the default bind (no args = "my own fleet") always
+// refused with FleetNotFound, verified live.
+//
+// So the caller may pass the `fleetID` from the invite it received, and the bind
+// is made against THAT fleet. It is not a new privilege: fleetObjectHandler's
+// MachoBindObject already takes a caller fleetID (the R72 note above), and the
+// accept still refuses unless a real invite for this character names that same
+// fleet — the invite, not the bind, is the authority.
+app.post("/api/bridge/fleet/invite/accept", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This accepts the fleet invitation. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const fleetID = strictPositiveID(body.fleetID);
+  if (fleetID === null) {
+    sendDedicatedWriteInputError(res, "INVALID_FLEET_ID", "A positive fleetID is required.");
+    return;
+  }
+  // The runtime safely derives the current hull type when this argument is
+  // null. Never let a browser poison its roster row with a spoofed type ID.
+  await dispatchFleetIDBoundWrite(req, res, next, fleetID, "AcceptInvite", [null]);
+});
+
+// RejectInvite(alreadyInFleet?) — decline a pending invite on the INVITING
+// fleet's bound object. The invitee has no session fleetID yet (or may already
+// be in a different fleet), so fleetID comes from OnFleetInvite. The pending
+// invite record remains the authority server-side.
+app.post("/api/bridge/fleet/invite/reject", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This declines the fleet invitation. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const fleetID = strictPositiveID(body.fleetID);
+  if (fleetID === null) {
+    sendDedicatedWriteInputError(res, "INVALID_FLEET_ID", "A positive fleetID is required.");
+    return;
+  }
+  const hasAlreadyInFleet = Object.prototype.hasOwnProperty.call(body, "alreadyInFleet");
+  if (hasAlreadyInFleet && typeof body.alreadyInFleet !== "boolean") {
+    sendDedicatedWriteInputError(
+      res,
+      "INVALID_ALREADY_IN_FLEET",
+      "alreadyInFleet must be a boolean when supplied.",
+    );
+    return;
+  }
+  await dispatchFleetIDBoundWrite(
+    req,
+    res,
+    next,
+    fleetID,
+    "RejectInvite",
+    hasAlreadyInFleet ? [body.alreadyInFleet] : [],
+  );
+});
+
+// Reconnect() — restore the session char into the SAVED pre-disconnect fleet.
+// The current session has no fleetID yet, so bind the saved fleetID explicitly;
+// the runtime still requires this character's member row. No method args.
+app.post("/api/bridge/fleet/reconnect", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This reconnects you to your fleet. Confirm to continue.")) {
+    return;
+  }
+  const fleetID = strictPositiveID((req.body || {}).fleetID);
+  if (fleetID === null) {
+    sendDedicatedWriteInputError(res, "INVALID_FLEET_ID", "A positive fleetID is required.");
+    return;
+  }
+  await dispatchFleetIDBoundWrite(req, res, next, fleetID, "Reconnect", []);
+});
+
+// --- R17 Contracts (contractProxy bridge) -----------------------------------
+//
+// Like mail and market, the whole contract surface is TOP-LEVEL
+// (sm.ProxySvc('contractProxy')) — no bound-object step — so heldTopLevelCall
+// carries all of it.
+//
+// ⚠ THE SERVICE IS "contractProxy". EveJS registers TWO contract services and
+// the obvious name is the wrong one: `contractMgr` (contractMgrService.js) is
+// 86 lines of DEAD STUBS — GetLoginInfo answers three empty rowsets,
+// SearchContracts an empty list, NumOutstandingContracts 0 — every method
+// hardcoded empty, never called by the retail client. Naming it would give a
+// contracts page that renders perfectly and is permanently empty, which is
+// INDISTINGUISHABLE from the genuinely empty world below. Every call here names
+// contractProxy; the gateway allowlist refuses `contractMgr` by name.
+//
+// ⚠ A PUBLIC BROWSE IS LEGITIMATELY EMPTY, AND THAT IS NOT A BUG. There is no
+// NPC/seed contract generator anywhere in EveJS — `createContract` exists only
+// in contractRuntimeState.js and its own handler, and nothing calls it at
+// startup. So SearchContracts answers nothing until a player creates a
+// contract. The route reports that as a FACT (`worldHasNoContracts`) so the
+// panel can say "no public contracts exist in this world yet" rather than
+// looking broken. Do not go hunting for a bug here.
+//
+// ⚠ SearchContracts IS KWARGS-ONLY. Handle_SearchContracts ignores `args`
+// entirely and reads every filter off kwargs. Filters sent positionally are
+// silently DROPPED — a browse meant to show couriers would quietly answer
+// every contract type instead, with no error.
+//
+// ⚠ READS ONLY. Every contract MUTATOR (AcceptContract, CompleteContract,
+// CreateContract, DeleteContract, ...) sits on the SAME service and is refused
+// by the gateway. Accepting a contract transfers items and ISK; its signature
+// is unambiguous ([contractID, forCorp]) but there is nothing in this world to
+// accept, so an accept path could not be exercised end to end even once — and a
+// two-step confirm gate that has never been run is worse than no gate.
+
+/** contractType 3 = courier. availability 0 = public. */
+const CONTRACT_TYPE_COURIER = 3;
+const CONTRACT_AVAILABILITY_PUBLIC = 0;
+/**
+ * ⚠ THE REAL PAGE STRIDE, and it is NOT the `maxResults` the envelope reports.
+ * searchContracts slices by CONTRACTS_PER_PAGE (100,
+ * contractRuntimeState.js:48) while the envelope's `maxResults` carries
+ * MAX_CONTRACTS_PER_SEARCH (1000, contractProxyService.js:29). The two
+ * constants disagree, so paging by `maxResults` — the obvious reading — would
+ * advance startNum by 1000 and SKIP 900 CONTRACTS PER PAGE, silently. Page by
+ * this, never by that field.
+ */
+const CONTRACTS_PAGE_SIZE = 100;
+
+function contractsListEmpty(result) {
+  const contracts = readMailKeyVal(result, "contracts");
+  return !contracts || !Array.isArray(contracts.items) || contracts.items.length === 0;
+}
+
+/**
+ * GET /api/bridge/contracts?page= — the browse, the player's own, and the
+ * summary, in one panel load.
+ *
+ * Five INDEPENDENT reads (R2's rule): one failure never blanks the rest. A
+ * player whose public browse fails still sees their own contracts.
+ */
+app.get("/api/bridge/contracts", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const page = Math.max(0, Number(req.query.page) || 0);
+  try {
+    const [browse, outstanding, accepted, expired, summary] = await Promise.allSettled([
+      // ⚠ KWARGS-ONLY: no positional args at all, or the filters are dropped.
+      heldTopLevelCall(held, req.webSessionID, "contractProxy", "SearchContracts", [], {
+        contractType: CONTRACT_TYPE_COURIER,
+        availability: CONTRACT_AVAILABILITY_PUBLIC,
+        startNum: page * CONTRACTS_PAGE_SIZE,
+      }),
+      // (isAccepted, forCorp). Neither names an owner — the character comes
+      // from the session, so there is nothing here to point elsewhere.
+      heldTopLevelCall(
+        held, req.webSessionID, "contractProxy", "GetMyCurrentContractList", [false, false], null,
+      ),
+      heldTopLevelCall(
+        held, req.webSessionID, "contractProxy", "GetMyCurrentContractList", [true, false], null,
+      ),
+      heldTopLevelCall(
+        held, req.webSessionID, "contractProxy", "GetMyExpiredContractList", [false], null,
+      ),
+      heldTopLevelCall(
+        held, req.webSessionID, "contractProxy", "GetLoginInfo", [], null,
+      ),
+    ]);
+
+    const settled = [browse, outstanding, accepted, expired, summary];
+    for (const entry of settled) {
+      if (entry.status === "rejected" && entry.reason && entry.reason.code === "SESSION_NOT_FOUND") {
+        next(entry.reason);
+        return;
+      }
+    }
+
+    const codeOf = (entry) =>
+      entry.status === "rejected"
+        ? String((entry.reason && entry.reason.code) || "READ_FAILED")
+        : null;
+    const valueOf = (entry) => (entry.status === "fulfilled" ? entry.value.result : null);
+
+    // ⚠ THE FACT, NOT A GUESS. "The browse succeeded and found nothing" is a
+    // different statement from "the browse failed", and only the first one
+    // justifies telling the player this world has no contracts yet.
+    const worldHasNoContracts =
+      browse.status === "fulfilled" && contractsListEmpty(browse.value.result);
+
+    res.json({
+      ok: true,
+      characterID: held.characterID,
+      page,
+      pageSize: CONTRACTS_PAGE_SIZE,
+      browse: { result: valueOf(browse), error: codeOf(browse) },
+      outstanding: { result: valueOf(outstanding), error: codeOf(outstanding) },
+      accepted: { result: valueOf(accepted), error: codeOf(accepted) },
+      expired: { result: valueOf(expired), error: codeOf(expired) },
+      summary: { result: valueOf(summary), error: codeOf(summary) },
+      worldHasNoContracts,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * GET /api/bridge/contracts/detail?contractID= — one contract in full.
+ *
+ * GetContract answers null for a contract that does not exist — a definite
+ * answer the panel can act on ("that contract is gone"), reported as a 404
+ * rather than an empty detail pane.
+ */
+app.get("/api/bridge/contracts/detail", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const contractID = Number(req.query.contractID) || 0;
+  if (contractID <= 0) {
+    res.status(400).json({
+      ok: false,
+      error: "CONTRACT_INVALID",
+      message: "No contract was named.",
+    });
+    return;
+  }
+  try {
+    const detail = await heldTopLevelCall(
+      held, req.webSessionID, "contractProxy", "GetContract", [contractID], null,
+    );
+    if (detail.result === null || detail.result === undefined) {
+      res.status(404).json({
+        ok: false,
+        error: "CONTRACT_NOT_FOUND",
+        message: "That contract is no longer available.",
+      });
+      return;
+    }
+    res.json({ ok: true, contractID, detail: detail.result });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// --- R37 Personal Assets (charMgr global-assets bridge) ---------------------
+//
+// "Where is my stuff, across the whole cluster." Unlike mail/market/contracts,
+// this surface is NOT top-level: the retail moniker is
+// Moniker('charMgr', (charID, 10002)) via MachoBindObject, and ListStations /
+// ListStationItems dispatch on that bound object — so it rides boundCall, the
+// same two-step invbroker and agentMgr use.
+//
+// ⚠ THE SERVER ALREADY ANSWERS "WHERE IS MY STUFF". charMgrGlobalAssets
+// resolves every item up its container chain to a dockable ROOT location and
+// groups by station (`_buildAssetSnapshot` / `_buildStationRows`). The bridge
+// must not re-derive that by walking containers itself — one call is the whole
+// feature, and a client-side aggregation would disagree with the server about
+// asset-safety wraps, industry-installed items and hidden locations.
+//
+// ⚠ THE TWO READS SEND DIFFERENT ROW SHAPES, and this is the R32 trap again.
+//   * ListStations is a CRowset — `{type:"objectex2", list:[packedrow …]}` —
+//     whose rows are the POSITIONAL packedrow variant (`values` parallel to
+//     `columns`), because buildDbRowset feeds buildPackedRowFromRowsetLine an
+//     ARRAY per row.
+//   * ListStationItems is a plain `{type:"list", items:[packedrow …]}` whose
+//     rows are the NAME-KEYED variant (`fields`).
+// A decoder that commits to either shape silently drops every field of the
+// other. Both are read through `readRowField` on the browser side.
+//
+// ⚠ stationID / solarSystemID / itemID / locationID ARE DECLARED int64 (type
+// code 0x14) in the row descriptors. They are ordinary JS numbers here because
+// the handler builds them with toInteger(), but a caller must not ASSUME that —
+// the gateway renders any genuine BigInt as a BARE DECIMAL STRING, not a
+// {type:"long"} wrapper (encodeJsonSafeCallValue). The browser decoder accepts
+// both.
+//
+// READS ONLY. The bound global-assets object implements no write at all.
+
+/** Moniker('charMgr', (charID, 10002)) — the global ASSETS container. */
+const CHAR_GLOBAL_ASSETS_CONTAINER_ID = 10002;
+
+function globalAssetsBindSpec(held) {
+  return {
+    key: `globalAssets:${held.characterID}`,
+    service: "charMgr",
+    method: "MachoBindObject",
+    args: [[held.characterID, CHAR_GLOBAL_ASSETS_CONTAINER_ID]],
+    kwargs: null,
+  };
+}
+
+/**
+ * Is this ListStations result a SUCCESSFUL, EMPTY read?
+ *
+ * The CRowset's rows live on `list`. An absent/!array `list` is a shape we did
+ * not expect and must NOT be reported as "you own nothing" — the caller only
+ * treats `true` as the fact.
+ */
+function assetStationsEmpty(result) {
+  return Boolean(result) && Array.isArray(result.list) && result.list.length === 0;
+}
+
+/**
+ * GET /api/bridge/assets — every station holding this character's items.
+ *
+ * ONE bound read. The per-station contents are a separate route so first paint
+ * does not fan out one call per station.
+ */
+app.get("/api/bridge/assets", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    // Sync the held session's live position first. The asset snapshot is built
+    // AGAINST THE SESSION: charMgrGlobalAssets keys its cache on the session's
+    // station/system/constellation/region, `isHiddenPersonalAssetLocation`
+    // hides the character's own id, and an unknown location inherits the
+    // session's system. This is the same class of dependency that made
+    // GetAgents answer 0 for a docked station until the sync was added.
+    await readHeldFlight(held, req.webSessionID).catch(() => null);
+    const spec = globalAssetsBindSpec(held);
+    const stations = await boundCall(held, req.webSessionID, spec, "ListStations", [], null);
+    res.json({
+      ok: true,
+      characterID: held.characterID,
+      stations: stations.result,
+      // ⚠ THE FACT, NOT A GUESS. True only when the read SUCCEEDED and the
+      // rowset was empty — "you own nothing anywhere" and "the read failed"
+      // must never render alike (the worldHasNoContracts precedent).
+      ownsNothing: assetStationsEmpty(stations.result),
+      error: null,
+    });
+  } catch (error) {
+    if (error && error.code === "SESSION_NOT_FOUND") {
+      next(error);
+      return;
+    }
+    // A failed read is reported AS a failed read, with ownsNothing false.
+    res.json({
+      ok: true,
+      characterID: held.characterID,
+      stations: null,
+      ownsNothing: false,
+      error: String((error && error.code) || "READ_FAILED"),
+    });
+  }
+});
+
+/**
+ * Per-TYPE charge fitment for every fitted module in a ListByFlags result:
+ * `{typeID: {size, groups}}`.
+ *
+ * Mirrors readTypeVolumes below — a property of the TYPE, read from static
+ * dogma, so it costs no bridge call. A module with no charge attributes is
+ * simply absent from the map, which reads as "we cannot say what it takes"
+ * rather than "it takes nothing".
+ */
+function readModuleChargeFits(result) {
+  const rows = result && Array.isArray(result.items) ? result.items : [];
+  const fits = {};
+  for (const row of rows) {
+    const fields = row && row.type === "packedrow" && row.fields ? row.fields : row;
+    const typeID = Number(fields && fields.typeID) || 0;
+    if (typeID <= 0 || Object.prototype.hasOwnProperty.call(fits, typeID)) {
+      continue;
+    }
+    const fitment = staticData.getModuleChargeFitment(typeID);
+    if (fitment.groups.length > 0) {
+      fits[typeID] = fitment;
+    }
+  }
+  return fits;
+}
+
+/**
+ * Per-type volume (m³) for every type in a ListStationItems result.
+ *
+ * Reads the NAME-KEYED packedrow variant this handler builds. Types the static
+ * tables do not know are simply absent from the map — never zero, which the
+ * page would have to render as a real measurement.
+ */
+function readTypeVolumes(result) {
+  const rows = result && Array.isArray(result.items) ? result.items : [];
+  const volumes = {};
+  for (const row of rows) {
+    const fields = row && row.type === "packedrow" && row.fields ? row.fields : null;
+    const typeID = Number(fields && fields.typeID) || 0;
+    if (typeID <= 0 || Object.prototype.hasOwnProperty.call(volumes, typeID)) {
+      continue;
+    }
+    const type = staticData.getType(typeID);
+    const volume = Number(type && type.volume);
+    if (Number.isFinite(volume) && volume > 0) {
+      volumes[typeID] = volume;
+    }
+  }
+  return volumes;
+}
+
+/**
+ * GET /api/bridge/assets/station?stationID= — what is at ONE of those stations.
+ *
+ * Called when the player expands a station. `hasNoItems` is the same fact as
+ * `ownsNothing` above, scoped to this station.
+ */
+app.get("/api/bridge/assets/station", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const stationID = Number(req.query.stationID) || 0;
+  if (stationID <= 0) {
+    res.status(400).json({
+      ok: false,
+      error: "ASSET_LOCATION_INVALID",
+      message: "No location was named.",
+    });
+    return;
+  }
+  try {
+    const spec = globalAssetsBindSpec(held);
+    const items = await boundCall(
+      held,
+      req.webSessionID,
+      spec,
+      "ListStationItems",
+      [stationID],
+      null,
+    );
+    const result = items.result;
+    res.json({
+      ok: true,
+      stationID,
+      items: result,
+      // Per-type VOLUME, from static reference data — no bridge call and no new
+      // allowlist pair. The asset rows carry a typeID but no volume (the
+      // descriptor has no such column), and volume is a property of the TYPE,
+      // not of the stack, so it cannot vary by player. Same class of read as
+      // /api/names. Absent for a type the static tables do not know, which the
+      // page renders as "—" rather than as zero.
+      volumes: readTypeVolumes(result),
+      hasNoItems:
+        Boolean(result) && Array.isArray(result.items) && result.items.length === 0,
+      error: null,
+    });
+  } catch (error) {
+    if (error && error.code === "SESSION_NOT_FOUND") {
+      next(error);
+      return;
+    }
+    res.json({
+      ok: true,
+      stationID,
+      items: null,
+      hasNoItems: false,
+      error: String((error && error.code) || "READ_FAILED"),
+    });
+  }
+});
+
+/** Read `status` off a util.KeyVal job row (the re-read's verdict). */
+function readIndustryJobStatus(row) {
+  const entries =
+    row && row.args && Array.isArray(row.args.entries) ? row.args.entries : [];
+  const entry = entries.find((candidate) => Array.isArray(candidate) && candidate[0] === "status");
+  return entry ? Number(entry[1]) || 0 : 0;
+}
+
+// R4 Agents & Missions (agentMgr bridge). Agent list is a top-level read on the
+// held session (retail agentMgr.GetAgents().Clone()); conversation, briefing,
+// and journal use the bound agent (Moniker('agentMgr', agentID)). The browser
+// addresses agents/missions by game ID; the BFF holds the agent bound handles.
+
+// Dispatch a top-level (non-bound) call on the held live session. A lost
+// persistent session drops the whole held session (as /api/bridge/call).
+async function heldTopLevelCall(held, webSessionID, service, method, args, kwargs) {
+  try {
+    return await gateway.callMethod(
+      service,
+      method,
+      args,
+      kwargs,
+      { userid: held.accountID },
+      held.bridgeSessionID,
+    );
+  } catch (error) {
+    if (error && error.code === "SESSION_NOT_FOUND") {
+      forgetBridgeSession(webSessionID);
+    }
+    throw error;
+  }
+}
+
+// Decode agentMgr.GetAgents' marshaled Rowset (header + lines) into plain agent
+// rows. Filtering to the docked station happens server-side: GetAgents returns
+// the whole ~11k-agent roster, and the retail client itself filters by station
+// client-side; the browser only ever needs the handful at Farmer's station.
+function decodeStationAgents(result, stationID) {
+  const dictEntries =
+    result && result.args && Array.isArray(result.args.entries)
+      ? result.args.entries
+      : [];
+  const header = (dictEntries.find(([key]) => key === "header") || [])[1];
+  const lines = (dictEntries.find(([key]) => key === "lines") || [])[1];
+  const fieldNames = header && Array.isArray(header.items) ? header.items : [];
+  const rows = lines && Array.isArray(lines.items) ? lines.items : [];
+  const indexOf = (name) => fieldNames.indexOf(name);
+  const idx = {
+    agentID: indexOf("agentID"),
+    agentTypeID: indexOf("agentTypeID"),
+    divisionID: indexOf("divisionID"),
+    level: indexOf("level"),
+    stationID: indexOf("stationID"),
+    corporationID: indexOf("corporationID"),
+    missionKind: indexOf("missionKind"),
+    missionTypeLabel: indexOf("missionTypeLabel"),
+  };
+  const numericStationID = Number(stationID) || 0;
+  const agents = [];
+  for (const line of rows) {
+    const values = line && Array.isArray(line.items) ? line.items : [];
+    const rowStationID = Number(values[idx.stationID]) || null;
+    if (numericStationID > 0 && rowStationID !== numericStationID) {
+      continue;
+    }
+    agents.push({
+      agentID: Number(values[idx.agentID]) || 0,
+      agentTypeID: idx.agentTypeID >= 0 ? Number(values[idx.agentTypeID]) || null : null,
+      divisionID: idx.divisionID >= 0 ? Number(values[idx.divisionID]) || null : null,
+      level: idx.level >= 0 ? Number(values[idx.level]) || null : null,
+      stationID: rowStationID,
+      corporationID: idx.corporationID >= 0 ? Number(values[idx.corporationID]) || null : null,
+      missionKind: idx.missionKind >= 0 ? String(values[idx.missionKind] || "") || null : null,
+      missionTypeLabel:
+        idx.missionTypeLabel >= 0 ? String(values[idx.missionTypeLabel] || "") || null : null,
+    });
+  }
+  return agents.filter((agent) => agent.agentID > 0);
+}
+
+// List the agents at the docked station (retail agentMgr.GetAgents, filtered).
+app.get("/api/bridge/agents", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    // Sync the held station to the character's live position first, so a dock
+    // at a new station (autopilot arrival) lists THAT station's agents rather
+    // than the select-time station's.
+    await readHeldFlight(held, req.webSessionID);
+    const outcome = await heldTopLevelCall(
+      held,
+      req.webSessionID,
+      "agentMgr",
+      "GetAgents",
+      [],
+      null,
+    );
+    res.json({
+      ok: true,
+      stationID: held.stationID,
+      agents: decodeStationAgents(outcome.result, held.stationID),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Drive the agent conversation: DoAction(actionID). actionID null opens the
+// conversation; a server-assigned action token (from availableActions) requests
+// / accepts / declines. The in-person accept is synchronous; a decline is a
+// deferred outcome the gateway drives to completion (or refuses with a typed
+// CALL_DEFERRED_UNSUPPORTED). The raw retail-shaped result is decoded browser
+// side (web/src/bridge/agents.ts).
+app.post("/api/bridge/agents/:agentID/action", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const agentID = Number(req.params.agentID) || 0;
+  if (agentID <= 0) {
+    res.status(400).json({ ok: false, error: "INVALID_AGENT", message: "A positive agentID is required." });
+    return;
+  }
+  const rawActionID = req.body ? req.body.actionID : undefined;
+  const actionID =
+    rawActionID === undefined || rawActionID === null ? null : Number(rawActionID);
+  if (actionID !== null && !Number.isSafeInteger(actionID)) {
+    res.status(400).json({ ok: false, error: "INVALID_ACTION", message: "actionID must be an integer or null." });
+    return;
+  }
+  try {
+    const outcome = await boundCall(
+      held,
+      req.webSessionID,
+      agentBindSpec(agentID),
+      "DoAction",
+      [actionID],
+      null,
+    );
+    res.json({ ok: true, result: outcome.result, notifications: outcome.notifications });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// The mission briefing on the bound agent: header + objectives + agent location.
+// The three reads are INDEPENDENT (Promise.allSettled) so one failure never
+// blanks the rest; each carries its own error code. Raw results are decoded
+// browser side.
+app.get("/api/bridge/agents/:agentID/briefing", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const agentID = Number(req.params.agentID) || 0;
+  if (agentID <= 0) {
+    res.status(400).json({ ok: false, error: "INVALID_AGENT", message: "A positive agentID is required." });
+    return;
+  }
+  try {
+    const spec = agentBindSpec(agentID);
+    const [briefing, objective, location] = await Promise.allSettled([
+      boundCall(held, req.webSessionID, spec, "GetMissionBriefingInfo", [], null),
+      boundCall(held, req.webSessionID, spec, "GetMissionObjectiveInfo", [], null),
+      boundCall(held, req.webSessionID, spec, "GetAgentLocationWrap", [], null),
+    ]);
+    for (const settled of [briefing, objective, location]) {
+      if (settled.status === "rejected" && settled.reason && settled.reason.code === "SESSION_NOT_FOUND") {
+        next(settled.reason);
+        return;
+      }
+    }
+    const settledCode = (settled) =>
+      settled.status === "rejected"
+        ? String((settled.reason && settled.reason.code) || "READ_FAILED")
+        : null;
+    const settledValue = (settled) => (settled.status === "fulfilled" ? settled.value.result : null);
+    res.json({
+      ok: true,
+      agentID,
+      briefing: settledValue(briefing),
+      objective: settledValue(objective),
+      location: settledValue(location),
+      errors: {
+        briefing: settledCode(briefing),
+        objective: settledCode(objective),
+        location: settledCode(location),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// The mission journal (retail agentMgr.GetMyJournalDetails, top-level): active +
+// offered missions for the character. Raw result decoded browser side.
+app.get("/api/bridge/journal", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const outcome = await heldTopLevelCall(
+      held,
+      req.webSessionID,
+      "agentMgr",
+      "GetMyJournalDetails",
+      [],
+      null,
+    );
+    res.json({ ok: true, result: outcome.result });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// R64 PLUMBING (no UI): the agent / mission READ bundle for one agent. Wires the
+// nine R64 agentMgr reads so a later goal builds an agent-info / mission page
+// cheaply. All reads are INDEPENDENT (Promise.allSettled) — one failure never
+// blanks the rest; each carries its own error code. Raw retail-shaped results are
+// decoded browser side (web/src/bridge/agentInfo.ts).
+//
+//   • FIVE top-level reads on the held session: GetAgentStaticInfo([agentID]) and
+//     GetAgentByID([agentID]) (public NPC-agent reference info — identical shape),
+//     GetSolarSystemOfAgent([agentID]) (the agent's system), GetMyEpicArcStatus([])
+//     (the char's OWN epic-arc progress, session-scoped), and
+//     GetCompletedCareerAgentIDs([[agentIDs]]) (which of the passed ids the char has
+//     completed — the LIST is the single positional arg; defaults to [agentID]).
+//   • THREE bound reads on the agent moniker (Moniker('agentMgr', agentID) via
+//     MachoBindObject, the R4 two-step): GetInfoServiceDetails, GetMissionJournalInfo,
+//     GetEntryPoint — each resolves the agentID from the bound context + the charID
+//     from the session, so they read the SESSION char's own agent relationship.
+//   • GetDungeonShipRestrictions([dungeonID, gateID]) — a STATIC reference read
+//     issued ONLY when ?dungeonID= is given (no dungeon → no read).
+// ⚠ Every agentMgr MUTATOR (RemoveOfferFromJournal / GotoLocation / WarpToLocation /
+// WarpToAgentInSpace) is NEVER dispatched here. Wire contract: docs/bridge-wire-contract.md.
+app.get("/api/bridge/agent-info", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const agentID = Number(req.query.agentID) || 0;
+  if (agentID <= 0) {
+    res.status(400).json({
+      ok: false,
+      error: "INVALID_AGENT",
+      message: "A positive agentID query parameter is required.",
+    });
+    return;
+  }
+  // GetCompletedCareerAgentIDs takes a LIST of agent ids to CHECK (its single
+  // positional arg); default to the primary agent when none are named. The result
+  // is scoped off session.characterID, so the list only chooses WHICH ids to test.
+  const agentIDs = String(req.query.agentIDs || "")
+    .split(",")
+    .map((raw) => Number(raw.trim()) || 0)
+    .filter((id) => id > 0);
+  const careerAgentIDs = agentIDs.length > 0 ? agentIDs : [agentID];
+  // GetDungeonShipRestrictions is a conditional STATIC read — issued only when a
+  // dungeon is named. gateID (optional) scopes it to one acceleration gate.
+  const dungeonID = Number(req.query.dungeonID) || 0;
+  const gateID = Number(req.query.gateID) || 0;
+  const wantDungeon = dungeonID > 0;
+
+  try {
+    const spec = agentBindSpec(agentID);
+    const [
+      staticInfo,
+      agentByID,
+      solarSystem,
+      epicArcStatus,
+      completedCareerAgents,
+      infoServiceDetails,
+      missionJournal,
+      entryPoint,
+      dungeonShipRestrictions,
+    ] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "agentMgr", "GetAgentStaticInfo", [agentID], null),
+      heldTopLevelCall(held, req.webSessionID, "agentMgr", "GetAgentByID", [agentID], null),
+      heldTopLevelCall(held, req.webSessionID, "agentMgr", "GetSolarSystemOfAgent", [agentID], null),
+      heldTopLevelCall(held, req.webSessionID, "agentMgr", "GetMyEpicArcStatus", [], null),
+      heldTopLevelCall(
+        held,
+        req.webSessionID,
+        "agentMgr",
+        "GetCompletedCareerAgentIDs",
+        [careerAgentIDs],
+        null,
+      ),
+      boundCall(held, req.webSessionID, spec, "GetInfoServiceDetails", [], null),
+      boundCall(held, req.webSessionID, spec, "GetMissionJournalInfo", [], null),
+      boundCall(held, req.webSessionID, spec, "GetEntryPoint", [], null),
+      wantDungeon
+        ? heldTopLevelCall(
+            held,
+            req.webSessionID,
+            "agentMgr",
+            "GetDungeonShipRestrictions",
+            [dungeonID, gateID > 0 ? gateID : null],
+            null,
+          )
+        : Promise.resolve(null),
+    ]);
+
+    // A lost live session can't be recovered by any read; surface it so the page
+    // returns to character select (as every held call does).
+    for (const settled of [
+      staticInfo,
+      agentByID,
+      solarSystem,
+      epicArcStatus,
+      completedCareerAgents,
+      infoServiceDetails,
+      missionJournal,
+      entryPoint,
+      dungeonShipRestrictions,
+    ]) {
+      if (
+        settled.status === "rejected" &&
+        settled.reason &&
+        settled.reason.code === "SESSION_NOT_FOUND"
+      ) {
+        next(settled.reason);
+        return;
+      }
+    }
+
+    const settledCode = (settled) =>
+      settled.status === "rejected"
+        ? String((settled.reason && settled.reason.code) || "READ_FAILED")
+        : null;
+    const settledValue = (settled) =>
+      settled.status === "fulfilled" && settled.value ? settled.value.result : null;
+
+    res.json({
+      ok: true,
+      agentID,
+      requested: {
+        agentID,
+        careerAgentIDs,
+        dungeonID: wantDungeon ? dungeonID : null,
+        gateID: wantDungeon && gateID > 0 ? gateID : null,
+      },
+      staticInfo: settledValue(staticInfo),
+      agentByID: settledValue(agentByID),
+      solarSystem: settledValue(solarSystem),
+      epicArcStatus: settledValue(epicArcStatus),
+      completedCareerAgents: settledValue(completedCareerAgents),
+      infoServiceDetails: settledValue(infoServiceDetails),
+      missionJournal: settledValue(missionJournal),
+      entryPoint: settledValue(entryPoint),
+      dungeonShipRestrictions: wantDungeon ? settledValue(dungeonShipRestrictions) : null,
+      errors: {
+        staticInfo: settledCode(staticInfo),
+        agentByID: settledCode(agentByID),
+        solarSystem: settledCode(solarSystem),
+        epicArcStatus: settledCode(epicArcStatus),
+        completedCareerAgents: settledCode(completedCareerAgents),
+        infoServiceDetails: settledCode(infoServiceDetails),
+        missionJournal: settledCode(missionJournal),
+        entryPoint: settledCode(entryPoint),
+        dungeonShipRestrictions: wantDungeon ? settledCode(dungeonShipRestrictions) : null,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// R6 courier-completion reward readout (inventory Step 12): the wallet / LP /
+// standings pull reads a panel issues after Complete pays out. These are plain
+// TOP-LEVEL server-tier reads on the held session (no bind). The mission
+// journal (the fourth Step-12 read) has its own route (/api/bridge/journal) +
+// slice, refreshed on the same Complete. The three reads are INDEPENDENT
+// (Promise.allSettled) so one failed read never blanks the rest; each carries
+// its own error code. Raw retail-shaped results decoded browser side
+// (web/src/bridge/rewards.ts).
+app.get("/api/bridge/rewards", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const [cash, lp, standings] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "account", "GetCashBalance", [0], null),
+      heldTopLevelCall(
+        held,
+        req.webSessionID,
+        "LPSvc",
+        "GetAllMyCharacterWalletLPBalances",
+        [],
+        null,
+      ),
+      heldTopLevelCall(held, req.webSessionID, "standingMgr", "GetCharStandings", [], null),
+    ]);
+    // A lost live session can't be recovered by any read; surface it so the page
+    // returns to character select (as every held call does).
+    for (const settled of [cash, lp, standings]) {
+      if (settled.status === "rejected" && settled.reason && settled.reason.code === "SESSION_NOT_FOUND") {
+        next(settled.reason);
+        return;
+      }
+    }
+    const settledCode = (settled) =>
+      settled.status === "rejected"
+        ? String((settled.reason && settled.reason.code) || "READ_FAILED")
+        : null;
+    const settledValue = (settled) =>
+      settled.status === "fulfilled" ? settled.value.result : null;
+    res.json({
+      ok: true,
+      cash: settledValue(cash),
+      lp: settledValue(lp),
+      standings: settledValue(standings),
+      errors: {
+        cash: settledCode(cash),
+        lp: settledCode(lp),
+        standings: settledCode(standings),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// --- R50 Wallet + Corp Wallet -----------------------------------------------
+// Two nav tabs, one read. The PERSONAL balance is account.GetCashBalance(0) —
+// the SAME allowlisted read the market panel and the R6 reward readout already
+// issue (no accountKey/corp args; the corp variant is never passed here). The
+// CORP division balances are account.GetWalletDivisionsInfo — R50's single new
+// allowlist pair, the read the retail corp-wallet window itself issues
+// (corpDivisionsPanel.py), scoped server-side to the session's corporation.
+// Division NAMES come from corpRegistry.GetCorporation (already allowlisted,
+// decoded here exactly as the corp hangar route does) so the browser never
+// renders a bare division flag. Three INDEPENDENT reads (Promise.allSettled): a
+// failed corp read never blanks the personal balance and vice versa; each read
+// carries its own error code. Amounts ship raw (decoded browser-side in
+// web/src/bridge/wallet.ts). ⚠ An empty divisions list is a REAL "no corp
+// wallet" answer and is distinct from a read that FAILED (which sets errors.divisions).
+app.get("/api/bridge/wallet", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    // R54 adds the PERSONAL ledger: GetJournal (a Rowset) + GetTransactions (a
+    // list<KeyVal>) + GetEntryTypes (the ref-type -> label static map). ⚠ The
+    // `account` corp-vs-personal branch is ARG-POSITION driven, not method
+    // driven: args[3]/isCorpWallet = 0 (and accountKey = 1000 CASH) reads THIS
+    // character's own wallet — the retail personal shape
+    // GetTransactions(accountingKeyCash, year=None, month=None, False). The corp
+    // branch (args[3] = 1) is DELIBERATELY never issued here (like R50's corp
+    // GetCashBalance). year/month are null so the server uses its recent-window
+    // default. Each read is independent; an empty ledger is a REAL answer, not a
+    // failure (worldHasNoContracts precedent), decoded browser-side.
+    const [cash, divisions, corporation, journal, transactions, entryTypes] =
+      await Promise.allSettled([
+        heldTopLevelCall(held, req.webSessionID, "account", "GetCashBalance", [0], null),
+        heldTopLevelCall(held, req.webSessionID, "account", "GetWalletDivisionsInfo", [], null),
+        heldTopLevelCall(held, req.webSessionID, "corpRegistry", "GetCorporation", [], null),
+        heldTopLevelCall(held, req.webSessionID, "account", "GetJournal", [1000, null, null, 0], null),
+        heldTopLevelCall(held, req.webSessionID, "account", "GetTransactions", [1000, null, null, 0], null),
+        heldTopLevelCall(held, req.webSessionID, "account", "GetEntryTypes", [], null),
+      ]);
+    // A lost live session can't be recovered by any read; surface it so the page
+    // returns to character select (as every held call does).
+    for (const settled of [cash, divisions, corporation, journal, transactions, entryTypes]) {
+      if (settled.status === "rejected" && settled.reason && settled.reason.code === "SESSION_NOT_FOUND") {
+        next(settled.reason);
+        return;
+      }
+    }
+    const settledCode = (settled) =>
+      settled.status === "rejected"
+        ? String((settled.reason && settled.reason.code) || "READ_FAILED")
+        : null;
+    const settledValue = (settled) =>
+      settled.status === "fulfilled" ? settled.value.result : null;
+    res.json({
+      ok: true,
+      cash: settledValue(cash),
+      divisions: settledValue(divisions),
+      // Division ordinal (1..7) -> player-authored name; the browser falls back
+      // to a plain "Division N" label when a corporation never renamed one. A
+      // division FLAG number is never shown.
+      divisionNames:
+        corporation.status === "fulfilled"
+          ? decodeDivisionNames(corporation.value.result)
+          : {},
+      // R54 raw ledger shapes (decoded in web/src/bridge/wallet.ts).
+      journal: settledValue(journal),
+      transactions: settledValue(transactions),
+      entryTypes: settledValue(entryTypes),
+      errors: {
+        cash: settledCode(cash),
+        divisions: settledCode(divisions),
+        corp: settledCode(corporation),
+        journal: settledCode(journal),
+        transactions: settledCode(transactions),
+        entryTypes: settledCode(entryTypes),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// --- R55 Standings ----------------------------------------------------------
+// The reads the retail standings panel issues (charsheet/standingsPanel). The
+// base pull is the character's own standings (standingMgr.GetCharStandings) and
+// the corporation's (standingMgr.GetCorpStandings) — both plain TOP-LEVEL reads
+// scoped server-side off the docked session, no args. Passing `fromID` also asks
+// for that entity's drill-down: the standing HISTORY
+// (GetStandingTransactions(fromID, characterID)) and the per-member COMPOSITION
+// (GetStandingCompositions(fromID, corporationID)) — the toIDs come from the
+// server-held session, never the browser. Every read is INDEPENDENT
+// (Promise.allSettled): a failed corp read never blanks the character's own
+// standings, and each read carries its own error code. An empty list is a REAL
+// "no standings" answer, distinct from a FAILED read (worldHasNoContracts
+// precedent). ⚠ Raw retail shapes ship out; the browser decodes them
+// (web/src/bridge/standings.ts) and resolves every entity id to a name (R7d).
+app.get("/api/bridge/standings", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const fromID = Number(req.query && req.query.fromID) || 0;
+  const wantDetail = fromID > 0;
+  try {
+    const [char, corp, transactions, compositions] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "standingMgr", "GetCharStandings", [], null),
+      heldTopLevelCall(held, req.webSessionID, "standingMgr", "GetCorpStandings", [], null),
+      wantDetail
+        ? heldTopLevelCall(
+            held,
+            req.webSessionID,
+            "standingMgr",
+            "GetStandingTransactions",
+            [fromID, held.characterID],
+            null,
+          )
+        : Promise.resolve({ result: null }),
+      wantDetail
+        ? heldTopLevelCall(
+            held,
+            req.webSessionID,
+            "standingMgr",
+            "GetStandingCompositions",
+            [fromID, Number(held.corporationID) || 0],
+            null,
+          )
+        : Promise.resolve({ result: null }),
+    ]);
+    // A lost live session can't be recovered by any read; surface it so the page
+    // returns to character select (as every held call does).
+    for (const settled of [char, corp, transactions, compositions]) {
+      if (settled.status === "rejected" && settled.reason && settled.reason.code === "SESSION_NOT_FOUND") {
+        next(settled.reason);
+        return;
+      }
+    }
+    const settledCode = (settled) =>
+      settled.status === "rejected"
+        ? String((settled.reason && settled.reason.code) || "READ_FAILED")
+        : null;
+    const settledValue = (settled) =>
+      settled.status === "fulfilled" ? settled.value.result : null;
+    res.json({
+      ok: true,
+      fromID: wantDetail ? fromID : null,
+      char: settledValue(char),
+      corp: settledValue(corp),
+      transactions: settledValue(transactions),
+      compositions: settledValue(compositions),
+      errors: {
+        char: settledCode(char),
+        corp: settledCode(corp),
+        // Detail reads are only issued when a fromID was asked for; otherwise
+        // they resolve to a null result with no error.
+        transactions: wantDetail ? settledCode(transactions) : null,
+        compositions: wantDetail ? settledCode(compositions) : null,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// --- R56 Character Sheet -----------------------------------------------------
+// "Who is this character." Four plain TOP-LEVEL charMgr reads the retail
+// charactersheet window issues, each scoped server-side off the docked session:
+//   • charMgr.GetPublicInfo3   -> {type:"list", items:[util.KeyVal{name, corp,
+//     alliance, security, ...}]} — public identity.
+//   • charMgr.GetCharacterDescription -> a plain STRING (the bio).
+//   • charMgr.GetHomeStation   -> util.KeyVal carrying the home stationID.
+//   • charMgr.GetCloneInfo     -> util.KeyVal{clones(dict), implants(dict), ...}.
+// Every read is issued with NO ARGUMENT so the handler falls through to
+// session.characterID — there is no way for the browser to point one at another
+// character. Each read is INDEPENDENT (Promise.allSettled): a failed clone read
+// never blanks the identity, and each carries its own error code. An empty implant
+// set is a REAL "clean clone" answer, distinct from a FAILED read
+// (worldHasNoContracts precedent). ⚠ Raw retail shapes ship out; the browser
+// decodes them (web/src/bridge/characterSheet.ts) and resolves every entity id to
+// a name (R7d) — corp / alliance / home station / implant typeIDs — via /api/names.
+app.get("/api/bridge/character-sheet", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const [publicInfo, description, homeStation, cloneInfo] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "charMgr", "GetPublicInfo3", [], null),
+      heldTopLevelCall(held, req.webSessionID, "charMgr", "GetCharacterDescription", [], null),
+      heldTopLevelCall(held, req.webSessionID, "charMgr", "GetHomeStation", [], null),
+      heldTopLevelCall(held, req.webSessionID, "charMgr", "GetCloneInfo", [], null),
+    ]);
+    // A lost live session can't be recovered by any read; surface it so the page
+    // returns to character select (as every held call does).
+    for (const settled of [publicInfo, description, homeStation, cloneInfo]) {
+      if (settled.status === "rejected" && settled.reason && settled.reason.code === "SESSION_NOT_FOUND") {
+        next(settled.reason);
+        return;
+      }
+    }
+    const settledCode = (settled) =>
+      settled.status === "rejected"
+        ? String((settled.reason && settled.reason.code) || "READ_FAILED")
+        : null;
+    const settledValue = (settled) =>
+      settled.status === "fulfilled" ? settled.value.result : null;
+    res.json({
+      ok: true,
+      publicInfo: settledValue(publicInfo),
+      description: settledValue(description),
+      homeStation: settledValue(homeStation),
+      cloneInfo: settledValue(cloneInfo),
+      errors: {
+        publicInfo: settledCode(publicInfo),
+        description: settledCode(description),
+        homeStation: settledCode(homeStation),
+        cloneInfo: settledCode(cloneInfo),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// --- R57 plumbing sweep: top-level reads (fittings / kill rights / LP) -------
+// PLUMBING ONLY: these three routes make the reads reachable + decodable so the
+// UI is easy to build later. No panel/tab/store slice ships with them. Each
+// issues an allowlisted TOP-LEVEL read on the held session, arg-less, so the
+// handler scopes to the logged-in character; the raw retail-shaped result ships
+// out and the browser decodes it (web/src/bridge/{fittings,killRights,lpStore}.ts).
+
+// GET /api/bridge/fittings — the saved FITTING LIBRARY (charFittingMgr.GetFittings,
+// the CHARACTER service — not corp/alliance). A single read: GetFittings scopes
+// to session.characterID (empty args -> resolveRequestedOwnerID falls through to
+// the session), so no cross-character read is possible. An empty library is a
+// REAL "no saved fittings" answer, not a failure. SESSION_NOT_FOUND surfaces via
+// next() so the page returns to character select, as every held call does.
+app.get("/api/bridge/fittings", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const outcome = await heldTopLevelCall(
+      held,
+      req.webSessionID,
+      "charFittingMgr",
+      "GetFittings",
+      [],
+      null,
+    );
+    res.json({ ok: true, fittings: outcome.result });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/bridge/kill-rights — the kill rights this character HOLDS
+// (bountyProxy.GetMyKillRights, scoped to session.characterID, no args). A single
+// read. An empty list is a REAL "no kill rights" answer, not a failure. ⚠ The
+// row's fromID/toID/restrictedTo are entity ids the browser resolves to names
+// (R7d); the raw shape ships out untouched.
+app.get("/api/bridge/kill-rights", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const outcome = await heldTopLevelCall(
+      held,
+      req.webSessionID,
+      "bountyProxy",
+      "GetMyKillRights",
+      [],
+      null,
+    );
+    res.json({ ok: true, killRights: outcome.result });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/bridge/lp — the LP store reads. THREE independent LPSvc reads
+// (Promise.allSettled; empty ≠ failed, each read carries its own error code):
+//   • GetLPsForCharacter    — this character's per-issuer LP balances, as a list
+//     of [issuerCorpID, loyaltyPoints] pairs (the retail LP-store list shape).
+//   • GetLPExchangeRates    — the LP-store exchange-rate table.
+//   • GetAvailableOffersFromCorp — the offers a corp publishes for LP.
+// ⚠ GetLPExchangeRates and GetAvailableOffersFromCorp are EMPTY-BY-DESIGN in this
+// world (the handlers return buildList([]) with no seed data) — an empty list is
+// a legitimate "no rates / no offers yet" state, not a bug. The plumbing lands so
+// a UI can render them the moment data exists. GetLPsForCharacter is the same
+// data as R6's GetAllMyCharacterWalletLPBalances (the /rewards route) but in the
+// list shape; both are session-scoped. Raw shapes ship out, decoded browser-side
+// (web/src/bridge/lpStore.ts).
+app.get("/api/bridge/lp", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const [balances, exchangeRates, offers] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "LPSvc", "GetLPsForCharacter", [], null),
+      heldTopLevelCall(held, req.webSessionID, "LPSvc", "GetLPExchangeRates", [], null),
+      heldTopLevelCall(held, req.webSessionID, "LPSvc", "GetAvailableOffersFromCorp", [], null),
+    ]);
+    // A lost live session can't be recovered by any read; surface it so the page
+    // returns to character select (as every held call does).
+    for (const settled of [balances, exchangeRates, offers]) {
+      if (settled.status === "rejected" && settled.reason && settled.reason.code === "SESSION_NOT_FOUND") {
+        next(settled.reason);
+        return;
+      }
+    }
+    const settledCode = (settled) =>
+      settled.status === "rejected"
+        ? String((settled.reason && settled.reason.code) || "READ_FAILED")
+        : null;
+    const settledValue = (settled) =>
+      settled.status === "fulfilled" ? settled.value.result : null;
+    res.json({
+      ok: true,
+      balances: settledValue(balances),
+      exchangeRates: settledValue(exchangeRates),
+      offers: settledValue(offers),
+      errors: {
+        balances: settledCode(balances),
+        exchangeRates: settledCode(exchangeRates),
+        offers: settledCode(offers),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// --- R65 plumbing sweep: utility READS (insurance / corp+alliance fittings /
+// bookmarks) — no UI. Each route batches allowlisted TOP-LEVEL reads on the held
+// session; every read scopes off the session (or is public/static reference
+// data), so the browser cannot point one at another entity. The raw retail-shaped
+// results ship out, decoded browser-side
+// (web/src/bridge/{insurance,sharedFittings,bookmarks}.ts).
+
+// A helper the three routes share for the allSettled fan-out: the read's value,
+// or null; and its error code, or null. A skipped optional read is modeled as a
+// resolved { result: null } so it reads as "no data", never an error.
+function settledReadValue(settled) {
+  return settled.status === "fulfilled" ? settled.value.result : null;
+}
+function settledReadCode(settled) {
+  return settled.status === "rejected"
+    ? String((settled.reason && settled.reason.code) || "READ_FAILED")
+    : null;
+}
+// The captured notifications of a settled held call. Some reads (e.g. pvpFilamentMgr.
+// GetLeaderboard / GetCharacterStatistics) RETURN null and push their payload as a
+// notification the gateway drains into the response envelope; those decoders read from
+// here, not from `.result`. [] for a rejected read.
+function settledReadNotifications(settled) {
+  return settled.status === "fulfilled" && Array.isArray(settled.value.notifications)
+    ? settled.value.notifications
+    : [];
+}
+function surfaceLostSession(settledList, next) {
+  for (const settled of settledList) {
+    if (
+      settled.status === "rejected" &&
+      settled.reason &&
+      settled.reason.code === "SESSION_NOT_FOUND"
+    ) {
+      next(settled.reason);
+      return true;
+    }
+  }
+  return false;
+}
+
+// GET /api/bridge/insurance?shipID=&shipTypeID=&typeIDs= — the ship-insurance
+// reads, as up to FOUR independent reads (Promise.allSettled; empty ≠ failed).
+// GetContracts is the char's OWN active ship-insurance policies (session-scoped;
+// empty when nothing is insured — a real state). The three arg-taking reads are
+// OPTIONAL: GetContractForShip(shipID) (canSessionSeeContract gates it, so an
+// un-owned shipID reads null), GetInsurancePrice(shipTypeID) and
+// GetInsurancePrices([typeIDs]) are the PUBLIC static premium table. With no query
+// params the route returns just the always-safe session-scoped policy list. These
+// are ship-INSURANCE contracts, NOT player contracts.
+app.get("/api/bridge/insurance", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const shipID = Number(req.query.shipID) || 0;
+  const shipTypeID = Number(req.query.shipTypeID) || 0;
+  const typeIDs = String(req.query.typeIDs ?? "")
+    .split(",")
+    .map((entry) => Number.parseInt(entry, 10))
+    .filter((entry) => Number.isFinite(entry) && entry > 0);
+  try {
+    const [contracts, contractForShip, price, prices] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "insuranceSvc", "GetContracts", [], null),
+      shipID > 0
+        ? heldTopLevelCall(held, req.webSessionID, "insuranceSvc", "GetContractForShip", [shipID], null)
+        : Promise.resolve({ result: null }),
+      shipTypeID > 0
+        ? heldTopLevelCall(held, req.webSessionID, "insuranceSvc", "GetInsurancePrice", [shipTypeID], null)
+        : Promise.resolve({ result: null }),
+      typeIDs.length > 0
+        ? heldTopLevelCall(held, req.webSessionID, "insuranceSvc", "GetInsurancePrices", [typeIDs], null)
+        : Promise.resolve({ result: null }),
+    ]);
+    if (surfaceLostSession([contracts, contractForShip, price, prices], next)) {
+      return;
+    }
+    res.json({
+      ok: true,
+      contracts: settledReadValue(contracts),
+      contractForShip: settledReadValue(contractForShip),
+      price: settledReadValue(price),
+      prices: settledReadValue(prices),
+      errors: {
+        contracts: settledReadCode(contracts),
+        contractForShip: settledReadCode(contractForShip),
+        price: settledReadCode(price),
+        prices: settledReadCode(prices),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/bridge/shared-fittings — the corp/alliance/community saved-fit
+// libraries beside R57's char library, as THREE independent reads
+// (Promise.allSettled; empty ≠ failed, each carries its own error code):
+//   • corpFittingMgr.GetFittings         — the SESSION corp's fits (own corp only;
+//     we send no owner arg, so a foreign corp id is never reachable here).
+//   • corpFittingMgr.GetCommunityFittings — the PUBLIC community library.
+//   • allianceFittingMgr.GetFittings     — the SESSION alliance's fits; a char with
+//     NO alliance answers OWNER_SCOPE_DENIED (a real "no alliance" state, surfaced
+//     as this read's error code, not a failure of the others).
+app.get("/api/bridge/shared-fittings", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const [corp, community, alliance] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "corpFittingMgr", "GetFittings", [], null),
+      heldTopLevelCall(held, req.webSessionID, "corpFittingMgr", "GetCommunityFittings", [], null),
+      heldTopLevelCall(held, req.webSessionID, "allianceFittingMgr", "GetFittings", [], null),
+    ]);
+    if (surfaceLostSession([corp, community, alliance], next)) {
+      return;
+    }
+    res.json({
+      ok: true,
+      corp: settledReadValue(corp),
+      community: settledReadValue(community),
+      alliance: settledReadValue(alliance),
+      errors: {
+        corp: settledReadCode(corp),
+        community: settledReadCode(community),
+        alliance: settledReadCode(alliance),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/bridge/bookmarks?folderID= — the bookmark reads, as up to THREE
+// independent reads (Promise.allSettled; empty ≠ failed):
+//   • GetMyActiveBookmarks()          — [folders, bookmarks, subfolders] for the
+//     session char's active folders (scoped off session.characterID).
+//   • SearchFoldersWithAdminAccess()  — the char's personal + admin-access folders.
+//   • GetFolderInfo(folderID)         — one folder (only when folderID is given);
+//     resolveFolderView gates it, so a folder the char cannot access is refused
+//     (surfaced as this read's error code), never revealed.
+app.get("/api/bridge/bookmarks", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const folderID = Number(req.query.folderID) || 0;
+  try {
+    const [active, adminFolders, folderInfo] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "accessGroupBookmarkMgr", "GetMyActiveBookmarks", [], null),
+      heldTopLevelCall(held, req.webSessionID, "accessGroupBookmarkMgr", "SearchFoldersWithAdminAccess", [], null),
+      folderID > 0
+        ? heldTopLevelCall(held, req.webSessionID, "accessGroupBookmarkMgr", "GetFolderInfo", [folderID], null)
+        : Promise.resolve({ result: null }),
+    ]);
+    if (surfaceLostSession([active, adminFolders, folderInfo], next)) {
+      return;
+    }
+    res.json({
+      ok: true,
+      active: settledReadValue(active),
+      adminFolders: settledReadValue(adminFolders),
+      folderInfo: settledReadValue(folderInfo),
+      errors: {
+        active: settledReadCode(active),
+        adminFolders: settledReadCode(adminFolders),
+        folderInfo: settledReadCode(folderInfo),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// --- R58 plumbing sweep: charMgr social/profile reads (no UI) ----------------
+// PLUMBING ONLY: three routes make the charMgr social/profile READS reachable +
+// decodable so a later goal builds UI cheaply. No panel/tab/store slice ships.
+// Every read is an allowlisted TOP-LEVEL call on the held session; the profile /
+// notes / contact reads scope to the logged-in character server-side (arg-less,
+// or session-scoped), so the browser cannot point one at another character. The
+// raw retail-shaped results ship out; the browser decodes them
+// (web/src/bridge/{characterProfile,characterNotes,contactList}.ts).
+
+// A non-negative integer from a query string, or a fallback. Used for the two
+// notes reads that take an id argument (GetOwnerNote(noteID) / GetNote(itemID)).
+function nonNegativeIntQuery(value, fallback) {
+  const numeric = Number.parseInt(String(value ?? ""), 10);
+  return Number.isFinite(numeric) && numeric >= 0 ? numeric : fallback;
+}
+
+// GET /api/bridge/character-profile — the charMgr profile/identity cluster, as
+// SEVEN independent TOP-LEVEL reads (Promise.allSettled; empty ≠ failed, each
+// read carries its own error code):
+//   • GetPublicInfo            -> util.KeyVal (the older public-info shape).
+//   • GetHomeStationRow        -> util.KeyVal (home station as a "row").
+//   • GetCharacterCreationDate -> {type:"long"} FILETIME.
+//   • GetSettingsInfo          -> [<py2 codeobject buffer>, 0] (opaque bytes).
+//   • GetPaperdollState        -> an INT (0..4 recustomization state).
+//   • GetCohortsForCharacter   -> {type:"list", items:[]} (empty-by-design stub).
+//   • GetPrivateInfoOnCorpChange -> CachedMethodCallResult wrapping util.KeyVal
+//     {corporationID, corporationDateTime(long)}.
+// All arg-less, so each handler scopes to session.characterID. Raw shapes ship
+// out, decoded browser-side (web/src/bridge/characterProfile.ts). SESSION_NOT_FOUND
+// surfaces via next() so the page returns to character select.
+app.get("/api/bridge/character-profile", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const [
+      publicInfo,
+      homeStationRow,
+      creationDate,
+      settingsInfo,
+      paperdollState,
+      cohorts,
+      corpChange,
+    ] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "charMgr", "GetPublicInfo", [], null),
+      heldTopLevelCall(held, req.webSessionID, "charMgr", "GetHomeStationRow", [], null),
+      heldTopLevelCall(held, req.webSessionID, "charMgr", "GetCharacterCreationDate", [], null),
+      heldTopLevelCall(held, req.webSessionID, "charMgr", "GetSettingsInfo", [], null),
+      heldTopLevelCall(held, req.webSessionID, "charMgr", "GetPaperdollState", [], null),
+      heldTopLevelCall(held, req.webSessionID, "charMgr", "GetCohortsForCharacter", [], null),
+      heldTopLevelCall(held, req.webSessionID, "charMgr", "GetPrivateInfoOnCorpChange", [], null),
+    ]);
+    const settled = [
+      publicInfo,
+      homeStationRow,
+      creationDate,
+      settingsInfo,
+      paperdollState,
+      cohorts,
+      corpChange,
+    ];
+    for (const outcome of settled) {
+      if (outcome.status === "rejected" && outcome.reason && outcome.reason.code === "SESSION_NOT_FOUND") {
+        next(outcome.reason);
+        return;
+      }
+    }
+    const settledCode = (outcome) =>
+      outcome.status === "rejected"
+        ? String((outcome.reason && outcome.reason.code) || "READ_FAILED")
+        : null;
+    const settledValue = (outcome) =>
+      outcome.status === "fulfilled" ? outcome.value.result : null;
+    res.json({
+      ok: true,
+      publicInfo: settledValue(publicInfo),
+      homeStationRow: settledValue(homeStationRow),
+      creationDate: settledValue(creationDate),
+      settingsInfo: settledValue(settingsInfo),
+      paperdollState: settledValue(paperdollState),
+      cohorts: settledValue(cohorts),
+      corpChange: settledValue(corpChange),
+      errors: {
+        publicInfo: settledCode(publicInfo),
+        homeStationRow: settledCode(homeStationRow),
+        creationDate: settledCode(creationDate),
+        settingsInfo: settledCode(settingsInfo),
+        paperdollState: settledCode(paperdollState),
+        cohorts: settledCode(cohorts),
+        corpChange: settledCode(corpChange),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/bridge/character-notes — the character NOTES cluster, as THREE
+// independent reads (Promise.allSettled):
+//   • GetOwnerNoteLabels()     -> Rowset[noteID, label] (the note index; the
+//     handler lazily seeds a default "S:Folders" note, so this is never empty).
+//   • GetOwnerNote(noteID)     -> list[util.KeyVal{noteID, label, note}] (one
+//     owner note; the empty payload for an unknown id). noteID from ?noteID=,
+//     default 1 (the always-present folders note).
+//   • GetNote(itemID)          -> a bare STRING (a note kept ABOUT an entity;
+//     "" for Farmer, who has none). itemID from ?itemID=, default 1.
+// GetOwnerNoteLabels / GetOwnerNote are session-scoped; the note WRITERS stay
+// refused. Raw shapes ship out, decoded browser-side
+// (web/src/bridge/characterNotes.ts).
+app.get("/api/bridge/character-notes", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const noteID = nonNegativeIntQuery(req.query.noteID, 1);
+  const itemID = nonNegativeIntQuery(req.query.itemID, 1);
+  try {
+    const [labels, ownerNote, entityNote] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "charMgr", "GetOwnerNoteLabels", [], null),
+      heldTopLevelCall(held, req.webSessionID, "charMgr", "GetOwnerNote", [noteID], null),
+      heldTopLevelCall(held, req.webSessionID, "charMgr", "GetNote", [itemID], null),
+    ]);
+    for (const outcome of [labels, ownerNote, entityNote]) {
+      if (outcome.status === "rejected" && outcome.reason && outcome.reason.code === "SESSION_NOT_FOUND") {
+        next(outcome.reason);
+        return;
+      }
+    }
+    const settledCode = (outcome) =>
+      outcome.status === "rejected"
+        ? String((outcome.reason && outcome.reason.code) || "READ_FAILED")
+        : null;
+    const settledValue = (outcome) =>
+      outcome.status === "fulfilled" ? outcome.value.result : null;
+    res.json({
+      ok: true,
+      requested: { noteID, itemID },
+      labels: settledValue(labels),
+      ownerNote: settledValue(ownerNote),
+      entityNote: settledValue(entityNote),
+      errors: {
+        labels: settledCode(labels),
+        ownerNote: settledCode(ownerNote),
+        entityNote: settledCode(entityNote),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/bridge/contact-list — the personal contacts / watchlist / blocked
+// owners (charMgr.GetContactList, session-scoped, no args). A single read ->
+// util.KeyVal{addresses: Rowset, blocked: Rowset}. Empty for Farmer (no contacts)
+// is a REAL empty state, not a failure. ⚠ Contact + blocked-owner IDs are entity
+// ids the browser resolves to names (R7d); the raw shape ships out untouched.
+app.get("/api/bridge/contact-list", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const outcome = await heldTopLevelCall(
+      held,
+      req.webSessionID,
+      "charMgr",
+      "GetContactList",
+      [],
+      null,
+    );
+    res.json({ ok: true, contactList: outcome.result });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// --- R59 plumbing sweep: comms reads — mail aux / notifications / calendar ----
+// PLUMBING ONLY: three routes make the mail-aux, notification, and calendar READS
+// reachable + decodable so a later goal builds UI cheaply. No panel/tab/store
+// slice ships. Every read is an allowlisted TOP-LEVEL call on the held session,
+// scoped to the logged-in character server-side (arg-less, session-scoped, or a
+// plain id/month arg the browser supplies), so a browser cannot point one at
+// another character's mailbox/notifications/calendar. Each route batches its
+// reads with Promise.allSettled (empty ≠ failed; each read carries its own error
+// code); a SESSION_NOT_FOUND on any read surfaces via next() so the page returns
+// to character select. The raw retail-shaped results ship out; the browser
+// decodes them (web/src/bridge/{mailAux,notifications,calendar}.ts).
+
+// GET /api/bridge/mail-aux — the mail LABELS + MAILING LISTS beside the R17
+// mailbox reads, as FIVE independent reads (Promise.allSettled):
+//   • mailMgr.GetLabels()            -> {type:"dict"} of labelID -> util.KeyVal
+//     (the character's mail folders/labels; session-scoped, arg-less).
+//   • mailingListsMgr.GetJoinedLists()-> {type:"dict"} of listID -> util.KeyVal
+//     (the lists this character has joined; session-scoped, arg-less). Empty for
+//     Farmer (no lists) is a REAL empty state, not a failure.
+//   • mailingListsMgr.GetInfo(listID)   -> util.KeyVal | null (one list summary).
+//   • mailingListsMgr.GetMembers(listID)-> {type:"dict"} memberID -> accessLevel.
+//   • mailingListsMgr.GetSettings(listID)-> util.KeyVal | null (list settings).
+// listID from ?listID= (default 0 -> the unknown-list path returns null/empty,
+// a legitimate answer). ⚠ label/member/entity IDs stay as data for later name
+// resolution (R7d); the raw shapes ship out untouched. The mail label writers
+// and every mailingLists writer stay refused server-side.
+app.get("/api/bridge/mail-aux", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const listID = nonNegativeIntQuery(req.query.listID, 0);
+  try {
+    const [labels, joinedLists, listInfo, listMembers, listSettings] =
+      await Promise.allSettled([
+        heldTopLevelCall(held, req.webSessionID, "mailMgr", "GetLabels", [], null),
+        heldTopLevelCall(held, req.webSessionID, "mailingListsMgr", "GetJoinedLists", [], null),
+        heldTopLevelCall(held, req.webSessionID, "mailingListsMgr", "GetInfo", [listID], null),
+        heldTopLevelCall(held, req.webSessionID, "mailingListsMgr", "GetMembers", [listID], null),
+        heldTopLevelCall(held, req.webSessionID, "mailingListsMgr", "GetSettings", [listID], null),
+      ]);
+    const settled = [labels, joinedLists, listInfo, listMembers, listSettings];
+    for (const outcome of settled) {
+      if (outcome.status === "rejected" && outcome.reason && outcome.reason.code === "SESSION_NOT_FOUND") {
+        next(outcome.reason);
+        return;
+      }
+    }
+    const settledCode = (outcome) =>
+      outcome.status === "rejected"
+        ? String((outcome.reason && outcome.reason.code) || "READ_FAILED")
+        : null;
+    const settledValue = (outcome) =>
+      outcome.status === "fulfilled" ? outcome.value.result : null;
+    res.json({
+      ok: true,
+      requested: { listID },
+      labels: settledValue(labels),
+      joinedLists: settledValue(joinedLists),
+      listInfo: settledValue(listInfo),
+      listMembers: settledValue(listMembers),
+      listSettings: settledValue(listSettings),
+      errors: {
+        labels: settledCode(labels),
+        joinedLists: settledCode(joinedLists),
+        listInfo: settledCode(listInfo),
+        listMembers: settledCode(listMembers),
+        listSettings: settledCode(listSettings),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/bridge/notifications — the notificationMgr reads, as THREE independent
+// reads (Promise.allSettled):
+//   • GetAllNotifications([fromID]) -> a BARE ARRAY of util.KeyVal notification
+//     DTOs {notificationID, typeID, senderID, receiverID, processed, created
+//     (long), data}. fromID from ?fromID= (default 0 -> all).
+//   • GetUnprocessed()             -> the unread subset, same bare-array shape.
+//   • GetByGroupID(groupID)        -> the notifications in one group. groupID
+//     from ?groupID= (default 0).
+// All session-scoped; a characterID<=0 or no notifications yields [] — a REAL
+// empty state for Farmer. ⚠ senderID is an entity id kept as data (R7d); the
+// per-type `data` payload ships through untouched. The Mark*/Delete* notification
+// writers stay refused. Decoded browser-side (web/src/bridge/notifications.ts).
+app.get("/api/bridge/notifications", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const fromID = nonNegativeIntQuery(req.query.fromID, 0);
+  const groupID = nonNegativeIntQuery(req.query.groupID, 0);
+  try {
+    const [all, unprocessed, byGroup] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "notificationMgr", "GetAllNotifications", [fromID], null),
+      heldTopLevelCall(held, req.webSessionID, "notificationMgr", "GetUnprocessed", [], null),
+      heldTopLevelCall(held, req.webSessionID, "notificationMgr", "GetByGroupID", [groupID], null),
+    ]);
+    for (const outcome of [all, unprocessed, byGroup]) {
+      if (outcome.status === "rejected" && outcome.reason && outcome.reason.code === "SESSION_NOT_FOUND") {
+        next(outcome.reason);
+        return;
+      }
+    }
+    const settledCode = (outcome) =>
+      outcome.status === "rejected"
+        ? String((outcome.reason && outcome.reason.code) || "READ_FAILED")
+        : null;
+    const settledValue = (outcome) =>
+      outcome.status === "fulfilled" ? outcome.value.result : null;
+    res.json({
+      ok: true,
+      requested: { fromID, groupID },
+      all: settledValue(all),
+      unprocessed: settledValue(unprocessed),
+      byGroup: settledValue(byGroup),
+      errors: {
+        all: settledCode(all),
+        unprocessed: settledCode(unprocessed),
+        byGroup: settledCode(byGroup),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/bridge/calendar — the calendar READS across calendarMgr + the
+// (top-level, NOT bound) calendarProxy, as FOUR independent reads
+// (Promise.allSettled):
+//   • calendarMgr.GetResponsesForCharacter() -> {type:"list"} of util.KeyVal
+//     {eventID, status} — this character's own event responses (session-scoped).
+//   • calendarProxy.GetEventList(month, year) -> [ {type:"list"} of event-row
+//     KeyVals, null, null ] — the events visible in one month. month from ?month=
+//     (default the current UTC month, 1-12), year from ?year= (default current).
+//   • calendarMgr.GetResponsesToEvent(eventID[, ownerID]) -> {type:"list"} of
+//     util.KeyVal{characterID, status} — the responses to one event.
+//   • calendarProxy.GetEventDetails(eventID, ownerID) -> util.KeyVal{eventText,
+//     creatorID} — one event's body. ⚠ GetEventDetails/GetResponsesToEvent need a
+//     real eventID; with the default 0 (Farmer has no events) the handler rejects
+//     ("no such event") — a legitimate outcome captured as this read's error code,
+//     NOT a route failure. eventID from ?eventID=, ownerID from ?ownerID=.
+// ⚠ ownerID/eventID/characterID/creatorID stay as data for later resolution
+// (R7d). Decoded browser-side (web/src/bridge/calendar.ts).
+app.get("/api/bridge/calendar", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const now = new Date();
+  const month = nonNegativeIntQuery(req.query.month, now.getUTCMonth() + 1);
+  const year = nonNegativeIntQuery(req.query.year, now.getUTCFullYear());
+  const eventID = nonNegativeIntQuery(req.query.eventID, 0);
+  const ownerID = nonNegativeIntQuery(req.query.ownerID, 0);
+  try {
+    const [responsesForCharacter, eventList, responsesToEvent, eventDetails] =
+      await Promise.allSettled([
+        heldTopLevelCall(held, req.webSessionID, "calendarMgr", "GetResponsesForCharacter", [], null),
+        heldTopLevelCall(held, req.webSessionID, "calendarProxy", "GetEventList", [month, year], null),
+        heldTopLevelCall(held, req.webSessionID, "calendarMgr", "GetResponsesToEvent", [eventID, ownerID || null], null),
+        heldTopLevelCall(held, req.webSessionID, "calendarProxy", "GetEventDetails", [eventID, ownerID || null], null),
+      ]);
+    const settled = [responsesForCharacter, eventList, responsesToEvent, eventDetails];
+    for (const outcome of settled) {
+      if (outcome.status === "rejected" && outcome.reason && outcome.reason.code === "SESSION_NOT_FOUND") {
+        next(outcome.reason);
+        return;
+      }
+    }
+    const settledCode = (outcome) =>
+      outcome.status === "rejected"
+        ? String((outcome.reason && outcome.reason.code) || "READ_FAILED")
+        : null;
+    const settledValue = (outcome) =>
+      outcome.status === "fulfilled" ? outcome.value.result : null;
+    res.json({
+      ok: true,
+      requested: { month, year, eventID, ownerID },
+      responsesForCharacter: settledValue(responsesForCharacter),
+      eventList: settledValue(eventList),
+      responsesToEvent: settledValue(responsesToEvent),
+      eventDetails: settledValue(eventDetails),
+      errors: {
+        responsesForCharacter: settledCode(responsesForCharacter),
+        eventList: settledCode(eventList),
+        responsesToEvent: settledCode(responsesToEvent),
+        eventDetails: settledCode(eventDetails),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// --- R60 plumbing sweep: lookup / presence / social reads (no UI) -------------
+// PLUMBING ONLY: three routes make the lookupSvc SEARCH, onlineStatus presence,
+// and LSC/account social READS reachable + decodable so a later goal builds UI
+// cheaply. No panel/tab/store slice ships. Every read is an allowlisted
+// TOP-LEVEL call on the held session, scoped to the logged-in character
+// server-side; each route batches its reads with Promise.allSettled (empty ≠
+// failed; each read carries its own error code), and a SESSION_NOT_FOUND on any
+// read surfaces via next() so the page returns to character select. The raw
+// retail-shaped results ship out; the browser decodes them
+// (web/src/bridge/{lookup,presence,social}.ts).
+
+// A trimmed string from a query param, or "". Used for the lookup search term.
+function stringQuery(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+// GET /api/bridge/lookup?q=&exact=&groupID= — the lookupSvc name/id SEARCH, as
+// NINE independent reads (Promise.allSettled). ⚠ THESE TAKE A QUERY ARG: the
+// retail signature is Lookup*(searchStr, exact) read positionally (args[0] the
+// search string, args[1] the exact-match flag, 0 = partial/default), so the
+// route forwards [q, exact] to the eight name searches and [groupID, q, exact]
+// to LookupKnownLocationsByGroup (whose signature is (groupID, searchStr, exact)).
+//   • LookupCharacters / LookupEvePlayerCharacters -> character rows.
+//   • LookupCorporations / LookupFactions           -> corp / faction rows.
+//   • LookupOwners / LookupPCOwners / LookupNoneNPCAccountOwners -> owner rows.
+//   • LookupKnownLocationsByGroup -> location rows for the groupID (default 5,
+//     solar system).
+//   • LookupWarableCorporationsOrAlliances -> owners a war can be declared on.
+// ⚠ A too-short/empty query legitimately returns an EMPTY list from every read
+// (the search filter drops everything) — a real "no matches" answer, not a
+// failure. Entity ids in every row stay as data for later name resolution (R7d);
+// the raw shapes ship out untouched. lookupSvc has no mutating surface.
+app.get("/api/bridge/lookup", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const q = stringQuery(req.query.q);
+  const exact = nonNegativeIntQuery(req.query.exact, 0);
+  const groupID = nonNegativeIntQuery(req.query.groupID, 5);
+  try {
+    const [
+      characters,
+      evePlayerCharacters,
+      corporations,
+      factions,
+      owners,
+      pcOwners,
+      nonNPCAccountOwners,
+      knownLocationsByGroup,
+      warableOwners,
+    ] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "lookupSvc", "LookupCharacters", [q, exact], null),
+      heldTopLevelCall(held, req.webSessionID, "lookupSvc", "LookupEvePlayerCharacters", [q, exact], null),
+      heldTopLevelCall(held, req.webSessionID, "lookupSvc", "LookupCorporations", [q, exact], null),
+      heldTopLevelCall(held, req.webSessionID, "lookupSvc", "LookupFactions", [q, exact], null),
+      heldTopLevelCall(held, req.webSessionID, "lookupSvc", "LookupOwners", [q, exact], null),
+      heldTopLevelCall(held, req.webSessionID, "lookupSvc", "LookupPCOwners", [q, exact], null),
+      heldTopLevelCall(held, req.webSessionID, "lookupSvc", "LookupNoneNPCAccountOwners", [q, exact], null),
+      heldTopLevelCall(held, req.webSessionID, "lookupSvc", "LookupKnownLocationsByGroup", [groupID, q, exact], null),
+      heldTopLevelCall(held, req.webSessionID, "lookupSvc", "LookupWarableCorporationsOrAlliances", [q, exact], null),
+    ]);
+    const settled = [
+      characters,
+      evePlayerCharacters,
+      corporations,
+      factions,
+      owners,
+      pcOwners,
+      nonNPCAccountOwners,
+      knownLocationsByGroup,
+      warableOwners,
+    ];
+    for (const outcome of settled) {
+      if (outcome.status === "rejected" && outcome.reason && outcome.reason.code === "SESSION_NOT_FOUND") {
+        next(outcome.reason);
+        return;
+      }
+    }
+    const settledCode = (outcome) =>
+      outcome.status === "rejected"
+        ? String((outcome.reason && outcome.reason.code) || "READ_FAILED")
+        : null;
+    const settledValue = (outcome) =>
+      outcome.status === "fulfilled" ? outcome.value.result : null;
+    res.json({
+      ok: true,
+      requested: { q, exact, groupID },
+      characters: settledValue(characters),
+      evePlayerCharacters: settledValue(evePlayerCharacters),
+      corporations: settledValue(corporations),
+      factions: settledValue(factions),
+      owners: settledValue(owners),
+      pcOwners: settledValue(pcOwners),
+      nonNPCAccountOwners: settledValue(nonNPCAccountOwners),
+      knownLocationsByGroup: settledValue(knownLocationsByGroup),
+      warableOwners: settledValue(warableOwners),
+      errors: {
+        characters: settledCode(characters),
+        evePlayerCharacters: settledCode(evePlayerCharacters),
+        corporations: settledCode(corporations),
+        factions: settledCode(factions),
+        owners: settledCode(owners),
+        pcOwners: settledCode(pcOwners),
+        nonNPCAccountOwners: settledCode(nonNPCAccountOwners),
+        knownLocationsByGroup: settledCode(knownLocationsByGroup),
+        warableOwners: settledCode(warableOwners),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/bridge/presence?targetID= — the onlineStatus reads, as THREE
+// independent reads (Promise.allSettled). All scope off the SESSION observer:
+//   • GetOnlineStatus(targetID) -> a BARE BOOLEAN (is that character online).
+//     targetID from ?targetID= (default 0 -> false; no contact named).
+//   • GetInitialState()         -> a Rowset[contactID, online] (the observer's
+//     whole contact-presence snapshot; empty for a character with no contacts).
+//   • Prime()                   -> ⚠ NOT void here: delegates to GetInitialState,
+//     so it returns the SAME Rowset. Wired for completeness; the decoder treats
+//     it identically. ⚠ contactID stays as data for later name resolution (R7d).
+app.get("/api/bridge/presence", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const targetID = nonNegativeIntQuery(req.query.targetID, 0);
+  try {
+    const [onlineStatus, initialState, prime] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "onlineStatus", "GetOnlineStatus", [targetID], null),
+      heldTopLevelCall(held, req.webSessionID, "onlineStatus", "GetInitialState", [], null),
+      heldTopLevelCall(held, req.webSessionID, "onlineStatus", "Prime", [], null),
+    ]);
+    for (const outcome of [onlineStatus, initialState, prime]) {
+      if (outcome.status === "rejected" && outcome.reason && outcome.reason.code === "SESSION_NOT_FOUND") {
+        next(outcome.reason);
+        return;
+      }
+    }
+    const settledCode = (outcome) =>
+      outcome.status === "rejected"
+        ? String((outcome.reason && outcome.reason.code) || "READ_FAILED")
+        : null;
+    const settledValue = (outcome) =>
+      outcome.status === "fulfilled" ? outcome.value.result : null;
+    res.json({
+      ok: true,
+      requested: { targetID },
+      onlineStatus: settledValue(onlineStatus),
+      initialState: settledValue(initialState),
+      prime: settledValue(prime),
+      errors: {
+        onlineStatus: settledCode(onlineStatus),
+        initialState: settledCode(initialState),
+        prime: settledCode(prime),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/bridge/social — two unrelated social reads (Promise.allSettled):
+//   • LSC.GetChannels() -> a Rowset with the 16 channel-info columns, one line
+//     per channel the session is in (the docked Local channel). ownerID kept as
+//     data (R7d); the message/join/leave LSC writers stay refused.
+//   • account.GetDefaultContactCost() -> ⚠ null in this world (a `return null`
+//     stub; the CSPA contact charge is not modelled). A legitimate "no default
+//     cost" answer, not a failure.
+app.get("/api/bridge/social", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const [channels, defaultContactCost] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "LSC", "GetChannels", [], null),
+      heldTopLevelCall(held, req.webSessionID, "account", "GetDefaultContactCost", [], null),
+    ]);
+    for (const outcome of [channels, defaultContactCost]) {
+      if (outcome.status === "rejected" && outcome.reason && outcome.reason.code === "SESSION_NOT_FOUND") {
+        next(outcome.reason);
+        return;
+      }
+    }
+    const settledCode = (outcome) =>
+      outcome.status === "rejected"
+        ? String((outcome.reason && outcome.reason.code) || "READ_FAILED")
+        : null;
+    const settledValue = (outcome) =>
+      outcome.status === "fulfilled" ? outcome.value.result : null;
+    res.json({
+      ok: true,
+      channels: settledValue(channels),
+      defaultContactCost: settledValue(defaultContactCost),
+      errors: {
+        channels: settledCode(channels),
+        defaultContactCost: settledCode(defaultContactCost),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// --- R61 plumbing sweep: corp reads (corpmgr / corp LP; no UI) ----------------
+// PLUMBING ONLY: three routes make the corp READS reachable + decodable so a
+// later goal builds UI cheaply. No panel/tab/store slice ships. Every read is an
+// allowlisted TOP-LEVEL call on the held session; corp-scoped reads default to
+// the session corporation (held.corporationID) and char-scoped ones to the
+// session character, so a browser cannot point one at another owner. The raw
+// retail-shaped results ship out; the browser decodes them
+// (web/src/bridge/{corpInfo,corpAssets,corpLp}.ts).
+
+// GET /api/bridge/corp?corporationID=&charID=&memberID= — the corpmgr identity /
+// settings / audit reads, as SIX independent reads (Promise.allSettled; empty ≠
+// failed, each carries its own error code):
+//   • GetPublicInfo(corpID)              -> util.KeyVal (public corp identity).
+//   • GetCorporations(corpID)            -> a single util.Row (51 columns).
+//   • GetCorporationIDForCharacter(charID) -> a bare INT (the char's corp id).
+//   • GetAggressionSettings(corpID)      -> a named AggressionSettings object.
+//   • GetAggressionSettingsForCorps([corpID]) -> a per-corp dict of the same.
+//   • AuditMember(memberID)              -> ⚠ ONLY when ?memberID= is given (a
+//     2-tuple of CRowsets, DIRECTOR/AUDITOR-gated — the empty pair without the
+//     role, a legitimate state). corporationID defaults to the session corp,
+//     charID to the session character. Corp / char / member ids stay data (R7d).
+app.get("/api/bridge/corp", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const sessionCorpID = Number(held.corporationID) || 0;
+  const corporationID = nonNegativeIntQuery(req.query.corporationID, sessionCorpID);
+  const charID = nonNegativeIntQuery(req.query.charID, Number(held.characterID) || 0);
+  const memberID = nonNegativeIntQuery(req.query.memberID, 0);
+  const wantAudit = memberID > 0;
+  try {
+    const [
+      publicInfo,
+      corporations,
+      corporationIDForCharacter,
+      aggressionSettings,
+      aggressionSettingsForCorps,
+      auditMember,
+    ] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "corpmgr", "GetPublicInfo", [corporationID], null),
+      heldTopLevelCall(held, req.webSessionID, "corpmgr", "GetCorporations", [corporationID], null),
+      heldTopLevelCall(held, req.webSessionID, "corpmgr", "GetCorporationIDForCharacter", [charID], null),
+      heldTopLevelCall(held, req.webSessionID, "corpmgr", "GetAggressionSettings", [corporationID], null),
+      heldTopLevelCall(held, req.webSessionID, "corpmgr", "GetAggressionSettingsForCorps", [[corporationID]], null),
+      wantAudit
+        ? heldTopLevelCall(held, req.webSessionID, "corpmgr", "AuditMember", [memberID], null)
+        : Promise.resolve({ result: null }),
+    ]);
+    const settled = [
+      publicInfo,
+      corporations,
+      corporationIDForCharacter,
+      aggressionSettings,
+      aggressionSettingsForCorps,
+      auditMember,
+    ];
+    for (const outcome of settled) {
+      if (outcome.status === "rejected" && outcome.reason && outcome.reason.code === "SESSION_NOT_FOUND") {
+        next(outcome.reason);
+        return;
+      }
+    }
+    const settledCode = (outcome) =>
+      outcome.status === "rejected"
+        ? String((outcome.reason && outcome.reason.code) || "READ_FAILED")
+        : null;
+    const settledValue = (outcome) =>
+      outcome.status === "fulfilled" ? outcome.value.result : null;
+    res.json({
+      ok: true,
+      requested: { corporationID, charID, memberID: wantAudit ? memberID : null },
+      publicInfo: settledValue(publicInfo),
+      corporations: settledValue(corporations),
+      corporationIDForCharacter: settledValue(corporationIDForCharacter),
+      aggressionSettings: settledValue(aggressionSettings),
+      aggressionSettingsForCorps: settledValue(aggressionSettingsForCorps),
+      auditMember: settledValue(auditMember),
+      errors: {
+        publicInfo: settledCode(publicInfo),
+        corporations: settledCode(corporations),
+        corporationIDForCharacter: settledCode(corporationIDForCharacter),
+        aggressionSettings: settledCode(aggressionSettings),
+        aggressionSettingsForCorps: settledCode(aggressionSettingsForCorps),
+        // The audit read is only issued when a memberID was asked for; otherwise
+        // it resolves to a null result with no error.
+        auditMember: wantAudit ? settledCode(auditMember) : null,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/bridge/corp-assets?which=&locationID=&categoryID=&groupID=&typeID=&minimumQuantity=
+// — the corpmgr ASSET reads, as THREE independent reads (Promise.allSettled).
+// ⚠ ALL THREE RETURN A CRowset WRAPPED IN A CachedMethodCallResult — the browser
+// unwraps both layers (web/src/bridge/corpAssets.ts):
+//   • GetAssetInventory(corpID, which)  -> the corp's asset LOCATIONS for a bucket
+//     (`which`, default "offices").
+//   • GetAssetInventoryForLocation(corpID, locationID, which) -> ⚠ ONLY when
+//     ?locationID= is given; the ITEMS at one location.
+//   • SearchAssets(which, categoryID, groupID, typeID, minimumQuantity) -> matching
+//     LOCATIONS. ⚠ corporationID comes from the SESSION in the handler, not args.
+// corporationID defaults to the session corp. ⚠ Farmer's player corp 98000001 may
+// have SPARSE corp assets — an empty CRowset is a legitimate "no corp assets"
+// state, not a failure. Location / item / type ids stay data (R7d).
+app.get("/api/bridge/corp-assets", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const corporationID = Number(held.corporationID) || 0;
+  const which = stringQuery(req.query.which) || "offices";
+  const locationID = nonNegativeIntQuery(req.query.locationID, 0);
+  const categoryID = nonNegativeIntQuery(req.query.categoryID, 0);
+  const groupID = nonNegativeIntQuery(req.query.groupID, 0);
+  const typeID = nonNegativeIntQuery(req.query.typeID, 0);
+  const minimumQuantity = nonNegativeIntQuery(req.query.minimumQuantity, 0);
+  const wantLocation = locationID > 0;
+  try {
+    const [inventory, locationInventory, search] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "corpmgr", "GetAssetInventory", [corporationID, which], null),
+      wantLocation
+        ? heldTopLevelCall(
+            held,
+            req.webSessionID,
+            "corpmgr",
+            "GetAssetInventoryForLocation",
+            [corporationID, locationID, which],
+            null,
+          )
+        : Promise.resolve({ result: null }),
+      heldTopLevelCall(
+        held,
+        req.webSessionID,
+        "corpmgr",
+        "SearchAssets",
+        [which, categoryID, groupID, typeID, minimumQuantity],
+        null,
+      ),
+    ]);
+    for (const outcome of [inventory, locationInventory, search]) {
+      if (outcome.status === "rejected" && outcome.reason && outcome.reason.code === "SESSION_NOT_FOUND") {
+        next(outcome.reason);
+        return;
+      }
+    }
+    const settledCode = (outcome) =>
+      outcome.status === "rejected"
+        ? String((outcome.reason && outcome.reason.code) || "READ_FAILED")
+        : null;
+    const settledValue = (outcome) =>
+      outcome.status === "fulfilled" ? outcome.value.result : null;
+    res.json({
+      ok: true,
+      requested: {
+        corporationID,
+        which,
+        locationID: wantLocation ? locationID : null,
+        filters: { categoryID, groupID, typeID, minimumQuantity },
+      },
+      inventory: settledValue(inventory),
+      locationInventory: settledValue(locationInventory),
+      search: settledValue(search),
+      errors: {
+        inventory: settledCode(inventory),
+        // The per-location read is only issued when a locationID was asked for.
+        locationInventory: wantLocation ? settledCode(locationInventory) : null,
+        search: settledCode(search),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/bridge/corp-lp?corpID= — the corp LP reads, as TWO independent reads
+// (Promise.allSettled; empty ≠ failed):
+//   • LPSvc.GetAllMyCorporationWalletLPBalances() -> a CRowset[issuerCorpID,
+//     loyaltyPoints] (the SESSION corp's per-issuer LP; the corp sibling of R6's
+//     character balances). Empty for a corp with no LP is a REAL empty state.
+//   • LPStoreMgr.GetAvailableOffersFromCorp(corpID) -> {type:"list"} of offer
+//     KeyVals. ⚠ LPStoreMgr is a DISTINCT service from LPSvc. corpID defaults to
+//     the Heraldry corp (emblem offers) when ?corpID= is absent. issuerCorpID /
+//     typeIDs stay data (R7d); LP / ISK costs are bigint-safe.
+app.get("/api/bridge/corp-lp", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const corpID = nonNegativeIntQuery(req.query.corpID, 0);
+  const offersArgs = corpID > 0 ? [corpID] : [];
+  try {
+    const [balances, offers] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "LPSvc", "GetAllMyCorporationWalletLPBalances", [], null),
+      heldTopLevelCall(held, req.webSessionID, "LPStoreMgr", "GetAvailableOffersFromCorp", offersArgs, null),
+    ]);
+    for (const outcome of [balances, offers]) {
+      if (outcome.status === "rejected" && outcome.reason && outcome.reason.code === "SESSION_NOT_FOUND") {
+        next(outcome.reason);
+        return;
+      }
+    }
+    const settledCode = (outcome) =>
+      outcome.status === "rejected"
+        ? String((outcome.reason && outcome.reason.code) || "READ_FAILED")
+        : null;
+    const settledValue = (outcome) =>
+      outcome.status === "fulfilled" ? outcome.value.result : null;
+    res.json({
+      ok: true,
+      requested: { corpID: corpID > 0 ? corpID : null },
+      balances: settledValue(balances),
+      offers: settledValue(offers),
+      errors: {
+        balances: settledCode(balances),
+        offers: settledCode(offers),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// --- R80 plumbing sweep: corpRegistry batch A (member / info core; no UI) -------
+// PLUMBING ONLY: three routes make the corpRegistry MEMBER + REGISTRY-META READS
+// reachable + decodable so a later goal builds UI cheaply. No panel/tab/store slice
+// ships. corpRegistry is retail-bound per corp (eveMoniker.GetCorpRegistry(corpID)),
+// but the gateway dispatches these TOP-LEVEL on the held session; every handler
+// resolves its corp from the SESSION (resolveCorporationID), and corpRegistry.
+// MachoBindObject is NOT allowlisted, so a browser cannot bind a foreign corp. The
+// raw retail-shaped results ship out; the browser decodes them
+// (web/src/bridge/{corpMembers,corpMemberTracking,corpRegistryMeta}.ts).
+
+// GET /api/bridge/corp-members?page=&memberID=&memberIDs= — the corp ROSTER +
+// member-tracking reads, as SIX independent reads (Promise.allSettled; empty ≠
+// failed, each its own error code). All SESSION-CORP-SCOPED (args cannot redirect
+// the corp; a foreign memberID misses the session corp's member table):
+//   • GetMembersPaged(page)          -> one page of the session corp's members
+//     (PagedResultSet; page defaults to 1).
+//   • GetEveOwners()                 -> name-resolution rows for the corp members.
+//   • GetMemberTrackingInfo()        -> member tracking (last-login / location),
+//     wrapped in a CachedMethodCallResult.
+//   • GetMemberTrackingInfoSimple()  -> the SAME tracking rows, un-cached.
+//   • GetMember(memberID)            -> ⚠ ONLY when ?memberID= is given; that member
+//     (null when the id is not in the session corp).
+//   • GetMembersByIds([memberIDs])   -> ⚠ ONLY when ?memberIDs= (a CSV) is given; the
+//     members among those ids (foreign ids drop out). Member / char ids stay data (R7d).
+app.get("/api/bridge/corp-members", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const page = Math.max(1, nonNegativeIntQuery(req.query.page, 1));
+  const memberID = nonNegativeIntQuery(req.query.memberID, 0);
+  const memberIDs = String(req.query.memberIDs || "")
+    .split(",")
+    .map((token) => Number(String(token).trim()))
+    .filter((value) => Number.isSafeInteger(value) && value > 0);
+  const wantMember = memberID > 0;
+  const wantByIds = memberIDs.length > 0;
+  try {
+    const [
+      membersPaged,
+      eveOwners,
+      trackingInfo,
+      trackingSimple,
+      member,
+      membersByIds,
+    ] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "corpRegistry", "GetMembersPaged", [page], null),
+      heldTopLevelCall(held, req.webSessionID, "corpRegistry", "GetEveOwners", [], null),
+      heldTopLevelCall(held, req.webSessionID, "corpRegistry", "GetMemberTrackingInfo", [], null),
+      heldTopLevelCall(held, req.webSessionID, "corpRegistry", "GetMemberTrackingInfoSimple", [], null),
+      wantMember
+        ? heldTopLevelCall(held, req.webSessionID, "corpRegistry", "GetMember", [memberID], null)
+        : Promise.resolve({ result: null }),
+      wantByIds
+        ? heldTopLevelCall(held, req.webSessionID, "corpRegistry", "GetMembersByIds", [memberIDs], null)
+        : Promise.resolve({ result: null }),
+    ]);
+    const settled = [membersPaged, eveOwners, trackingInfo, trackingSimple, member, membersByIds];
+    for (const outcome of settled) {
+      if (outcome.status === "rejected" && outcome.reason && outcome.reason.code === "SESSION_NOT_FOUND") {
+        next(outcome.reason);
+        return;
+      }
+    }
+    const settledCode = (outcome) =>
+      outcome.status === "rejected"
+        ? String((outcome.reason && outcome.reason.code) || "READ_FAILED")
+        : null;
+    const settledValue = (outcome) =>
+      outcome.status === "fulfilled" ? outcome.value.result : null;
+    res.json({
+      ok: true,
+      requested: {
+        page,
+        memberID: wantMember ? memberID : null,
+        memberIDs: wantByIds ? memberIDs : null,
+      },
+      membersPaged: settledValue(membersPaged),
+      eveOwners: settledValue(eveOwners),
+      trackingInfo: settledValue(trackingInfo),
+      trackingSimple: settledValue(trackingSimple),
+      member: settledValue(member),
+      membersByIds: settledValue(membersByIds),
+      errors: {
+        membersPaged: settledCode(membersPaged),
+        eveOwners: settledCode(eveOwners),
+        trackingInfo: settledCode(trackingInfo),
+        trackingSimple: settledCode(trackingSimple),
+        member: wantMember ? settledCode(member) : null,
+        membersByIds: wantByIds ? settledCode(membersByIds) : null,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/bridge/corp-registry-meta — the session corp's TITLE scheme, contact
+// LABELS, CONTACTS and BULLETINS, as FOUR independent reads (Promise.allSettled).
+// All SESSION-CORP-SCOPED (args ignored). ⚠ Farmer's corp seeds no labels/contacts/
+// bulletins — an empty CIndexedRowset / dict / CRowset is a legitimate state, not a
+// failure. The default 16-title scheme ships even for a fresh corp. ids stay data (R7d):
+//   • GetTitles() / GetLabels() / GetCorporateContacts() / GetBulletins().
+app.get("/api/bridge/corp-registry-meta", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const [titles, labels, contacts, bulletins] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "corpRegistry", "GetTitles", [], null),
+      heldTopLevelCall(held, req.webSessionID, "corpRegistry", "GetLabels", [], null),
+      heldTopLevelCall(held, req.webSessionID, "corpRegistry", "GetCorporateContacts", [], null),
+      heldTopLevelCall(held, req.webSessionID, "corpRegistry", "GetBulletins", [], null),
+    ]);
+    for (const outcome of [titles, labels, contacts, bulletins]) {
+      if (outcome.status === "rejected" && outcome.reason && outcome.reason.code === "SESSION_NOT_FOUND") {
+        next(outcome.reason);
+        return;
+      }
+    }
+    const settledCode = (outcome) =>
+      outcome.status === "rejected"
+        ? String((outcome.reason && outcome.reason.code) || "READ_FAILED")
+        : null;
+    const settledValue = (outcome) =>
+      outcome.status === "fulfilled" ? outcome.value.result : null;
+    res.json({
+      ok: true,
+      titles: settledValue(titles),
+      labels: settledValue(labels),
+      contacts: settledValue(contacts),
+      bulletins: settledValue(bulletins),
+      errors: {
+        titles: settledCode(titles),
+        labels: settledCode(labels),
+        contacts: settledCode(contacts),
+        bulletins: settledCode(bulletins),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/bridge/corp-char-info?charID= — corpRegistry.GetInfoWindowDataForChar,
+// the character info-window corp data (corpID / allianceID / factionID / the char's
+// title + title1..title16 scheme). charID defaults to the SESSION character.
+// ⚠ CROSS-CHARACTER by design: the handler derives the corp from the TARGET char, so
+// a foreign charID returns THAT char's corp identity + title scheme — an arg-injection
+// leak kept pre-plumbed and FLAGGED in docs/arg-injection-leak-handoff.md (operator
+// flag-only). corpID/allianceID/the char's own title are retail-public info-window
+// fields; the full 16-title-name dump of the foreign corp is the sensitive part.
+app.get("/api/bridge/corp-char-info", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const charID = nonNegativeIntQuery(req.query.charID, Number(held.characterID) || 0);
+  try {
+    const infoWindow = await heldTopLevelCall(
+      held,
+      req.webSessionID,
+      "corpRegistry",
+      "GetInfoWindowDataForChar",
+      charID > 0 ? [charID] : [],
+      null,
+    );
+    res.json({
+      ok: true,
+      requested: { charID: charID > 0 ? charID : null },
+      infoWindow: infoWindow.result,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// --- R81 plumbing sweep: corpRegistry batch B (shares / applications / welcome
+// mail; no UI) --------------------------------------------------------------
+// PLUMBING ONLY: three routes make the corpRegistry SHARE-LEDGER, APPLICATION and
+// WELCOME-MAIL reads reachable + decodable so a later goal builds UI cheaply. No
+// panel/tab/store slice ships. Same dispatch as R80 batch A: corpRegistry is retail-
+// bound per corp (eveMoniker.GetCorpRegistry(corpID)) but the gateway dispatches these
+// TOP-LEVEL on the held session; every handler resolves its corp (or char) from the
+// SESSION (resolveCorporationID / resolveCharacterID), and corpRegistry.MachoBindObject
+// is NOT allowlisted, so a browser cannot bind a foreign corp. Decoders in
+// web/src/bridge/{corpShares,corpMemberQueries,corpApplications}.ts.
+
+// GET /api/bridge/corp-shares?corpID=&company= — the corp SHARE ledger + the
+// caller's own shareholding, as TWO independent reads (Promise.allSettled).
+//   • GetShareholders(corpID)        -> the corp's full shareholder ledger (a Rowset
+//     of [shareholderID, corporationID, shares]). corpID defaults to the SESSION corp.
+//     ⚠ ARG-INJECTION: args[0] IS a caller-chosen corpID — a foreign ?corpID= returns
+//     THAT corp's ledger with no session check (leak kept pre-plumbed + FLAGGED in
+//     docs/arg-injection-leak-handoff.md; the ?corpID= override exists to prove it).
+//   • GetSharesByShareholder(flag)   -> the caller's OWN shareholding, as a CRowset of
+//     one [shareholderID, corporationID, shares] row. ⚠ args[0] is a COMPANY-vs-PERSONAL
+//     1/0 FLAG (?company=1 → the session corp's own shares in itself; else the session
+//     CHAR's shares), NOT a shareholder lookup — SESSION-SCOPED, cannot read a foreign
+//     holder. shares / ids stay data (R7d).
+app.get("/api/bridge/corp-shares", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const corpID = nonNegativeIntQuery(req.query.corpID, 0);
+  const company = nonNegativeIntQuery(req.query.company, 0) === 1 ? 1 : 0;
+  try {
+    const [shareholders, sharesByShareholder] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "corpRegistry", "GetShareholders", corpID > 0 ? [corpID] : [], null),
+      heldTopLevelCall(held, req.webSessionID, "corpRegistry", "GetSharesByShareholder", [company], null),
+    ]);
+    for (const outcome of [shareholders, sharesByShareholder]) {
+      if (outcome.status === "rejected" && outcome.reason && outcome.reason.code === "SESSION_NOT_FOUND") {
+        next(outcome.reason);
+        return;
+      }
+    }
+    const settledCode = (outcome) =>
+      outcome.status === "rejected"
+        ? String((outcome.reason && outcome.reason.code) || "READ_FAILED")
+        : null;
+    const settledValue = (outcome) =>
+      outcome.status === "fulfilled" ? outcome.value.result : null;
+    res.json({
+      ok: true,
+      requested: { corpID: corpID > 0 ? corpID : null, company: company === 1 },
+      shareholders: settledValue(shareholders),
+      sharesByShareholder: settledValue(sharesByShareholder),
+      errors: {
+        shareholders: settledCode(shareholders),
+        sharesByShareholder: settledCode(sharesByShareholder),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/bridge/corp-membership-queries — the session corp's member-id QUERY reads,
+// as FOUR independent reads (Promise.allSettled). All SESSION-CORP-SCOPED (args ignored
+// or applied WITHIN the session corp; a foreign id cannot redirect the corp):
+//   • GetMemberIDsByQuery([]) -> the session corp's member characterIDs (an empty query
+//     = no criteria = ALL members; a structured criteria list is not exposed here).
+//   • GetMemberIDsWithMoreThanAvgShares() -> members holding above the corp average.
+//   • GetPendingAutoKicks()   -> the pending auto-kick queue (empty for a healthy corp).
+//   • GetNumberOfPotentialCEOs() -> the member ids eligible to become CEO. All lists of
+//     characterIDs — ids stay data (R7d). Empty is a legitimate answer.
+app.get("/api/bridge/corp-membership-queries", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const [byQuery, aboveAvgShares, pendingAutoKicks, potentialCEOs] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "corpRegistry", "GetMemberIDsByQuery", [[], false, false], null),
+      heldTopLevelCall(held, req.webSessionID, "corpRegistry", "GetMemberIDsWithMoreThanAvgShares", [], null),
+      heldTopLevelCall(held, req.webSessionID, "corpRegistry", "GetPendingAutoKicks", [], null),
+      heldTopLevelCall(held, req.webSessionID, "corpRegistry", "GetNumberOfPotentialCEOs", [], null),
+    ]);
+    for (const outcome of [byQuery, aboveAvgShares, pendingAutoKicks, potentialCEOs]) {
+      if (outcome.status === "rejected" && outcome.reason && outcome.reason.code === "SESSION_NOT_FOUND") {
+        next(outcome.reason);
+        return;
+      }
+    }
+    const settledCode = (outcome) =>
+      outcome.status === "rejected"
+        ? String((outcome.reason && outcome.reason.code) || "READ_FAILED")
+        : null;
+    const settledValue = (outcome) =>
+      outcome.status === "fulfilled" ? outcome.value.result : null;
+    res.json({
+      ok: true,
+      byQuery: settledValue(byQuery),
+      aboveAvgShares: settledValue(aboveAvgShares),
+      pendingAutoKicks: settledValue(pendingAutoKicks),
+      potentialCEOs: settledValue(potentialCEOs),
+      errors: {
+        byQuery: settledCode(byQuery),
+        aboveAvgShares: settledCode(aboveAvgShares),
+        pendingAutoKicks: settledCode(pendingAutoKicks),
+        potentialCEOs: settledCode(potentialCEOs),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/bridge/corp-applications — the corp/char APPLICATION reads + the corp
+// WELCOME MAIL, as SIX independent reads (Promise.allSettled). ⚠ A small corp with no
+// pending applications is a legitimate EMPTY state, not a failure. All SESSION-SCOPED
+// (args ignored):
+//   • GetApplications()        -> the SESSION corp's incoming applications, a dict
+//     {applicantCharID -> list of application packedrows}. (Retail director-gated; eve.js
+//     is own-corp only.)
+//   • GetOldApplications()     -> the session corp's ARCHIVED applications (a list).
+//   • GetMyApplications()      -> the SESSION char's own applications across corps, a
+//     dict {corpID -> list of application packedrows}.
+//   • GetMyOldApplications()   -> the session char's own ARCHIVED applications (a list).
+//   • GetAllianceApplications() -> the session corp's OUTGOING alliance applications, an
+//     IndexRowset keyed by allianceID.
+//   • GetCorpWelcomeMail()     -> the corp welcome-mail KeyVal (editor charID / change
+//     FILETIME / the mail string). FILETIMEs bigint-safe; charIDs stay data (R7d).
+app.get("/api/bridge/corp-applications", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const [applications, oldApplications, myApplications, myOldApplications, allianceApplications, welcomeMail] =
+      await Promise.allSettled([
+        heldTopLevelCall(held, req.webSessionID, "corpRegistry", "GetApplications", [], null),
+        heldTopLevelCall(held, req.webSessionID, "corpRegistry", "GetOldApplications", [], null),
+        heldTopLevelCall(held, req.webSessionID, "corpRegistry", "GetMyApplications", [], null),
+        heldTopLevelCall(held, req.webSessionID, "corpRegistry", "GetMyOldApplications", [], null),
+        heldTopLevelCall(held, req.webSessionID, "corpRegistry", "GetAllianceApplications", [], null),
+        heldTopLevelCall(held, req.webSessionID, "corpRegistry", "GetCorpWelcomeMail", [], null),
+      ]);
+    const settled = [applications, oldApplications, myApplications, myOldApplications, allianceApplications, welcomeMail];
+    for (const outcome of settled) {
+      if (outcome.status === "rejected" && outcome.reason && outcome.reason.code === "SESSION_NOT_FOUND") {
+        next(outcome.reason);
+        return;
+      }
+    }
+    const settledCode = (outcome) =>
+      outcome.status === "rejected"
+        ? String((outcome.reason && outcome.reason.code) || "READ_FAILED")
+        : null;
+    const settledValue = (outcome) =>
+      outcome.status === "fulfilled" ? outcome.value.result : null;
+    res.json({
+      ok: true,
+      applications: settledValue(applications),
+      oldApplications: settledValue(oldApplications),
+      myApplications: settledValue(myApplications),
+      myOldApplications: settledValue(myOldApplications),
+      allianceApplications: settledValue(allianceApplications),
+      welcomeMail: settledValue(welcomeMail),
+      errors: {
+        applications: settledCode(applications),
+        oldApplications: settledCode(oldApplications),
+        myApplications: settledCode(myApplications),
+        myOldApplications: settledCode(myOldApplications),
+        allianceApplications: settledCode(allianceApplications),
+        welcomeMail: settledCode(welcomeMail),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// --- R82 plumbing sweep: corpRegistry batch C (kills / settings / checks / name
+// suggestions; no UI — CLOSES corpRegistry at 34/34) ------------------------
+// PLUMBING ONLY: four routes make the corpRegistry KILLBOARD, SETTINGS, MEMBERSHIP-CHECK
+// and NAME-SUGGESTION reads reachable + decodable so a later goal builds UI cheaply. No
+// panel/tab/store slice ships. Same top-level dispatch as splits A/B: corpRegistry is
+// retail-bound per corp (eveMoniker.GetCorpRegistry(corpID)) but the gateway dispatches
+// these TOP-LEVEL; corp/char are resolved from the SESSION, and corpRegistry.MachoBindObject
+// is NOT allowlisted, so a browser cannot bind a foreign corp. Decoders in
+// web/src/bridge/{corpKillboard,corpSettings,corpMembershipChecks,corpNameSuggestions}.ts.
+
+// GET /api/bridge/corp-killboard?limit=&startKillID= — the SESSION corp's recent kills +
+// losses, as TWO independent reads (Promise.allSettled). Both SESSION-CORP-SCOPED: corp =
+// resolveCorporationID(session); args[0]/args[1] are a paging LIMIT + start-kill cursor,
+// NOT a corpID — a browser can only ever read its OWN corp's board. Each returns a Cached
+// MethodCallResult wrapping (substream) a CRowset of killmail rows; FILETIMEs bigint-safe,
+// ids stay data (R7d). ⚠ An empty board (Farmer's corp has 0 losses) is a legitimate state.
+app.get("/api/bridge/corp-killboard", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const limit = nonNegativeIntQuery(req.query.limit, 0);
+  const startKillID = nonNegativeIntQuery(req.query.startKillID, 0);
+  const killArgs = limit > 0 || startKillID > 0 ? [limit, startKillID > 0 ? startKillID : null] : [];
+  try {
+    const [kills, losses] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "corpRegistry", "GetRecentKills", killArgs, null),
+      heldTopLevelCall(held, req.webSessionID, "corpRegistry", "GetRecentLosses", killArgs, null),
+    ]);
+    for (const outcome of [kills, losses]) {
+      if (outcome.status === "rejected" && outcome.reason && outcome.reason.code === "SESSION_NOT_FOUND") {
+        next(outcome.reason);
+        return;
+      }
+    }
+    const settledCode = (outcome) =>
+      outcome.status === "rejected"
+        ? String((outcome.reason && outcome.reason.code) || "READ_FAILED")
+        : null;
+    const settledValue = (outcome) =>
+      outcome.status === "fulfilled" ? outcome.value.result : null;
+    res.json({
+      ok: true,
+      requested: { limit: limit > 0 ? limit : null, startKillID: startKillID > 0 ? startKillID : null },
+      kills: settledValue(kills),
+      losses: settledValue(losses),
+      errors: { kills: settledCode(kills), losses: settledCode(losses) },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/bridge/corp-settings — the SESSION corp's aggression / structure / mail settings,
+// as FOUR independent reads (Promise.allSettled). All SESSION-CORP-SCOPED (args ignored):
+//   • GetAggressionSettings        -> the friendly-fire enable/disable FILETIME schedule
+//     (a named AggressionSettings object).
+//   • GetStructureReinforceDefault -> [reinforceWeekday, reinforceHour] (a bare 2-int array).
+//   • DoesMyCorpAcceptStructures   -> a 0/1 flag.
+//   • DoesCorpRestrictCorpMails    -> a 0/1 flag. FILETIMEs bigint-safe. Decoder in
+//     web/src/bridge/corpSettings.ts.
+app.get("/api/bridge/corp-settings", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const [aggression, reinforce, acceptStructures, restrictMails] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "corpRegistry", "GetAggressionSettings", [], null),
+      heldTopLevelCall(held, req.webSessionID, "corpRegistry", "GetStructureReinforceDefault", [], null),
+      heldTopLevelCall(held, req.webSessionID, "corpRegistry", "DoesMyCorpAcceptStructures", [], null),
+      heldTopLevelCall(held, req.webSessionID, "corpRegistry", "DoesCorpRestrictCorpMails", [], null),
+    ]);
+    for (const outcome of [aggression, reinforce, acceptStructures, restrictMails]) {
+      if (outcome.status === "rejected" && outcome.reason && outcome.reason.code === "SESSION_NOT_FOUND") {
+        next(outcome.reason);
+        return;
+      }
+    }
+    const settledCode = (outcome) =>
+      outcome.status === "rejected"
+        ? String((outcome.reason && outcome.reason.code) || "READ_FAILED")
+        : null;
+    const settledValue = (outcome) =>
+      outcome.status === "fulfilled" ? outcome.value.result : null;
+    res.json({
+      ok: true,
+      aggression: settledValue(aggression),
+      reinforce: settledValue(reinforce),
+      acceptStructures: settledValue(acceptStructures),
+      restrictMails: settledValue(restrictMails),
+      errors: {
+        aggression: settledCode(aggression),
+        reinforce: settledCode(reinforce),
+        acceptStructures: settledCode(acceptStructures),
+        restrictMails: settledCode(restrictMails),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/bridge/corp-membership-checks?charID= — three membership/war checks, as THREE
+// independent reads (Promise.allSettled).
+//   • CanLeaveCurrentCorporation() -> the SESSION char's own [canLeave, errorCode, details]
+//     triple (resolveCharacterID(session, []) IGNORES args) → SESSION-CHAR-SCOPED.
+//   • CanBeKickedOut([charID])      -> whether charID is a kickable member of the SESSION
+//     corp (member lookup scoped to the session corp; a foreign non-member → 0). charID
+//     defaults to 0 (→ 0) when ?charID= is omitted → SESSION-CORP-SCOPED.
+//   • CharGetAllyBaseCost([charID]) -> the war-ally base cost (ISK) for charID (fallback the
+//     session char). ⚠ ARG-INJECTION: args[0] is a caller-chosen charID and the cost encodes
+//     that char's Diplomatic Relations skill level, so a foreign ?charID= leaks it (kept pre-
+//     plumbed + FLAGGED in docs/arg-injection-leak-handoff.md; the ?charID= override exists to
+//     prove it). With ?charID= omitted the route is SESSION-scoped (own ally cost). Decoder in
+//     web/src/bridge/corpMembershipChecks.ts.
+app.get("/api/bridge/corp-membership-checks", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const charID = nonNegativeIntQuery(req.query.charID, 0);
+  const charArgs = charID > 0 ? [charID] : [];
+  try {
+    const [canLeave, canBeKickedOut, allyBaseCost] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "corpRegistry", "CanLeaveCurrentCorporation", [], null),
+      heldTopLevelCall(held, req.webSessionID, "corpRegistry", "CanBeKickedOut", charArgs, null),
+      heldTopLevelCall(held, req.webSessionID, "corpRegistry", "CharGetAllyBaseCost", charArgs, null),
+    ]);
+    for (const outcome of [canLeave, canBeKickedOut, allyBaseCost]) {
+      if (outcome.status === "rejected" && outcome.reason && outcome.reason.code === "SESSION_NOT_FOUND") {
+        next(outcome.reason);
+        return;
+      }
+    }
+    const settledCode = (outcome) =>
+      outcome.status === "rejected"
+        ? String((outcome.reason && outcome.reason.code) || "READ_FAILED")
+        : null;
+    const settledValue = (outcome) =>
+      outcome.status === "fulfilled" ? outcome.value.result : null;
+    res.json({
+      ok: true,
+      requested: { charID: charID > 0 ? charID : null },
+      canLeave: settledValue(canLeave),
+      canBeKickedOut: settledValue(canBeKickedOut),
+      allyBaseCost: settledValue(allyBaseCost),
+      errors: {
+        canLeave: settledCode(canLeave),
+        canBeKickedOut: settledCode(canBeKickedOut),
+        allyBaseCost: settledCode(allyBaseCost),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/bridge/corp-name-suggestions?allianceBase= — the two PUBLIC name generators, as
+// TWO independent reads (Promise.allSettled). Neither handler takes a session or reads any
+// corp/char data — nothing to own or leak:
+//   • GetSuggestedTickerNames()             -> a random corp-ticker suggestion (list of KeyVal).
+//   • GetSuggestedAllianceShortNames([base]) -> short-name variants of the ?allianceBase= base
+//     name (list of KeyVal). Decoder in web/src/bridge/corpNameSuggestions.ts.
+app.get("/api/bridge/corp-name-suggestions", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const allianceBase = stringQuery(req.query.allianceBase);
+  try {
+    const [tickerNames, allianceShortNames] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "corpRegistry", "GetSuggestedTickerNames", [], null),
+      heldTopLevelCall(held, req.webSessionID, "corpRegistry", "GetSuggestedAllianceShortNames", allianceBase ? [allianceBase] : [], null),
+    ]);
+    for (const outcome of [tickerNames, allianceShortNames]) {
+      if (outcome.status === "rejected" && outcome.reason && outcome.reason.code === "SESSION_NOT_FOUND") {
+        next(outcome.reason);
+        return;
+      }
+    }
+    const settledCode = (outcome) =>
+      outcome.status === "rejected"
+        ? String((outcome.reason && outcome.reason.code) || "READ_FAILED")
+        : null;
+    const settledValue = (outcome) =>
+      outcome.status === "fulfilled" ? outcome.value.result : null;
+    res.json({
+      ok: true,
+      requested: { allianceBase: allianceBase || null },
+      tickerNames: settledValue(tickerNames),
+      allianceShortNames: settledValue(allianceShortNames),
+      errors: {
+        tickerNames: settledCode(tickerNames),
+        allianceShortNames: settledCode(allianceShortNames),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// --- R83 plumbing sweep: allianceRegistry batch A (alliance info / members /
+// relationships; no UI) -----------------------------------------------------
+// PLUMBING ONLY: three routes make the allianceRegistry INFO / MEMBER / RELATIONSHIP
+// READS reachable + decodable so a later goal builds UI cheaply. No panel/tab/store
+// slice ships. allianceRegistry is retail-bound to an allianceID (like corpRegistry→
+// corpID), but the gateway dispatches these TOP-LEVEL on the held session and
+// allianceRegistry.MachoBindObject is NOT allowlisted, so a browser cannot BIND a
+// foreign alliance. Ownership verified LIVE (Farmer 140000005 / corp 98000001,
+// ALLIANCE-LESS): the identity/member/tenure reads are alliance-PUBLIC even for an
+// injected foreign allianceID, and GetRelationships is session-scoped (ignores args).
+// Decoders: web/src/bridge/{allianceInfo,allianceMembers,allianceRelationships}.ts.
+
+// GET /api/bridge/alliance-info?allianceID=&maxLen= — the alliance IDENTITY reads, as
+// THREE independent reads (Promise.allSettled; empty ≠ failed). ?allianceID= targets a
+// specific alliance (EVE-PUBLIC identity lookup, safe); omitted → the SESSION alliance
+// (null/empty when the caller's corp is alliance-less — a real state). ids stay data (R7d):
+//   • GetAlliance([allianceID?]) / GetAlliancePublicInfo([allianceID?]) -> util.KeyVal
+//     identity, or null.
+//   • GetRankedAlliances([maxLen]) -> the public alliance-browser list (maxLen def 100).
+app.get("/api/bridge/alliance-info", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const allianceID = nonNegativeIntQuery(req.query.allianceID, 0);
+  const maxLen = Math.max(1, nonNegativeIntQuery(req.query.maxLen, 100));
+  const allianceArgs = allianceID > 0 ? [allianceID] : [];
+  try {
+    const [alliance, publicInfo, ranked] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "allianceRegistry", "GetAlliance", allianceArgs, null),
+      heldTopLevelCall(held, req.webSessionID, "allianceRegistry", "GetAlliancePublicInfo", allianceArgs, null),
+      heldTopLevelCall(held, req.webSessionID, "allianceRegistry", "GetRankedAlliances", [maxLen], null),
+    ]);
+    for (const outcome of [alliance, publicInfo, ranked]) {
+      if (outcome.status === "rejected" && outcome.reason && outcome.reason.code === "SESSION_NOT_FOUND") {
+        next(outcome.reason);
+        return;
+      }
+    }
+    const settledCode = (outcome) =>
+      outcome.status === "rejected"
+        ? String((outcome.reason && outcome.reason.code) || "READ_FAILED")
+        : null;
+    const settledValue = (outcome) =>
+      outcome.status === "fulfilled" ? outcome.value.result : null;
+    res.json({
+      ok: true,
+      requested: { allianceID: allianceID > 0 ? allianceID : null, maxLen },
+      alliance: settledValue(alliance),
+      publicInfo: settledValue(publicInfo),
+      ranked: settledValue(ranked),
+      errors: {
+        alliance: settledCode(alliance),
+        publicInfo: settledCode(publicInfo),
+        ranked: settledCode(ranked),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/bridge/alliance-members?allianceID=&corporationID=&minDays= — the alliance
+// MEMBERSHIP / TENURE / HISTORY reads, as FOUR independent reads (Promise.allSettled).
+// ?allianceID= targets a specific alliance (member corps + tenure are EVE-PUBLIC — safe);
+// omitted → the SESSION alliance (empty when alliance-less). corp/alliance ids stay data:
+//   • GetAllianceMembers([allianceID?])                 -> member-corp Rowset.
+//   • GetAllianceMembersOlderThan([allianceID?, minDays]) -> member corpIDs by tenure.
+//   • GetDaysInAlliance([allianceID?, corporationID?])  -> integer days (needs BOTH ids).
+//   • GetEmploymentRecord([corporationID?])             -> a corp's alliance history.
+app.get("/api/bridge/alliance-members", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const allianceID = nonNegativeIntQuery(req.query.allianceID, 0);
+  const corporationID = nonNegativeIntQuery(req.query.corporationID, 0);
+  const minDays = nonNegativeIntQuery(req.query.minDays, 0);
+  const membersArgs = allianceID > 0 ? [allianceID] : [];
+  const olderThanArgs = [allianceID > 0 ? allianceID : 0, minDays];
+  const daysArgs = [allianceID > 0 ? allianceID : 0, corporationID > 0 ? corporationID : 0];
+  const employmentArgs = corporationID > 0 ? [corporationID] : [];
+  try {
+    const [members, olderThan, days, employment] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "allianceRegistry", "GetAllianceMembers", membersArgs, null),
+      heldTopLevelCall(held, req.webSessionID, "allianceRegistry", "GetAllianceMembersOlderThan", olderThanArgs, null),
+      heldTopLevelCall(held, req.webSessionID, "allianceRegistry", "GetDaysInAlliance", daysArgs, null),
+      heldTopLevelCall(held, req.webSessionID, "allianceRegistry", "GetEmploymentRecord", employmentArgs, null),
+    ]);
+    for (const outcome of [members, olderThan, days, employment]) {
+      if (outcome.status === "rejected" && outcome.reason && outcome.reason.code === "SESSION_NOT_FOUND") {
+        next(outcome.reason);
+        return;
+      }
+    }
+    const settledCode = (outcome) =>
+      outcome.status === "rejected"
+        ? String((outcome.reason && outcome.reason.code) || "READ_FAILED")
+        : null;
+    const settledValue = (outcome) =>
+      outcome.status === "fulfilled" ? outcome.value.result : null;
+    res.json({
+      ok: true,
+      requested: {
+        allianceID: allianceID > 0 ? allianceID : null,
+        corporationID: corporationID > 0 ? corporationID : null,
+        minDays,
+      },
+      members: settledValue(members),
+      olderThan: settledValue(olderThan),
+      days: settledValue(days),
+      employment: settledValue(employment),
+      errors: {
+        members: settledCode(members),
+        olderThan: settledCode(olderThan),
+        days: settledCode(days),
+        employment: settledCode(employment),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/bridge/alliance-relationships — the SESSION alliance's standings dict
+// {ownerID -> relationship}. SESSION-ALLIANCE-SCOPED: the handler resolves the alliance
+// from the session ONLY and ignores args, so there is no allianceID query param — a
+// browser can only ever read its own alliance's standings. Empty {} is a real answer
+// (alliance-less session, or an alliance that seeds no standings). ids stay data (R7d).
+app.get("/api/bridge/alliance-relationships", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const relationships = await heldTopLevelCall(
+      held,
+      req.webSessionID,
+      "allianceRegistry",
+      "GetRelationships",
+      [],
+      null,
+    );
+    res.json({ ok: true, relationships: relationships.result });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// --- R84 plumbing sweep: allianceRegistry batch B (contacts / applications /
+// bulletins / bills / sovereignty config; no UI) — CLOSES allianceRegistry -----
+// PLUMBING ONLY: three routes make the allianceRegistry GOVERNANCE / FINANCIAL /
+// SOVEREIGNTY reads reachable + decodable so a later goal builds UI cheaply. No
+// panel/tab/store slice ships. Same top-level seam as R83, but EVERY read here is
+// STRICTLY SESSION-SCOPED and IGNORES args (the handler resolves the alliance from
+// resolveAllianceIDFromSession(session), or, for GetBillBalance, from the session
+// corp / account key). There is NO allianceID query param because no args path can
+// redirect any of these to a foreign alliance — verified LIVE: as Farmer
+// (alliance-less) INJECTING allianceID 99000000 every read returned his OWN
+// empty/zero state (prime hour 0, not Elysian's 2; bill balance = his own corp's),
+// never the foreign alliance's contacts/applications/bulletins/bills. All 7 SAFE,
+// nothing flagged. Decoders: web/src/bridge/{allianceGovernance,allianceBills,
+// allianceSovereignty}.ts.
+
+// GET /api/bridge/alliance-governance — the SESSION alliance's GOVERNANCE reads, as
+// THREE independent reads (Promise.allSettled; empty ≠ failed). ids stay data (R7d):
+//   • GetAllianceContacts -> a dict {contactID -> KeyVal(contactID/relationshipID/
+//       labelMask)} — the alliance's standings-contact list.
+//   • GetApplications -> an IndexRowset (keyed by corporationID) of the alliance's
+//       INCOMING corp applications (allianceID/corporationID/applicationText/state/
+//       applicationDateTime FILETIME).
+//   • GetBulletins -> a list of packed bulletin rows (bulletinID/ownerID/create+edit
+//       FILETIME/editCharacterID/title/body/sortOrder).
+app.get("/api/bridge/alliance-governance", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const [contacts, applications, bulletins] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "allianceRegistry", "GetAllianceContacts", [], null),
+      heldTopLevelCall(held, req.webSessionID, "allianceRegistry", "GetApplications", [], null),
+      heldTopLevelCall(held, req.webSessionID, "allianceRegistry", "GetBulletins", [], null),
+    ]);
+    for (const outcome of [contacts, applications, bulletins]) {
+      if (outcome.status === "rejected" && outcome.reason && outcome.reason.code === "SESSION_NOT_FOUND") {
+        next(outcome.reason);
+        return;
+      }
+    }
+    const settledCode = (outcome) =>
+      outcome.status === "rejected"
+        ? String((outcome.reason && outcome.reason.code) || "READ_FAILED")
+        : null;
+    const settledValue = (outcome) =>
+      outcome.status === "fulfilled" ? outcome.value.result : null;
+    res.json({
+      ok: true,
+      contacts: settledValue(contacts),
+      applications: settledValue(applications),
+      bulletins: settledValue(bulletins),
+      errors: {
+        contacts: settledCode(contacts),
+        applications: settledCode(applications),
+        bulletins: settledCode(bulletins),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/bridge/alliance-bills — the SESSION alliance's FINANCIAL reads, as TWO
+// independent reads (Promise.allSettled). Alliance financials, but only ever the
+// caller's OWN alliance / corp (session-scoped; args ignored). ISK amounts + FILETIMEs
+// kept bigint-safe as decimal strings in the decoder; ids stay data (R7d):
+//   • GetBills -> a list of the alliance's OWED bills (billID/billTypeID/amount/
+//       interest/debtorID/creditorID/dueDateTime FILETIME/paid/…).
+//   • GetBillBalance -> the SESSION corp's wallet balance (a bare number) for its
+//       default account key — what a "pay bill" flow would draw against. 0 when corp-less.
+app.get("/api/bridge/alliance-bills", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const [bills, balance] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "allianceRegistry", "GetBills", [], null),
+      heldTopLevelCall(held, req.webSessionID, "allianceRegistry", "GetBillBalance", [], null),
+    ]);
+    for (const outcome of [bills, balance]) {
+      if (outcome.status === "rejected" && outcome.reason && outcome.reason.code === "SESSION_NOT_FOUND") {
+        next(outcome.reason);
+        return;
+      }
+    }
+    const settledCode = (outcome) =>
+      outcome.status === "rejected"
+        ? String((outcome.reason && outcome.reason.code) || "READ_FAILED")
+        : null;
+    const settledValue = (outcome) =>
+      outcome.status === "fulfilled" ? outcome.value.result : null;
+    res.json({
+      ok: true,
+      bills: settledValue(bills),
+      balance: settledValue(balance),
+      errors: {
+        bills: settledCode(bills),
+        balance: settledCode(balance),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/bridge/alliance-sovereignty — the SESSION alliance's SOVEREIGNTY-CONFIG
+// reads, as TWO independent reads (Promise.allSettled). Session-scoped; args ignored:
+//   • GetCapitalSystemInfo -> KeyVal(currentCapitalSystem / newCapitalSystem /
+//       newCapitalSystemValidAfter FILETIME) — the capital-system transition state.
+//   • GetPrimeTimeInfo -> KeyVal(currentPrimeHour / newPrimeHour /
+//       newPrimeHourValidAfter FILETIME) — the sovereignty prime-hour (small int).
+app.get("/api/bridge/alliance-sovereignty", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const [capital, prime] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "allianceRegistry", "GetCapitalSystemInfo", [], null),
+      heldTopLevelCall(held, req.webSessionID, "allianceRegistry", "GetPrimeTimeInfo", [], null),
+    ]);
+    for (const outcome of [capital, prime]) {
+      if (outcome.status === "rejected" && outcome.reason && outcome.reason.code === "SESSION_NOT_FOUND") {
+        next(outcome.reason);
+        return;
+      }
+    }
+    const settledCode = (outcome) =>
+      outcome.status === "rejected"
+        ? String((outcome.reason && outcome.reason.code) || "READ_FAILED")
+        : null;
+    const settledValue = (outcome) =>
+      outcome.status === "fulfilled" ? outcome.value.result : null;
+    res.json({
+      ok: true,
+      capital: settledValue(capital),
+      prime: settledValue(prime),
+      errors: {
+        capital: settledCode(capital),
+        prime: settledCode(prime),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/bridge/market-trading?fromDate=&accountKey= — the market CORP-ORDER +
+// PLEX reads the R16 market panel left out (R62 plumbing sweep), as SEVEN
+// independent reads (Promise.allSettled; empty ≠ failed, each its own error
+// code). All session-scoped server-side (corpid / regionid) — no owner/region
+// argument. Decoders in web/src/bridge/marketTrading.ts:
+//   • GetCorporationOrders()        -> the SESSION corp's open orders (cached
+//     owner-orders Rowset, same shape as GetCharOrders).
+//   • CorpGetTransactions(fromDate, accountKey) -> the corp's trades (cached
+//     list; fromDate 0 = everything, accountKey null = any division).
+//   • GetPlexOrders()               -> the PLEX order book in the session region.
+//   • GetPlexBest()                 -> the best PLEX ask per typeID.
+//   • GetPlexHistory() / GetPlexOldPriceHistory() / GetPlexNewPriceHistory()
+//     -> PLEX daily price history (full dict, and the old/new halves).
+// ⚠ Daemon-backed: a market-daemon outage throws MarketUnavailable, surfaced as
+//   its own signal rather than a false "no orders". typeIDs / stationIDs stay
+//   data (R7d); orderIDs + ISK are bigint-safe.
+app.get("/api/bridge/market-trading", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const fromDate = nonNegativeIntQuery(req.query.fromDate, 0);
+  const accountKey = nonNegativeIntQuery(req.query.accountKey, -1);
+  const corpTxnArgs = [fromDate, accountKey >= 0 ? accountKey : null];
+  try {
+    const [
+      corporationOrders,
+      corpTransactions,
+      plexOrders,
+      plexBest,
+      plexHistory,
+      plexOldPriceHistory,
+      plexNewPriceHistory,
+    ] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "marketProxy", "GetCorporationOrders", [], null),
+      heldTopLevelCall(held, req.webSessionID, "marketProxy", "CorpGetTransactions", corpTxnArgs, null),
+      heldTopLevelCall(held, req.webSessionID, "marketProxy", "GetPlexOrders", [], null),
+      heldTopLevelCall(held, req.webSessionID, "marketProxy", "GetPlexBest", [], null),
+      heldTopLevelCall(held, req.webSessionID, "marketProxy", "GetPlexHistory", [], null),
+      heldTopLevelCall(held, req.webSessionID, "marketProxy", "GetPlexOldPriceHistory", [], null),
+      heldTopLevelCall(held, req.webSessionID, "marketProxy", "GetPlexNewPriceHistory", [], null),
+    ]);
+    const settled = [
+      corporationOrders,
+      corpTransactions,
+      plexOrders,
+      plexBest,
+      plexHistory,
+      plexOldPriceHistory,
+      plexNewPriceHistory,
+    ];
+    for (const outcome of settled) {
+      if (outcome.status === "rejected" && outcome.reason && outcome.reason.code === "SESSION_NOT_FOUND") {
+        next(outcome.reason);
+        return;
+      }
+    }
+    const settledCode = (outcome) =>
+      outcome.status === "rejected"
+        ? String((outcome.reason && outcome.reason.code) || "READ_FAILED")
+        : null;
+    const settledValue = (outcome) =>
+      outcome.status === "fulfilled" ? outcome.value.result : null;
+    // The daemon-outage signal, extracted ONCE: if the market itself is not
+    // answering, "no orders" would be a lie.
+    const outage = settled.find(
+      (outcome) => outcome.status === "rejected" && isMarketUnavailable(outcome.reason),
+    );
+    res.json({
+      ok: true,
+      requested: { fromDate, accountKey: accountKey >= 0 ? accountKey : null },
+      corporationID: held.corporationID ?? null,
+      corporationOrders: settledValue(corporationOrders),
+      corpTransactions: settledValue(corpTransactions),
+      plexOrders: settledValue(plexOrders),
+      plexBest: settledValue(plexBest),
+      plexHistory: settledValue(plexHistory),
+      plexOldPriceHistory: settledValue(plexOldPriceHistory),
+      plexNewPriceHistory: settledValue(plexNewPriceHistory),
+      errors: {
+        corporationOrders: settledCode(corporationOrders),
+        corpTransactions: settledCode(corpTransactions),
+        plexOrders: settledCode(plexOrders),
+        plexBest: settledCode(plexBest),
+        plexHistory: settledCode(plexHistory),
+        plexOldPriceHistory: settledCode(plexOldPriceHistory),
+        plexNewPriceHistory: settledCode(plexNewPriceHistory),
+      },
+      marketUnavailable: outage
+        ? "The market is not answering right now, so these figures may be incomplete."
+        : null,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/bridge/contract-items?locationID=&containerID=&itemID=&forCorp= — the
+// contractProxy BIDS / ESCROW / ITEM-SOURCE reads beside the R17 contract browse
+// (R62 plumbing sweep), as up to SEVEN independent reads (Promise.allSettled;
+// empty ≠ failed, each its own error code). All session-scoped; the item reads
+// are ownership-gated server-side, so no argument points one at another owner.
+// Decoders in web/src/bridge/contractItems.ts:
+//   • GetMyContractEscrow()     -> {isk, items} locked behind own contracts.
+//     ⚠ NOT marketProxy.GetCharEscrow — a different call, different service.
+//   • GetMyBids()               -> contracts bid on (a SERVER STUB: empty bundle).
+//   • NumOutstandingContracts() -> the outstanding-contract counts.
+//   • GetItemsInContainer(locationID, containerID, forCorp, flag) -> ⚠ ONLY when
+//     ?containerID= is given; the items in that container (a list of packedrows).
+//   • GetItemsInDockableLocation(locationID, forCorp) -> the hangar items
+//     available to contract (a __builtin__.set of packedrows). ⚠ locationID
+//     defaults to the docked station.
+//   • GetNumItemsInContainers(locationID, [containerID], forCorp, flag) -> ⚠ ONLY
+//     when ?containerID= is given; item count per container.
+//   • GetCourierContractFromItemID(itemID) -> ⚠ ONLY when ?itemID= is given; the
+//     courier contract a crate item belongs to, or null.
+// The retail signatures are location-first (captured from ClientCodeGrabber
+// contracts.py); the BFF forwards forCorp (default 0) and flag (null). item /
+// type / contract ids stay data (R7d).
+app.get("/api/bridge/contract-items", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const stationID = Number(held.stationID) || 0;
+  const locationID = nonNegativeIntQuery(req.query.locationID, stationID);
+  const containerID = nonNegativeIntQuery(req.query.containerID, 0);
+  const itemID = nonNegativeIntQuery(req.query.itemID, 0);
+  const forCorp = nonNegativeIntQuery(req.query.forCorp, 0) === 1;
+  const wantContainer = containerID > 0;
+  const wantItem = itemID > 0;
+  try {
+    const [
+      escrow,
+      myBids,
+      outstandingCounts,
+      containerItems,
+      dockableItems,
+      containerCounts,
+      courierContract,
+    ] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "contractProxy", "GetMyContractEscrow", [], null),
+      heldTopLevelCall(held, req.webSessionID, "contractProxy", "GetMyBids", [], null),
+      heldTopLevelCall(held, req.webSessionID, "contractProxy", "NumOutstandingContracts", [], null),
+      wantContainer
+        ? heldTopLevelCall(
+            held,
+            req.webSessionID,
+            "contractProxy",
+            "GetItemsInContainer",
+            [locationID, containerID, forCorp, null],
+            null,
+          )
+        : Promise.resolve({ result: null }),
+      heldTopLevelCall(
+        held,
+        req.webSessionID,
+        "contractProxy",
+        "GetItemsInDockableLocation",
+        [locationID, forCorp],
+        null,
+      ),
+      wantContainer
+        ? heldTopLevelCall(
+            held,
+            req.webSessionID,
+            "contractProxy",
+            "GetNumItemsInContainers",
+            [locationID, [containerID], forCorp, null],
+            null,
+          )
+        : Promise.resolve({ result: null }),
+      wantItem
+        ? heldTopLevelCall(
+            held,
+            req.webSessionID,
+            "contractProxy",
+            "GetCourierContractFromItemID",
+            [itemID],
+            null,
+          )
+        : Promise.resolve({ result: null }),
+    ]);
+    const settled = [
+      escrow,
+      myBids,
+      outstandingCounts,
+      containerItems,
+      dockableItems,
+      containerCounts,
+      courierContract,
+    ];
+    for (const outcome of settled) {
+      if (outcome.status === "rejected" && outcome.reason && outcome.reason.code === "SESSION_NOT_FOUND") {
+        next(outcome.reason);
+        return;
+      }
+    }
+    const settledCode = (outcome) =>
+      outcome.status === "rejected"
+        ? String((outcome.reason && outcome.reason.code) || "READ_FAILED")
+        : null;
+    const settledValue = (outcome) =>
+      outcome.status === "fulfilled" ? outcome.value.result : null;
+    res.json({
+      ok: true,
+      requested: {
+        locationID,
+        containerID: wantContainer ? containerID : null,
+        itemID: wantItem ? itemID : null,
+        forCorp,
+      },
+      escrow: settledValue(escrow),
+      myBids: settledValue(myBids),
+      outstandingCounts: settledValue(outstandingCounts),
+      containerItems: settledValue(containerItems),
+      dockableItems: settledValue(dockableItems),
+      containerCounts: settledValue(containerCounts),
+      courierContract: settledValue(courierContract),
+      errors: {
+        escrow: settledCode(escrow),
+        myBids: settledCode(myBids),
+        outstandingCounts: settledCode(outstandingCounts),
+        // The container reads are only issued when a containerID was asked for.
+        containerItems: wantContainer ? settledCode(containerItems) : null,
+        dockableItems: settledCode(dockableItems),
+        containerCounts: wantContainer ? settledCode(containerCounts) : null,
+        // The courier read is only issued when an itemID was asked for.
+        courierContract: wantItem ? settledCode(courierContract) : null,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// --- R63 plumbing sweep: structure directory reads (no UI) -------------------
+// GET /api/bridge/structures?solarSystemID=&structureID=&structureIDs=&ownerID=
+// — the structureDirectory SESSION/ACCESS-SCOPED reads (R63 plumbing sweep), as up
+// to TEN independent reads (Promise.allSettled; empty ≠ failed, each its own
+// error code). Every read is scoped off the session or gated on the character's
+// access/roles server-side, so no argument points one at a structure the
+// character has no relationship with. Decoders in web/src/bridge/structures.ts:
+//   • GetMyCorporationStructures()    -> dict of the SESSION corp's OWN structures
+//     (ROLE-GATED: CrpAccessDenied without Station/Brand Manager — a real state).
+//   • GetCorporationStructures()      -> the SAME handler (delegates; no arbitrary corpID).
+//   • GetMyDockableStructures([sys])  -> a bare id list; sys defaults to the current system.
+//   • GetStructureMapData([sys])      -> a CRowset (name/type/position; NO fuel/reinforce).
+//   • GetMyAccessibleOnlineCynoBeaconStructures() -> access-scoped cyno-beacon entries.
+//   • GetSolarSystemsWithBeacons()    -> a bare solar-system id list.
+//   • GetValidWarHQs(ownerID)         -> war-HQ payloads, GATED to the session corp/
+//     alliance; ownerID defaults to the session corp.
+//   • GetJumpBridgesWithMyAccess()    -> [pairs, hasAccessIDs, hasNoAccessIDs].
+//   • GetStructureDescription(id)     -> ⚠ ONLY when ?structureID= is given; the bio string.
+//   • CheckMyDockingAccessToStructures([ids]) -> ⚠ ONLY when ?structureIDs= is given;
+//     the subset of those ids the char can dock at.
+// ⚠ structureDirectory.GetStructures is NOT wired (R38): it leaks fuel/reinforcement/
+// vulnerability for arbitrary un-owned structures. ⚠ GetMyCharacterStructures is ALSO
+// NOT wired: despite the "My" prefix it returns every DOCKABLE structure with the same
+// operational payload, so it leaked a NON-owned structure's reinforce/vulnerability
+// schedule live (see the allowlist runtime note). The OWNED-corp directory
+// (GetMyCorporationStructures) is the safe read for that payload.
+// structure / owner / system ids stay data (R7d).
+app.get("/api/bridge/structures", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const sessionSystemID = Number(held.solarSystemID) || 0;
+  const sessionCorpID = Number(held.corporationID) || 0;
+  const solarSystemID = nonNegativeIntQuery(req.query.solarSystemID, sessionSystemID);
+  const structureID = nonNegativeIntQuery(req.query.structureID, 0);
+  const ownerID = nonNegativeIntQuery(req.query.ownerID, sessionCorpID);
+  // A comma-separated list of structure ids to test docking access against. These
+  // stay exact through Number: real structure ids here are ~1e12 (> 2^32 but well
+  // under 2^53), so a JS number holds them without loss.
+  const structureIDs = String(req.query.structureIDs || "")
+    .split(",")
+    .map((token) => Number(token.trim()))
+    .filter((id) => Number.isInteger(id) && id > 0);
+  const wantDescription = structureID > 0;
+  const wantDockingAccess = structureIDs.length > 0;
+  try {
+    const [
+      myCorporationStructures,
+      corporationStructures,
+      myDockableStructures,
+      structureMapData,
+      cynoBeacons,
+      solarSystemsWithBeacons,
+      validWarHQs,
+      jumpBridges,
+      structureDescription,
+      dockingAccess,
+    ] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "structureDirectory", "GetMyCorporationStructures", [], null),
+      heldTopLevelCall(held, req.webSessionID, "structureDirectory", "GetCorporationStructures", [], null),
+      heldTopLevelCall(held, req.webSessionID, "structureDirectory", "GetMyDockableStructures", [solarSystemID], null),
+      heldTopLevelCall(held, req.webSessionID, "structureDirectory", "GetStructureMapData", [solarSystemID], null),
+      heldTopLevelCall(held, req.webSessionID, "structureDirectory", "GetMyAccessibleOnlineCynoBeaconStructures", [], null),
+      heldTopLevelCall(held, req.webSessionID, "structureDirectory", "GetSolarSystemsWithBeacons", [], null),
+      heldTopLevelCall(held, req.webSessionID, "structureDirectory", "GetValidWarHQs", [ownerID], null),
+      heldTopLevelCall(held, req.webSessionID, "structureDirectory", "GetJumpBridgesWithMyAccess", [], null),
+      wantDescription
+        ? heldTopLevelCall(held, req.webSessionID, "structureDirectory", "GetStructureDescription", [structureID], null)
+        : Promise.resolve({ result: null }),
+      wantDockingAccess
+        ? heldTopLevelCall(held, req.webSessionID, "structureDirectory", "CheckMyDockingAccessToStructures", [structureIDs], null)
+        : Promise.resolve({ result: null }),
+    ]);
+    const settled = [
+      myCorporationStructures,
+      corporationStructures,
+      myDockableStructures,
+      structureMapData,
+      cynoBeacons,
+      solarSystemsWithBeacons,
+      validWarHQs,
+      jumpBridges,
+      structureDescription,
+      dockingAccess,
+    ];
+    for (const outcome of settled) {
+      if (outcome.status === "rejected" && outcome.reason && outcome.reason.code === "SESSION_NOT_FOUND") {
+        next(outcome.reason);
+        return;
+      }
+    }
+    const settledCode = (outcome) =>
+      outcome.status === "rejected"
+        ? String((outcome.reason && outcome.reason.code) || "READ_FAILED")
+        : null;
+    const settledValue = (outcome) =>
+      outcome.status === "fulfilled" ? outcome.value.result : null;
+    res.json({
+      ok: true,
+      requested: {
+        solarSystemID,
+        structureID: wantDescription ? structureID : null,
+        structureIDs: wantDockingAccess ? structureIDs : null,
+        ownerID,
+      },
+      myCorporationStructures: settledValue(myCorporationStructures),
+      corporationStructures: settledValue(corporationStructures),
+      myDockableStructures: settledValue(myDockableStructures),
+      structureMapData: settledValue(structureMapData),
+      cynoBeacons: settledValue(cynoBeacons),
+      solarSystemsWithBeacons: settledValue(solarSystemsWithBeacons),
+      validWarHQs: settledValue(validWarHQs),
+      jumpBridges: settledValue(jumpBridges),
+      structureDescription: settledValue(structureDescription),
+      dockingAccess: settledValue(dockingAccess),
+      errors: {
+        myCorporationStructures: settledCode(myCorporationStructures),
+        corporationStructures: settledCode(corporationStructures),
+        myDockableStructures: settledCode(myDockableStructures),
+        structureMapData: settledCode(structureMapData),
+        cynoBeacons: settledCode(cynoBeacons),
+        solarSystemsWithBeacons: settledCode(solarSystemsWithBeacons),
+        validWarHQs: settledCode(validWarHQs),
+        jumpBridges: settledCode(jumpBridges),
+        // The description / docking reads are only issued when their query is given.
+        structureDescription: wantDescription ? settledCode(structureDescription) : null,
+        dockingAccess: wantDockingAccess ? settledCode(dockingAccess) : null,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// --- R66 plumbing sweep: pvp-info READS (bounties / wars / killmail) — no UI ---
+// PLUMBING ONLY: three routes make the bounty / war / killmail READS reachable +
+// decodable so a later goal builds UI cheaply. No panel/tab/store slice ships.
+// Bounties, wars and killmails are LARGELY PUBLIC EVE data; the one seam that
+// could leak (kill rights) is gated server-side to FOR-SALE rights the session
+// may see (killRightState.hasSaleAccess). Each route batches allowlisted
+// TOP-LEVEL reads on the held session (Promise.allSettled; empty ≠ failed, each
+// read its own error code). Raw retail-shaped results ship out, decoded
+// browser-side (web/src/bridge/{bounties,wars,killmail}.ts).
+
+// A comma-separated list of positive ids from a query string (drops blanks/0).
+// Bounty/war owner + kill-right target lists all arrive this way; real entity ids
+// here are well under 2^53, so Number holds them without loss.
+function positiveIntListQuery(value) {
+  return String(value ?? "")
+    .split(",")
+    .map((token) => Number(token.trim()))
+    .filter((id) => Number.isInteger(id) && id > 0);
+}
+
+// GET /api/bridge/bounties?targetIDs=&killRightTargetIDs=&searchTargetID= — the
+// bountyProxy reads, as up to EIGHT independent reads (GetMyKillRights is its own
+// R57 route and is not repeated here). ⚠ GetBounties / GetBountiesAndKillRights
+// with an EMPTY targetIDs resolve server-side to the whole known bounty board
+// (buildKnownBountyOwnerIds); GetKillRightsOnCharacters needs explicit target ids
+// (empty -> [], a real "asked about none"). GetMyBounties + the three ranked
+// leaderboards take no args. SearchCharBounties(targetID) is issued ONLY when
+// ?searchTargetID= is given. Bounty amounts are bigint ISK; entity ids stay data
+// (R7d). Empty (Farmer has placed none, no board seeded) is a legitimate state.
+app.get("/api/bridge/bounties", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const targetIDs = positiveIntListQuery(req.query.targetIDs);
+  const killRightTargetIDs = positiveIntListQuery(req.query.killRightTargetIDs);
+  const searchTargetID = Number(req.query.searchTargetID) || 0;
+  try {
+    const [
+      bounties,
+      myBounties,
+      killRightsOnChars,
+      bountiesAndKillRights,
+      topPilots,
+      topCorps,
+      topAlliances,
+      search,
+    ] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "bountyProxy", "GetBounties", [targetIDs], null),
+      heldTopLevelCall(held, req.webSessionID, "bountyProxy", "GetMyBounties", [], null),
+      heldTopLevelCall(held, req.webSessionID, "bountyProxy", "GetKillRightsOnCharacters", [killRightTargetIDs], null),
+      heldTopLevelCall(held, req.webSessionID, "bountyProxy", "GetBountiesAndKillRights", [targetIDs, killRightTargetIDs], null),
+      heldTopLevelCall(held, req.webSessionID, "bountyProxy", "GetTopPilotBounties", [], null),
+      heldTopLevelCall(held, req.webSessionID, "bountyProxy", "GetTopCorpBounties", [], null),
+      heldTopLevelCall(held, req.webSessionID, "bountyProxy", "GetTopAllianceBounties", [], null),
+      searchTargetID > 0
+        ? heldTopLevelCall(held, req.webSessionID, "bountyProxy", "SearchCharBounties", [searchTargetID], null)
+        : Promise.resolve({ result: null }),
+    ]);
+    const settled = [
+      bounties, myBounties, killRightsOnChars, bountiesAndKillRights,
+      topPilots, topCorps, topAlliances, search,
+    ];
+    if (surfaceLostSession(settled, next)) {
+      return;
+    }
+    res.json({
+      ok: true,
+      requested: {
+        targetIDs,
+        killRightTargetIDs,
+        searchTargetID: searchTargetID > 0 ? searchTargetID : null,
+      },
+      bounties: settledReadValue(bounties),
+      myBounties: settledReadValue(myBounties),
+      killRightsOnChars: settledReadValue(killRightsOnChars),
+      bountiesAndKillRights: settledReadValue(bountiesAndKillRights),
+      topPilots: settledReadValue(topPilots),
+      topCorps: settledReadValue(topCorps),
+      topAlliances: settledReadValue(topAlliances),
+      search: settledReadValue(search),
+      errors: {
+        bounties: settledReadCode(bounties),
+        myBounties: settledReadCode(myBounties),
+        killRightsOnChars: settledReadCode(killRightsOnChars),
+        bountiesAndKillRights: settledReadCode(bountiesAndKillRights),
+        topPilots: settledReadCode(topPilots),
+        topCorps: settledReadCode(topCorps),
+        topAlliances: settledReadCode(topAlliances),
+        search: searchTargetID > 0 ? settledReadCode(search) : null,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/bridge/wars?ownerID=&ownerIDs=&maxWarID=&structureID=&warID= — the
+// warsInfoMgr reads, as up to SIX independent reads. ownerID / ownerIDs default
+// to the SESSION corp (held.corporationID); GetWarsRequiringAssistance falls back
+// to the session alliance/corp server-side. GetWarsForStructure / GetPublicWarInfo
+// are issued ONLY when their id query is given. War records are PUBLIC (no fuel/
+// reinforce field); entity ids stay data (R7d), FILETIMEs bigint. Empty (Farmer's
+// corp is in no war, no wars seeded) is a legitimate state. ⚠ GetWarsByOwnerID /
+// GetTop50 wrap a CRowset in a CachedMethodCallResult (two wrappers to unpeel).
+app.get("/api/bridge/wars", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const sessionCorpID = Number(held.corporationID) || 0;
+  const ownerID = nonNegativeIntQuery(req.query.ownerID, sessionCorpID);
+  const ownerIDsParam = positiveIntListQuery(req.query.ownerIDs);
+  const ownerIDs = ownerIDsParam.length > 0 ? ownerIDsParam : (ownerID > 0 ? [ownerID] : []);
+  const maxWarID = nonNegativeIntQuery(req.query.maxWarID, 0);
+  const structureID = nonNegativeIntQuery(req.query.structureID, 0);
+  const warID = nonNegativeIntQuery(req.query.warID, 0);
+  const wantStructure = structureID > 0;
+  const wantWar = warID > 0;
+  try {
+    const [
+      byOwner,
+      byOwners,
+      top50,
+      requiringAssistance,
+      forStructure,
+      publicWarInfo,
+    ] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "warsInfoMgr", "GetWarsByOwnerID", [ownerID], null),
+      heldTopLevelCall(held, req.webSessionID, "warsInfoMgr", "GetWarsByOwners", [ownerIDs], null),
+      heldTopLevelCall(held, req.webSessionID, "warsInfoMgr", "GetTop50", [maxWarID], null),
+      heldTopLevelCall(held, req.webSessionID, "warsInfoMgr", "GetWarsRequiringAssistance", [ownerID], null),
+      wantStructure
+        ? heldTopLevelCall(held, req.webSessionID, "warsInfoMgr", "GetWarsForStructure", [structureID], null)
+        : Promise.resolve({ result: null }),
+      wantWar
+        ? heldTopLevelCall(held, req.webSessionID, "warsInfoMgr", "GetPublicWarInfo", [warID], null)
+        : Promise.resolve({ result: null }),
+    ]);
+    const settled = [byOwner, byOwners, top50, requiringAssistance, forStructure, publicWarInfo];
+    if (surfaceLostSession(settled, next)) {
+      return;
+    }
+    res.json({
+      ok: true,
+      requested: {
+        ownerID,
+        ownerIDs,
+        maxWarID,
+        structureID: wantStructure ? structureID : null,
+        warID: wantWar ? warID : null,
+      },
+      byOwner: settledReadValue(byOwner),
+      byOwners: settledReadValue(byOwners),
+      top50: settledReadValue(top50),
+      requiringAssistance: settledReadValue(requiringAssistance),
+      forStructure: settledReadValue(forStructure),
+      publicWarInfo: settledReadValue(publicWarInfo),
+      errors: {
+        byOwner: settledReadCode(byOwner),
+        byOwners: settledReadCode(byOwners),
+        top50: settledReadCode(top50),
+        requiringAssistance: settledReadCode(requiringAssistance),
+        forStructure: wantStructure ? settledReadCode(forStructure) : null,
+        publicWarInfo: wantWar ? settledReadCode(publicWarInfo) : null,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/bridge/killmail?killID=&hash= — one public killmail
+// (warStatisticMgr.GetKillMail). ⚠ VERIFY-FIRST BINDING (worklist): warStatisticMgr
+// is a bindable service, but Handle_GetKillMail reads killID from args[0] and never
+// touches the bound context, so it answers a plain TOP-LEVEL /call (confirmed live);
+// the bound-only siblings stay refused. killID is REQUIRED — with none the route
+// returns killmail:null and issues no read. An optional hash verifies the mail (a
+// mismatch/unknown id -> null, a real state). Killmails are public; ids stay data
+// (R7d), ISK/value fields + killTime are bigint-safe.
+app.get("/api/bridge/killmail", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const killID = Number(req.query.killID) || 0;
+  const hash = typeof req.query.hash === "string" ? req.query.hash.trim() : "";
+  if (killID <= 0) {
+    res.json({ ok: true, requested: { killID: null, hash: null }, killmail: null, error: null });
+    return;
+  }
+  try {
+    const outcome = await heldTopLevelCall(
+      held,
+      req.webSessionID,
+      "warStatisticMgr",
+      "GetKillMail",
+      hash ? [killID, hash] : [killID],
+      null,
+    );
+    res.json({
+      ok: true,
+      requested: { killID, hash: hash || null },
+      killmail: outcome.result,
+      error: null,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// --- R68 plumbing sweep: map / starmap READS (the whole map read set) — no UI --
+// PLUMBING ONLY: ONE route makes the seventeen map READS reachable + decodable so
+// a later goal builds UI cheaply. No panel/tab/store slice ships. Every read is an
+// allowlisted TOP-LEVEL call on the held session; the map service has NO owner/
+// location argument that could point a read at another player. The four flagged
+// reads were verified LIVE across two sessions (R63): GetMyExtraMapInfo/Agents are
+// hardcoded-empty (no data path); GetSolarSystemVisits is session-scoped (own
+// visits only — a second session saw a different set); GetHistory is GLOBAL
+// aggregate map stats (both sessions saw identical per-system totals). Most other
+// reads are PUBLIC starmap/region data and legitimately EMPTY in this seeded world
+// (no incursions, no sov claims, no fac-war contest, no roaming weather, no lit
+// fleet beacons). The route batches with Promise.allSettled (empty ≠ failed; each
+// read carries its own error code); a SESSION_NOT_FOUND on any read surfaces via
+// next() so the page returns to character select. Raw retail-shaped results ship
+// out; the browser decodes them (web/src/bridge/starmap.ts).
+//
+// ⚠ ARG-DRIVEN READS forward REAL ids (a map read that needs an id returns empty
+// silently otherwise): GetSolarsystemItems(systemID) defaults to the SESSION's own
+// solar system; GetHistory(statID, hours) defaults to statID 1 (jumps) / 24h;
+// GetCurrentSovData(locationID) defaults to 0 (all); GetFacWarZoneInfo(factionID)
+// and GetConstellationLPData(constellationID) are issued ONLY when their id query
+// is given (else null, no read). GetDeadspace*Map(language) default "en".
+app.get("/api/bridge/starmap", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const systemID = nonNegativeIntQuery(req.query.systemID, Number(held.solarSystemID) || 0);
+  const statID = nonNegativeIntQuery(req.query.statID, 1);
+  const hours = nonNegativeIntQuery(req.query.hours, 24);
+  const locationID = nonNegativeIntQuery(req.query.locationID, 0);
+  const factionID = nonNegativeIntQuery(req.query.factionID, 0);
+  const constellationID = nonNegativeIntQuery(req.query.constellationID, 0);
+  const language = stringQuery(req.query.language) || "en";
+  const wantSystem = systemID > 0;
+  const wantFacWar = factionID > 0;
+  const wantConstellation = constellationID > 0;
+  try {
+    const [
+      stationCount,
+      solarsystemItems,
+      history,
+      solarSystemVisits,
+      beaconCount,
+      currentSovData,
+      recentSovActivity,
+      facWarZoneInfo,
+      deadspaceAgentsMap,
+      deadspaceComplexMap,
+      myExtraMapInfo,
+      myExtraMapInfoAgents,
+      constellationLPData,
+      allRoamingWeatherSystems,
+      securityModifiedSystems,
+      incursionGlobalReport,
+      systemsInIncursions,
+    ] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "map", "GetStationCount", [], null),
+      wantSystem
+        ? heldTopLevelCall(held, req.webSessionID, "map", "GetSolarsystemItems", [systemID], null)
+        : Promise.resolve({ result: null }),
+      heldTopLevelCall(held, req.webSessionID, "map", "GetHistory", [statID, hours], null),
+      heldTopLevelCall(held, req.webSessionID, "map", "GetSolarSystemVisits", [], null),
+      heldTopLevelCall(held, req.webSessionID, "map", "GetBeaconCount", [], null),
+      heldTopLevelCall(held, req.webSessionID, "map", "GetCurrentSovData", [locationID], null),
+      heldTopLevelCall(held, req.webSessionID, "map", "GetRecentSovActivity", [], null),
+      wantFacWar
+        ? heldTopLevelCall(held, req.webSessionID, "map", "GetFacWarZoneInfo", [factionID], null)
+        : Promise.resolve({ result: null }),
+      heldTopLevelCall(held, req.webSessionID, "map", "GetDeadspaceAgentsMap", [language], null),
+      heldTopLevelCall(held, req.webSessionID, "map", "GetDeadspaceComplexMap", [language], null),
+      heldTopLevelCall(held, req.webSessionID, "map", "GetMyExtraMapInfo", [], null),
+      heldTopLevelCall(held, req.webSessionID, "map", "GetMyExtraMapInfoAgents", [], null),
+      wantConstellation
+        ? heldTopLevelCall(held, req.webSessionID, "map", "GetConstellationLPData", [constellationID], null)
+        : Promise.resolve({ result: null }),
+      heldTopLevelCall(held, req.webSessionID, "map", "GetAllRoamingWeatherSystems", [], null),
+      heldTopLevelCall(held, req.webSessionID, "map", "GetSecurityModifiedSystems", [], null),
+      heldTopLevelCall(held, req.webSessionID, "map", "GetIncursionGlobalReport", [], null),
+      heldTopLevelCall(held, req.webSessionID, "map", "GetSystemsInIncursions", [], null),
+    ]);
+    const settled = [
+      stationCount, solarsystemItems, history, solarSystemVisits, beaconCount,
+      currentSovData, recentSovActivity, facWarZoneInfo, deadspaceAgentsMap,
+      deadspaceComplexMap, myExtraMapInfo, myExtraMapInfoAgents, constellationLPData,
+      allRoamingWeatherSystems, securityModifiedSystems, incursionGlobalReport,
+      systemsInIncursions,
+    ];
+    if (surfaceLostSession(settled, next)) {
+      return;
+    }
+    res.json({
+      ok: true,
+      requested: {
+        systemID: wantSystem ? systemID : null,
+        statID,
+        hours,
+        locationID,
+        factionID: wantFacWar ? factionID : null,
+        constellationID: wantConstellation ? constellationID : null,
+        language,
+      },
+      stationCount: settledReadValue(stationCount),
+      solarsystemItems: settledReadValue(solarsystemItems),
+      history: settledReadValue(history),
+      solarSystemVisits: settledReadValue(solarSystemVisits),
+      beaconCount: settledReadValue(beaconCount),
+      currentSovData: settledReadValue(currentSovData),
+      recentSovActivity: settledReadValue(recentSovActivity),
+      facWarZoneInfo: settledReadValue(facWarZoneInfo),
+      deadspaceAgentsMap: settledReadValue(deadspaceAgentsMap),
+      deadspaceComplexMap: settledReadValue(deadspaceComplexMap),
+      myExtraMapInfo: settledReadValue(myExtraMapInfo),
+      myExtraMapInfoAgents: settledReadValue(myExtraMapInfoAgents),
+      constellationLPData: settledReadValue(constellationLPData),
+      allRoamingWeatherSystems: settledReadValue(allRoamingWeatherSystems),
+      securityModifiedSystems: settledReadValue(securityModifiedSystems),
+      incursionGlobalReport: settledReadValue(incursionGlobalReport),
+      systemsInIncursions: settledReadValue(systemsInIncursions),
+      errors: {
+        stationCount: settledReadCode(stationCount),
+        // Issued only when a systemID resolved (session system or ?systemID=).
+        solarsystemItems: wantSystem ? settledReadCode(solarsystemItems) : null,
+        history: settledReadCode(history),
+        solarSystemVisits: settledReadCode(solarSystemVisits),
+        beaconCount: settledReadCode(beaconCount),
+        currentSovData: settledReadCode(currentSovData),
+        recentSovActivity: settledReadCode(recentSovActivity),
+        // Issued only when ?factionID= was given.
+        facWarZoneInfo: wantFacWar ? settledReadCode(facWarZoneInfo) : null,
+        deadspaceAgentsMap: settledReadCode(deadspaceAgentsMap),
+        deadspaceComplexMap: settledReadCode(deadspaceComplexMap),
+        myExtraMapInfo: settledReadCode(myExtraMapInfo),
+        myExtraMapInfoAgents: settledReadCode(myExtraMapInfoAgents),
+        // Issued only when ?constellationID= was given.
+        constellationLPData: wantConstellation ? settledReadCode(constellationLPData) : null,
+        allRoamingWeatherSystems: settledReadCode(allRoamingWeatherSystems),
+        securityModifiedSystems: settledReadCode(securityModifiedSystems),
+        incursionGlobalReport: settledReadCode(incursionGlobalReport),
+        systemsInIncursions: settledReadCode(systemsInIncursions),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// --- R69 plumbing sweep: in-space info-service READS (sov / ESS / pvp-filament /
+// fleet ads) — no UI. Four routes make the sovMgr / essMgr / pvpFilamentMgr /
+// fleetProxy READS reachable + decodable so a later goal builds UI cheaply. No
+// panel/tab/store slice ships. Each route batches allowlisted TOP-LEVEL reads on the
+// held session (Promise.allSettled; empty ≠ failed, each read its own error code). Raw
+// retail-shaped results ship out, decoded browser-side (web/src/bridge/{sov,ess,
+// pvpFilaments,fleetAds}.ts). Ownership-safety was verified live on the three flagged
+// seams (see the allowlist runtime note): GetCharacterStatistics takes no charID and
+// returns hardcoded zeros; the ESS theft reads are system-scoped public data;
+// GetMyFleetFinderAdvert derives its fleet from the session with no caller id.
+
+// GET /api/bridge/sov?systemID= — the sovMgr sovereignty reads. systemID defaults to
+// the session's own system; every read is PUBLIC solar-system data (empty/null in
+// highsec — a real state). GetSovStructuresInfoForLocalSolarSystem is argless (session
+// system); the systemID-keyed reads forward [systemID].
+app.get("/api/bridge/sov", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const systemID = nonNegativeIntQuery(req.query.systemID, Number(held.solarSystemID) || 0);
+  try {
+    const [
+      localStructures,
+      systemStructures,
+      sovereigntyInfo,
+      hubInfo,
+      fuelAccessGroup,
+      isOnLocalFuelAccessGroup,
+    ] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "sovMgr", "GetSovStructuresInfoForLocalSolarSystem", [], null),
+      heldTopLevelCall(held, req.webSessionID, "sovMgr", "GetSovStructuresInfoForSolarSystem", [systemID], null),
+      heldTopLevelCall(held, req.webSessionID, "sovMgr", "GetSystemSovereigntyInfo", [systemID], null),
+      heldTopLevelCall(held, req.webSessionID, "sovMgr", "GetInfrastructureHubInfo", [systemID], null),
+      heldTopLevelCall(held, req.webSessionID, "sovMgr", "GetSovHubFuelAccessGroup", [systemID], null),
+      heldTopLevelCall(held, req.webSessionID, "sovMgr", "IsOnLocalSovHubFuelAccessGroup", [], null),
+    ]);
+    const settled = [
+      localStructures, systemStructures, sovereigntyInfo, hubInfo,
+      fuelAccessGroup, isOnLocalFuelAccessGroup,
+    ];
+    if (surfaceLostSession(settled, next)) {
+      return;
+    }
+    res.json({
+      ok: true,
+      requested: { systemID },
+      localStructures: settledReadValue(localStructures),
+      systemStructures: settledReadValue(systemStructures),
+      sovereigntyInfo: settledReadValue(sovereigntyInfo),
+      hubInfo: settledReadValue(hubInfo),
+      fuelAccessGroup: settledReadValue(fuelAccessGroup),
+      isOnLocalFuelAccessGroup: settledReadValue(isOnLocalFuelAccessGroup),
+      errors: {
+        localStructures: settledReadCode(localStructures),
+        systemStructures: settledReadCode(systemStructures),
+        sovereigntyInfo: settledReadCode(sovereigntyInfo),
+        hubInfo: settledReadCode(hubInfo),
+        fuelAccessGroup: settledReadCode(fuelAccessGroup),
+        isOnLocalFuelAccessGroup: settledReadCode(isOnLocalFuelAccessGroup),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/bridge/ess?systemID= — the essMgr Encounter Surveillance System reads.
+// systemID defaults to the session's own system; the data read is null when the system
+// has no ESS (a real state). GetDataForClientSolarSystem and both theft reads accept
+// systemID (args[0]); IsClientLinkedToReserveBank is session-scoped (argless).
+app.get("/api/bridge/ess", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const systemID = nonNegativeIntQuery(req.query.systemID, Number(held.solarSystemID) || 0);
+  try {
+    const [
+      data,
+      isLinkedToReserveBank,
+      mainBankThefts,
+      reserveBankThefts,
+    ] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "essMgr", "GetDataForClientSolarSystem", [systemID], null),
+      heldTopLevelCall(held, req.webSessionID, "essMgr", "IsClientLinkedToReserveBank", [], null),
+      heldTopLevelCall(held, req.webSessionID, "essMgr", "GetMainBankTheftsForClientSolarSystem", [systemID], null),
+      heldTopLevelCall(held, req.webSessionID, "essMgr", "GetReserveBankTheftsForClientSolarSystem", [systemID], null),
+    ]);
+    const settled = [data, isLinkedToReserveBank, mainBankThefts, reserveBankThefts];
+    if (surfaceLostSession(settled, next)) {
+      return;
+    }
+    res.json({
+      ok: true,
+      requested: { systemID },
+      data: settledReadValue(data),
+      isLinkedToReserveBank: settledReadValue(isLinkedToReserveBank),
+      mainBankThefts: settledReadValue(mainBankThefts),
+      reserveBankThefts: settledReadValue(reserveBankThefts),
+      errors: {
+        data: settledReadCode(data),
+        isLinkedToReserveBank: settledReadCode(isLinkedToReserveBank),
+        mainBankThefts: settledReadCode(mainBankThefts),
+        reserveBankThefts: settledReadCode(reserveBankThefts),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/bridge/pvp-filaments?matchTypeID=&scheduleID= — the pvpFilamentMgr abyssal
+// Proving-Grounds reads. The four event reads answer from `result`; GetLeaderboard and
+// GetCharacterStatistics RETURN null and push their payload as a NOTIFICATION, so those
+// two are issued in ISOLATION (sequentially, after the batch) and their captured
+// notifications are surfaced — a concurrent drain would let another call steal the
+// notification. matchTypeID/scheduleID default to 0 (forwarded exactly as retail sends;
+// the data is empty/zeroed in this world regardless). GetCharacterStatistics takes NO
+// charID (ownership-safe — see the allowlist note).
+app.get("/api/bridge/pvp-filaments", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const matchTypeID = nonNegativeIntQuery(req.query.matchTypeID, 0);
+  const scheduleID = nonNegativeIntQuery(req.query.scheduleID, 0);
+  try {
+    const [
+      allEvents,
+      activeEvents,
+      mostRecentEvent,
+      nextEventDate,
+    ] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "pvpFilamentMgr", "GetAllEvents", [], null),
+      heldTopLevelCall(held, req.webSessionID, "pvpFilamentMgr", "GetActiveEvents", [], null),
+      heldTopLevelCall(held, req.webSessionID, "pvpFilamentMgr", "GetMostRecentEvent", [], null),
+      heldTopLevelCall(held, req.webSessionID, "pvpFilamentMgr", "GetNextEventDate", [], null),
+    ]);
+    // The two notification-carrying reads, isolated so each drain captures only its own
+    // OnPVPFilaments* push (the decoders key off the notification method name).
+    const [leaderboard] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "pvpFilamentMgr", "GetLeaderboard", [matchTypeID, scheduleID], null),
+    ]);
+    const [characterStatistics] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "pvpFilamentMgr", "GetCharacterStatistics", [matchTypeID, scheduleID], null),
+    ]);
+    const settled = [
+      allEvents, activeEvents, mostRecentEvent, nextEventDate, leaderboard, characterStatistics,
+    ];
+    if (surfaceLostSession(settled, next)) {
+      return;
+    }
+    res.json({
+      ok: true,
+      requested: { matchTypeID, scheduleID },
+      allEvents: settledReadValue(allEvents),
+      activeEvents: settledReadValue(activeEvents),
+      mostRecentEvent: settledReadValue(mostRecentEvent),
+      nextEventDate: settledReadValue(nextEventDate),
+      // These two carry the data in the notification stream, not the result.
+      leaderboardNotifications: settledReadNotifications(leaderboard),
+      characterStatisticsNotifications: settledReadNotifications(characterStatistics),
+      errors: {
+        allEvents: settledReadCode(allEvents),
+        activeEvents: settledReadCode(activeEvents),
+        mostRecentEvent: settledReadCode(mostRecentEvent),
+        nextEventDate: settledReadCode(nextEventDate),
+        leaderboard: settledReadCode(leaderboard),
+        characterStatistics: settledReadCode(characterStatistics),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/bridge/fleet-ads — the fleetProxy fleet-finder reads. GetAvailableFleetAds is
+// the session-FILTERED public listing (empty when no open ads); GetMyFleetFinderAdvert is
+// the session's OWN advert (null when not in a fleet — the real state for a docked
+// character). Both argless and session-scoped (ownership-safe — see the allowlist note).
+app.get("/api/bridge/fleet-ads", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const [availableFleetAds, myFleetFinderAdvert] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "fleetProxy", "GetAvailableFleetAds", [], null),
+      heldTopLevelCall(held, req.webSessionID, "fleetProxy", "GetMyFleetFinderAdvert", [], null),
+    ]);
+    const settled = [availableFleetAds, myFleetFinderAdvert];
+    if (surfaceLostSession(settled, next)) {
+      return;
+    }
+    res.json({
+      ok: true,
+      availableFleetAds: settledReadValue(availableFleetAds),
+      myFleetFinderAdvert: settledReadValue(myFleetFinderAdvert),
+      errors: {
+        availableFleetAds: settledReadCode(availableFleetAds),
+        myFleetFinderAdvert: settledReadCode(myFleetFinderAdvert),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// --- R70 plumbing sweep: character / account / support READS (no UI) --------
+// PLUMBING ONLY: these three routes make the charUnboundMgr / petitioner / charMgr
+// reads reachable + decodable so the UI is easy to build later. No panel/tab/store
+// slice ships. Each issues allowlisted TOP-LEVEL reads on the held session; every
+// read is session/account-scoped (or genuinely public/config data), so the browser
+// cannot point one at another entity. Raw retail-shaped results ship out, decoded
+// browser-side (web/src/bridge/{charAccount,petitions,killboard}.ts).
+
+// GET /api/bridge/char-account?charID=&raceID=&name= — the charUnboundMgr char-select
+// + creation reads, as SEVEN independent reads (Promise.allSettled; empty ≠ failed).
+// ⚠ GetCharacterInfo is ACCOUNT-SCOPED, not public: Handle_GetCharacterToSelect returns
+// null for a charID not on the requesting account, so it answers the account's OWN
+// character's selection data (defaulting to the session's own characterID when no charID
+// is supplied) or null. The optional ?charID lets a caller name one of their OWN alts;
+// a foreign id is rejected server-side (returns null), never leaking that character's
+// data. GetValidRandomName([raceID]) and ValidateNameEx([name]) are char-creation
+// helpers (config/validation, no character data); GetQAStarterSystemIDs / GetNumCharacters
+// / GetCharacterLockType / GetCohortsForUser are account/config reads (the last two are
+// empty-by-design stubs). Raw shapes ship out.
+app.get("/api/bridge/char-account", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  // Default to the session's OWN character; ?charID lets a caller read one of their own
+  // alts (a foreign id is rejected by the handler, returning null). ?raceID defaults to
+  // Caldari (1) so GetValidRandomName answers a real name; ?name is validated as sent.
+  const charID = nonNegativeIntQuery(req.query.charID, Number(held.characterID) || 0);
+  const raceID = nonNegativeIntQuery(req.query.raceID, 1);
+  const name = stringQuery(req.query.name);
+  try {
+    const [
+      numCharacters,
+      characterInfo,
+      characterLockType,
+      cohortsForUser,
+      validRandomName,
+      nameValidation,
+      starterSystemIDs,
+    ] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "charUnboundMgr", "GetNumCharacters", [], null),
+      heldTopLevelCall(held, req.webSessionID, "charUnboundMgr", "GetCharacterInfo", [charID], null),
+      heldTopLevelCall(held, req.webSessionID, "charUnboundMgr", "GetCharacterLockType", [], null),
+      heldTopLevelCall(held, req.webSessionID, "charUnboundMgr", "GetCohortsForUser", [], null),
+      heldTopLevelCall(held, req.webSessionID, "charUnboundMgr", "GetValidRandomName", [raceID], null),
+      heldTopLevelCall(held, req.webSessionID, "charUnboundMgr", "ValidateNameEx", [name], null),
+      heldTopLevelCall(held, req.webSessionID, "charUnboundMgr", "GetQAStarterSystemIDs", [], null),
+    ]);
+    const settled = [
+      numCharacters, characterInfo, characterLockType, cohortsForUser,
+      validRandomName, nameValidation, starterSystemIDs,
+    ];
+    if (surfaceLostSession(settled, next)) {
+      return;
+    }
+    res.json({
+      ok: true,
+      requested: { charID, raceID, name },
+      numCharacters: settledReadValue(numCharacters),
+      characterInfo: settledReadValue(characterInfo),
+      characterLockType: settledReadValue(characterLockType),
+      cohortsForUser: settledReadValue(cohortsForUser),
+      validRandomName: settledReadValue(validRandomName),
+      nameValidation: settledReadValue(nameValidation),
+      starterSystemIDs: settledReadValue(starterSystemIDs),
+      errors: {
+        numCharacters: settledReadCode(numCharacters),
+        characterInfo: settledReadCode(characterInfo),
+        characterLockType: settledReadCode(characterLockType),
+        cohortsForUser: settledReadCode(cohortsForUser),
+        validRandomName: settledReadCode(validRandomName),
+        nameValidation: settledReadCode(nameValidation),
+        starterSystemIDs: settledReadCode(starterSystemIDs),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/bridge/petitions?petitionID= — the petitioner (support) reads, as EIGHT
+// independent reads (Promise.allSettled; empty ≠ failed). petitioner is a STUB support
+// service in this world: every read answers constant/empty data with no per-entity store
+// lookup, so a foreign ?petitionID yields the SAME empty message list — no cross-ticket
+// access. GetMyPetitionsEx / GetUnreadMessages / GetPetitionMessages are the session's OWN
+// tickets (all empty here — a real "no petitions filed" state). GetCategories /
+// GetCategoryHierarchicalInfo are the (empty) category taxonomy; MayPetition -> -4
+// (petitioning disabled); IsZendeskEnabled -> true.
+// ⚠ GetZendeskJwtLink returns a support-link STRING treated as a CREDENTIAL: it ships out
+// in the response but is NEVER logged here, and the decoder passes it through without
+// parsing or logging. (In this world it is a public help-center URL, not a signed JWT.)
+app.get("/api/bridge/petitions", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const petitionID = nonNegativeIntQuery(req.query.petitionID, 0);
+  try {
+    const [
+      myPetitions,
+      categories,
+      categoryHierarchicalInfo,
+      petitionMessages,
+      mayPetition,
+      zendeskEnabled,
+      zendeskJwtLink,
+      unreadMessages,
+    ] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "petitioner", "GetMyPetitionsEx", [], null),
+      heldTopLevelCall(held, req.webSessionID, "petitioner", "GetCategories", [], null),
+      heldTopLevelCall(held, req.webSessionID, "petitioner", "GetCategoryHierarchicalInfo", [], null),
+      heldTopLevelCall(held, req.webSessionID, "petitioner", "GetPetitionMessages", [petitionID], null),
+      heldTopLevelCall(held, req.webSessionID, "petitioner", "MayPetition", [], null),
+      heldTopLevelCall(held, req.webSessionID, "petitioner", "IsZendeskEnabled", [], null),
+      heldTopLevelCall(held, req.webSessionID, "petitioner", "GetZendeskJwtLink", [], null),
+      heldTopLevelCall(held, req.webSessionID, "petitioner", "GetUnreadMessages", [], null),
+    ]);
+    const settled = [
+      myPetitions, categories, categoryHierarchicalInfo, petitionMessages,
+      mayPetition, zendeskEnabled, zendeskJwtLink, unreadMessages,
+    ];
+    if (surfaceLostSession(settled, next)) {
+      return;
+    }
+    res.json({
+      ok: true,
+      requested: { petitionID },
+      myPetitions: settledReadValue(myPetitions),
+      categories: settledReadValue(categories),
+      categoryHierarchicalInfo: settledReadValue(categoryHierarchicalInfo),
+      petitionMessages: settledReadValue(petitionMessages),
+      mayPetition: settledReadValue(mayPetition),
+      zendeskEnabled: settledReadValue(zendeskEnabled),
+      // A credential string: shipped out, never logged here.
+      zendeskJwtLink: settledReadValue(zendeskJwtLink),
+      unreadMessages: settledReadValue(unreadMessages),
+      errors: {
+        myPetitions: settledReadCode(myPetitions),
+        categories: settledReadCode(categories),
+        categoryHierarchicalInfo: settledReadCode(categoryHierarchicalInfo),
+        petitionMessages: settledReadCode(petitionMessages),
+        mayPetition: settledReadCode(mayPetition),
+        zendeskEnabled: settledReadCode(zendeskEnabled),
+        zendeskJwtLink: settledReadCode(zendeskJwtLink),
+        unreadMessages: settledReadCode(unreadMessages),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/bridge/killboard?limit=&startKillID= — the charMgr straggler
+// GetRecentShipKillsAndLosses: the SESSION character's recent kills + losses. ⚠ The args
+// are [limit, startKillID] PAGINATION, NOT a charID — Handle_GetRecentShipKillsAndLosses
+// derives the character from the session, so a caller cannot request a foreign
+// killboard. An empty list is a REAL "no recent kills/losses" answer (Farmer). The row's
+// entity ids (victim*/final*/warID) are kept as data for the browser to resolve (R7d);
+// killTime is a FILETIME bigint; iskLost/iskDestroyed are bigint-safe. Raw shape ships out.
+app.get("/api/bridge/killboard", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const limit = nonNegativeIntQuery(req.query.limit, 0);
+  const startKillID = nonNegativeIntQuery(req.query.startKillID, 0);
+  try {
+    const outcome = await heldTopLevelCall(
+      held,
+      req.webSessionID,
+      "charMgr",
+      "GetRecentShipKillsAndLosses",
+      [limit, startKillID],
+      null,
+    );
+    res.json({ ok: true, requested: { limit, startKillID }, killmails: outcome.result });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// --- R7 Local + Corp chat ---------------------------------------------------
+// The browser reads a channel's member roster + recent backlog and sends
+// messages to Local or Corp on the held session. Chat delivery bypasses the
+// notification drain, so READ is a backlog poll: the panel polls /chat/read on
+// a modest interval while it is open, and stops when it closes. The BFF holds
+// the bridgeSessionID server-side (never in browser JS); the browser addresses
+// channels by name only. Wire contract: docs/bridge-wire-contract.md.
+
+const CHAT_CHANNELS = new Set(["local", "corp"]);
+
+function normalizeChatChannel(res, value) {
+  const channel = typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (!CHAT_CHANNELS.has(channel)) {
+    res.status(400).json({
+      ok: false,
+      error: "INVALID_CHANNEL",
+      message: "channel must be 'local' or 'corp'.",
+    });
+    return null;
+  }
+  return channel;
+}
+
+app.get("/api/bridge/chat/:channel", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const channel = normalizeChatChannel(res, req.params.channel);
+  if (!channel) {
+    return;
+  }
+  try {
+    const outcome = await gateway.readChat(
+      held.bridgeSessionID,
+      channel,
+      { userid: held.accountID },
+      { limit: Number(req.query.limit) || undefined },
+    );
+    res.json({ ok: true, chat: outcome.chat, notifications: outcome.notifications });
+  } catch (error) {
+    if (error && error.code === "SESSION_NOT_FOUND") {
+      forgetBridgeSession(req.webSessionID);
+    }
+    next(error);
+  }
+});
+
+app.post("/api/bridge/chat/:channel/send", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const channel = normalizeChatChannel(res, req.params.channel);
+  if (!channel) {
+    return;
+  }
+  const message = typeof req.body?.message === "string" ? req.body.message : "";
+  if (!message.trim()) {
+    res.status(400).json({
+      ok: false,
+      error: "EMPTY_MESSAGE",
+      message: "message must be a non-empty string.",
+    });
+    return;
+  }
+  try {
+    const outcome = await gateway.sendChat(held.bridgeSessionID, channel, message, {
+      userid: held.accountID,
+    });
+    res.json({ ok: true, chat: outcome.chat, notifications: outcome.notifications });
+  } catch (error) {
+    if (error && error.code === "SESSION_NOT_FOUND") {
+      forgetBridgeSession(req.webSessionID);
+    }
+    next(error);
+  }
+});
+
+// R5a flight (manually-stepped space movement): undock -> warp -> jump -> dock,
+// each an explicit step the browser issues (no timer loop — the autopilot
+// decide-loop is R5b). EveJS's space handlers stay authoritative for every
+// move; the BFF only relays the atomic calls the retail client's client-side
+// autopilot issues, holding the beyonce bound handle server-side. Movement
+// refusals (scrambled, invalid target, docking-approach, lost control, ship
+// destroyed) pass through as the handler's own CALL_REFUSED message so the page
+// can surface a real reason — never a silent no-op or a fake success.
+
+// beyonce remote park moniker: Moniker('beyonce', solarSystemID) via
+// michelle.GetRemotePark(). Keyed by system so a jump (which changes the
+// system) rebinds the park for the new system rather than reusing a stale OID.
+const BEYONCE_BIND_GROUP = 5;
+function parkBindSpec(solarSystemID) {
+  return {
+    key: `park:${solarSystemID}`,
+    service: "beyonce",
+    method: "MachoBindObject",
+    args: [[Number(solarSystemID), BEYONCE_BIND_GROUP]],
+    kwargs: null,
+  };
+}
+
+// Read the held session's current flight status (location + ship movement
+// state). A lost persistent session drops the held session (the page returns to
+// character select), as with every held call.
+async function readHeldFlight(held, webSessionID) {
+  try {
+    const outcome = await gateway.readFlightStatus(held.bridgeSessionID, {
+      userid: held.accountID,
+    });
+    // Keep the held session's station in sync with the character's LIVE
+    // position. held.stationID is otherwise set only at select, so after the
+    // ship docks somewhere new (e.g. an autopilot arrival) the station-scoped
+    // reads (agents, inventory bind) would still target the select-time station
+    // until a full re-login. Adopt a real docked station here; leave the last
+    // station in place while in space (agents/inventory are docked-only). The
+    // active ship is owned by the board flow, so it is not synced here.
+    const flight = outcome && outcome.flight ? outcome.flight : {};
+    if (flight.docked === true && Number(flight.stationID) > 0) {
+      held.stationID = Number(flight.stationID);
+    }
+    // The solar system the character is in RIGHT NOW. Tracked here because
+    // R15's industry deliver/cancel take it as an argument
+    // (CompleteJob(jobID, solarSystemID)), and it is otherwise unavailable to a
+    // route that never touches the space runtime.
+    if (Number(flight.solarSystemID) > 0) {
+      held.solarSystemID = Number(flight.solarSystemID);
+    }
+    // A latched ("failed") transition is resolved by exactly this kind of
+    // fresh authoritative read — the write either landed (adopt it) or never
+    // took (release the latch). Every client polls flight status continuously,
+    // so a session recovers within a poll cycle of the world settling instead
+    // of demanding a character re-select.
+    resolveFailedTransition(held, flight);
+    return {
+      ...outcome,
+      flight: {
+        ...flight,
+        transition: publicTransition(held),
+      },
+    };
+  } catch (error) {
+    if (error && error.code === "SESSION_NOT_FOUND") {
+      forgetBridgeSession(webSessionID);
+    }
+    throw error;
+  }
+}
+
+// A movement command that already SUCCEEDED must not be reported as a failure
+// because the follow-up snapshot read aborted — the gateway is busiest right
+// after a movement command, so the after-read is the piece most likely to time
+// out. The answer degrades to the before-snapshot (one command stale; every
+// client re-polls flight status within a couple of seconds) instead of a 502
+// for a command the sim is already executing. A lost session still propagates.
+async function readHeldFlightAfterCommand(held, webSessionID, before) {
+  try {
+    return await readHeldFlight(held, webSessionID);
+  } catch (error) {
+    if (error && error.code === "SESSION_NOT_FOUND") {
+      throw error;
+    }
+    return {
+      ...before,
+      flight: { ...before.flight, transition: publicTransition(held) },
+      notifications: [],
+    };
+  }
+}
+
+async function readHeldScanner(held, webSessionID) {
+  try {
+    const outcome = await gateway.readScannerState(held.bridgeSessionID, {
+      userid: held.accountID,
+    });
+    return {
+      ...outcome,
+      scanner: outcome && outcome.scanner && typeof outcome.scanner === "object"
+        ? outcome.scanner
+        : {},
+    };
+  } catch (error) {
+    if (error && error.code === "SESSION_NOT_FOUND") {
+      forgetBridgeSession(webSessionID);
+    }
+    throw error;
+  }
+}
+
+function routeTransitionNow() {
+  return typeof options.transitionNow === "function" ? Number(options.transitionNow()) : Date.now();
+}
+
+function beginRouteTransition(res, held, kind, expected) {
+  const begun = beginHeldTransition(held, kind, expected, routeTransitionNow());
+  if (begun.ok) {
+    return true;
+  }
+  res.status(409).json({
+    ok: false,
+    error: begun.code,
+    message: begun.message,
+    transition: begun.transition || publicTransition(held),
+  });
+  return false;
+}
+
+/**
+ * Reserve the next session-changing command and wait out retail's advertised
+ * next-mutation timer. Readiness and cooldown are intentionally separate: a
+ * ship can already be usable while another dock/jump/board is not legal yet.
+ * Only the latter waits here; ordinary warp/module/inventory calls continue
+ * once the prior transition's authoritative readiness phase is `ready`.
+ */
+async function acquireRouteTransition(res, held, kind, expected) {
+  if (held.transition && held.transition.phase !== "ready") {
+    return beginRouteTransition(res, held, kind, expected);
+  }
+  if (held.transitionReservation) {
+    res.status(409).json({
+      ok: false,
+      error: "SESSION_CHANGE_IN_PROGRESS",
+      message: `Another ${held.transitionReservation.kind} request is waiting for the session-change timer.`,
+      transition: publicTransition(held),
+    });
+    return false;
+  }
+
+  const waitMs = Math.max(0, Number(held.cooldownUntilMs || 0) - routeTransitionNow());
+  if (waitMs > 0) {
+    const reservation = { kind, token: Symbol(kind) };
+    held.transitionReservation = reservation;
+    try {
+      const sleep = typeof options.transitionSleep === "function"
+        ? options.transitionSleep
+        : (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+      await sleep(waitMs);
+    } finally {
+      if (held.transitionReservation === reservation) {
+        held.transitionReservation = null;
+      }
+    }
+  }
+  return beginRouteTransition(res, held, kind, expected);
+}
+
+/**
+ * Wait for an issued session mutation to become USABLE, not for a guessed
+ * delay. Space transitions require the destination snapshot's own ship (scene
+ * + ego); dock/board require their authoritative location/ship postcondition.
+ * A timeout is deliberately uncertain and remains latched, so no route can
+ * repeat the write until the player reselects the character.
+ */
+async function awaitRouteTransition(held, webSessionID, kind, expected, overrides = {}) {
+  let lastFlight = {};
+  return waitForTransitionReady({
+    held,
+    kind,
+    expected,
+    latchOnTimeout: overrides.latchOnTimeout !== false,
+    timeoutMs: Number(overrides.timeoutMs) || Number(options.transitionReadyTimeoutMs) || undefined,
+    pollMs: Number(options.transitionPollMs) || undefined,
+    sleep: options.transitionSleep,
+    now: options.transitionNow,
+    readFlight: async () => {
+      const outcome = await readHeldFlight(held, webSessionID);
+      lastFlight = outcome.flight || {};
+      return outcome;
+    },
+    readSpace: async () => {
+      if (typeof gateway.readSpaceSnapshot === "function") {
+        return gateway.readSpaceSnapshot(held.bridgeSessionID, { userid: held.accountID });
+      }
+      // Test/minimal gateway compatibility only. Production always has the
+      // stronger snapshot route; an older gateway can at least require the
+      // authoritative flight location + ship rather than a fixed timer.
+      return {
+        space: {
+          inSpace: lastFlight.inSpace === true,
+          ship: lastFlight.inSpace === true && Number(lastFlight.shipID) > 0
+            ? { itemID: Number(lastFlight.shipID) }
+            : null,
+        },
+        notifications: [],
+      };
+    },
+  });
+}
+
+function sendTransitionTimeout(res, outcome, commandNotifications = []) {
+  res.status(504).json({
+    ok: false,
+    error: outcome.code || "TRANSITION_TIMEOUT",
+    message: outcome.message || "The session change did not become ready in time. No command was repeated.",
+    flight: outcome.flight || null,
+    transition: outcome.transition || null,
+    notifications: [...commandNotifications, ...(outcome.notifications || [])],
+  });
+}
+
+// A dock the sim ACCEPTED seats within a couple of seconds in this emulator;
+// this bounds how long the dock route watches for that before reading the
+// 200/null answer as retail's silent decline and handing the decision back to
+// the client's silent-dock ladder. Overridable via options.dockProbeTimeoutMs,
+// and never longer than an injected transitionReadyTimeoutMs (the tests run on
+// a virtual clock).
+const DOCK_SILENT_DECLINE_PROBE_MS = 6_000;
+
+// --- R13 flight-verb ranges -------------------------------------------------
+// Every one of these is a DISTANCE IN METRES, never an identifier. The retail
+// defaults: Approach 50 m (the menu form; the autopilot uses 0), Keep at range
+// 1000 m floored at 50 m, Orbit 1000 m. The warp-range menu offers a fixed
+// ladder, whose default is 0 — NOT 10 km.
+const APPROACH_DEFAULT_RANGE_M = 50;
+const KEEP_AT_RANGE_DEFAULT_M = 1000;
+const KEEP_AT_RANGE_FLOOR_M = 50;
+const ORBIT_DEFAULT_RANGE_M = 1000;
+// A sane ceiling so a typo cannot send an absurd follow/orbit range: 1000 km,
+// far beyond any sensible hold distance and well inside warp range.
+const MAX_FOLLOW_RANGE_M = 1_000_000;
+const WARP_RANGE_CHOICES_M = Object.freeze([0, 10000, 20000, 30000, 50000, 70000, 100000]);
+
+/**
+ * A follow/orbit range in metres: absent -> the caller's default, otherwise a
+ * finite non-negative number clamped up to `floor` and bounded above. Returns
+ * null for anything that is not a number at all (the route answers 400).
+ */
+function normalizeFollowRange(value, fallback, floor) {
+  if (value === undefined || value === null || value === "") {
+    return fallback;
+  }
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric < 0 || numeric > MAX_FOLLOW_RANGE_M) {
+    return null;
+  }
+  return Math.max(floor, numeric);
+}
+
+/** A warp range in metres: one of the offered choices, or null (400). */
+function normalizeWarpRange(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return null;
+  }
+  return WARP_RANGE_CHOICES_M.includes(numeric) ? numeric : null;
+}
+
+function requireInSpace(res, flight) {
+  if (!flight || flight.inSpace !== true) {
+    res.status(409).json({
+      ok: false,
+      error: "NOT_IN_SPACE",
+      message: "The ship is not in space; undock first.",
+    });
+    return false;
+  }
+  return true;
+}
+
+// Current flight status snapshot for the page's status readout + "Refresh
+// flight status" button.
+app.get("/api/bridge/flight/status", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const outcome = await readHeldFlight(held, req.webSessionID);
+    res.json({ ok: true, flight: outcome.flight, notifications: outcome.notifications });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Undock: ship.Undock(shipID, ignoreContraband, onlineModules=[]) — a top-level
+// call on the docked session (Handle_Undock resolves the ship + attaches the
+// session to space). onlineModules is a kwarg (never positional).
+app.post("/api/bridge/flight/undock", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const before = await readHeldFlight(held, req.webSessionID);
+    if (before.flight.inSpace === true) {
+      res.status(409).json({
+        ok: false,
+        error: "ALREADY_IN_SPACE",
+        message: "The ship is already in space.",
+      });
+      return;
+    }
+    const shipID = Number(before.flight.shipID) || Number(held.activeShipID) || 0;
+    const expected = {
+      shipID,
+      toSolarSystemID: Number(before.flight.solarSystemID) || null,
+    };
+    if (!await acquireRouteTransition(res, held, "undock", expected)) {
+      return;
+    }
+    const outcome = await heldTopLevelCall(
+      held,
+      req.webSessionID,
+      "ship",
+      "Undock",
+      [shipID, false],
+      { onlineModules: [] },
+    );
+    markTransitionAccepted(held);
+    const after = await awaitRouteTransition(held, req.webSessionID, "undock", expected);
+    if (!after.ok) {
+      sendTransitionTimeout(res, after, outcome.notifications);
+      return;
+    }
+    res.json({
+      ok: true,
+      flight: { ...after.flight, transition: after.transition },
+      transition: after.transition,
+      notifications: [...outcome.notifications, ...after.notifications],
+    });
+  } catch (error) {
+    if (held.transition && held.transition.kind === "undock") {
+      if (held.transition.phase === "requested") {
+        cancelHeldTransition(held);
+      } else if (held.transition.phase !== "failed") {
+        markTransitionFailed(held, error && error.message);
+      }
+    }
+    next(error);
+  }
+});
+
+// Warp to a chosen gate/celestial through the bound park.
+//
+// Two shapes, exactly as retail has two:
+//   - no `minRange` in the body  -> beyonce.CmdWarpToStuffAutopilot(destID),
+//     the autopilot's own warp (the browser decide-loop uses this one);
+//   - `minRange` present         -> beyonce.CmdWarpToStuff("item", destID,
+//     minRange=<metres>), the right-click "Warp to → within N km" menu (R13).
+//     Retail's own default for that menu is 0, not 10 km.
+// `minRange` is a KWARG; the subject string ("item") is positional.
+app.post("/api/bridge/flight/warp", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const destinationID = Number(req.body && req.body.destinationID) || 0;
+  if (destinationID <= 0) {
+    res.status(400).json({ ok: false, error: "INVALID_TARGET", message: "A positive destinationID is required." });
+    return;
+  }
+  const rangedWarp = req.body && req.body.minRange !== undefined && req.body.minRange !== null;
+  const minRange = rangedWarp ? normalizeWarpRange(req.body.minRange) : 0;
+  if (rangedWarp && minRange === null) {
+    res.status(400).json({
+      ok: false,
+      error: "INVALID_RANGE",
+      message: "The warp range must be one of the offered distances.",
+    });
+    return;
+  }
+  try {
+    const before = await readHeldFlight(held, req.webSessionID);
+    if (!requireInSpace(res, before.flight)) {
+      return;
+    }
+    const outcome = rangedWarp
+      ? await boundCall(
+          held,
+          req.webSessionID,
+          parkBindSpec(before.flight.solarSystemID),
+          "CmdWarpToStuff",
+          ["item", destinationID],
+          { minRange },
+        )
+      : await boundCall(
+          held,
+          req.webSessionID,
+          parkBindSpec(before.flight.solarSystemID),
+          "CmdWarpToStuffAutopilot",
+          [destinationID],
+          null,
+        );
+    const after = await readHeldFlightAfterCommand(held, req.webSessionID, before);
+    res.json({
+      ok: true,
+      result: outcome.result,
+      flight: after.flight,
+      notifications: [...outcome.notifications, ...after.notifications],
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Warp to a SCANNED SITE (an anomaly / signature) by its scan-signature label
+// ("QEE-288") — beyonce.CmdWarpToStuff("scan", <label>). The server resolves the
+// label to the site's entity or point itself (resolveScanWarpTarget), which is
+// exactly how retail's scanner window warps. The labels come from
+// scanMgr.GetFullState (served by /api/bridge/bound-small-services), always the
+// session's OWN system — so this cannot be aimed at anything the pilot could
+// not see in their own scanner.
+app.post("/api/bridge/flight/warp-scan", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const target = typeof (req.body && req.body.target) === "string" ? req.body.target.trim() : "";
+  if (target === "" || target.length > 32) {
+    res.status(400).json({ ok: false, error: "INVALID_TARGET", message: "A scan-site label is required." });
+    return;
+  }
+  const minRange = Number(req.body && req.body.minRange) || 0;
+  try {
+    const before = await readHeldFlight(held, req.webSessionID);
+    if (!requireInSpace(res, before.flight)) {
+      return;
+    }
+    const outcome = await boundCall(
+      held,
+      req.webSessionID,
+      parkBindSpec(before.flight.solarSystemID),
+      "CmdWarpToStuff",
+      ["scan", target],
+      minRange > 0 ? { minRange } : null,
+    );
+    const after = await readHeldFlightAfterCommand(held, req.webSessionID, before);
+    res.json({
+      ok: true,
+      result: outcome.result,
+      flight: after.flight,
+      notifications: [...outcome.notifications, ...after.notifications],
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// The station repair shop (repairSvc) — the quote and the fix. Quotes are the
+// read (what is damaged and what the shop would charge); RepairItems debits the
+// wallet server-side and repairs. Both take explicit item ids, so the browser
+// can never repair (or be charged for) more than it named.
+app.get("/api/bridge/station/repair-quotes", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const itemIDs = String(req.query.itemIDs || "")
+    .split(",")
+    .map((token) => Number(token))
+    .filter((id) => Number.isSafeInteger(id) && id > 0);
+  if (itemIDs.length === 0) {
+    res.status(400).json({ ok: false, error: "INVALID_TARGET", message: "At least one item is required." });
+    return;
+  }
+  try {
+    const outcome = await heldTopLevelCall(held, req.webSessionID, "repairSvc", "GetRepairQuotes", [itemIDs], null);
+    res.json({ ok: true, quotes: outcome.result });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/bridge/station/repair", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This repairs those items and the station charges your wallet for it. Confirm to continue.")) {
+    return;
+  }
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const body = req.body || {};
+  const itemIDs = (Array.isArray(body.itemIDs) ? body.itemIDs : [])
+    .map((value) => Number(value))
+    .filter((id) => Number.isSafeInteger(id) && id > 0);
+  if (itemIDs.length === 0) {
+    res.status(400).json({ ok: false, error: "INVALID_TARGET", message: "At least one item is required." });
+    return;
+  }
+  try {
+    const outcome = await heldTopLevelCall(held, req.webSessionID, "repairSvc", "RepairItems", [itemIDs, null], null);
+    res.json({ ok: true, result: outcome.result, notifications: outcome.notifications });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Warp to a SAVED BOOKMARK — beyonce.CmdWarpToStuff("bookmark", bookmarkID).
+// The server resolves the bookmark itself (site entity, raw point, or a
+// mission-scoped instance via its metadata) and refuses one that is not the
+// session's to use (BookmarkNotAvailable) — so this cannot be aimed at another
+// character's spots.
+app.post("/api/bridge/flight/warp-bookmark", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const bookmarkID = Number(req.body && req.body.bookmarkID) || 0;
+  if (bookmarkID <= 0) {
+    res.status(400).json({ ok: false, error: "INVALID_TARGET", message: "A bookmark is required." });
+    return;
+  }
+  const minRange = Number(req.body && req.body.minRange) || 0;
+  try {
+    const before = await readHeldFlight(held, req.webSessionID);
+    if (!requireInSpace(res, before.flight)) {
+      return;
+    }
+    const outcome = await boundCall(
+      held,
+      req.webSessionID,
+      parkBindSpec(before.flight.solarSystemID),
+      "CmdWarpToStuff",
+      ["bookmark", bookmarkID],
+      minRange > 0 ? { minRange } : null,
+    );
+    const after = await readHeldFlightAfterCommand(held, req.webSessionID, before);
+    res.json({
+      ok: true,
+      result: outcome.result,
+      flight: after.flight,
+      notifications: [...outcome.notifications, ...after.notifications],
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Jump through an NPC stargate: beyonce.CmdStargateJump(fromGateID, toGateID,
+// shipID). The system transition completes after a short handoff delay; the
+// page polls flight status to see the new system.
+app.post("/api/bridge/flight/jump", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const fromGateID = Number(req.body && req.body.fromGateID) || 0;
+  const toGateID = Number(req.body && req.body.toGateID) || 0;
+  if (fromGateID <= 0 || toGateID <= 0) {
+    res.status(400).json({ ok: false, error: "INVALID_GATE", message: "Positive fromGateID and toGateID are required." });
+    return;
+  }
+  try {
+    const before = await readHeldFlight(held, req.webSessionID);
+    if (!requireInSpace(res, before.flight)) {
+      return;
+    }
+    const shipID = Number(before.flight.shipID) || 0;
+    const expected = {
+      fromSolarSystemID: Number(before.flight.solarSystemID) || null,
+      shipID,
+    };
+    if (!await acquireRouteTransition(res, held, "stargate", expected)) {
+      return;
+    }
+    const outcome = await boundCall(
+      held,
+      req.webSessionID,
+      parkBindSpec(before.flight.solarSystemID),
+      "CmdStargateJump",
+      [fromGateID, toGateID, shipID],
+      null,
+    );
+    markTransitionAccepted(held);
+    const after = await awaitRouteTransition(held, req.webSessionID, "stargate", expected);
+    if (!after.ok) {
+      sendTransitionTimeout(res, after, outcome.notifications);
+      return;
+    }
+    res.json({
+      ok: true,
+      result: outcome.result,
+      flight: { ...after.flight, transition: after.transition },
+      transition: after.transition,
+      notifications: [...outcome.notifications, ...after.notifications],
+    });
+  } catch (error) {
+    if (held.transition && held.transition.kind === "stargate") {
+      if (held.transition.phase === "requested") {
+        cancelHeldTransition(held);
+      } else if (held.transition.phase !== "failed") {
+        markTransitionFailed(held, error && error.message);
+      }
+    }
+    next(error);
+  }
+});
+
+// Jump through an Ansiblex / Upwell structure gate. The browser names only the
+// nearby source structure; the BFF resolves its destination through the held
+// session before issuing the consumptive command. That prevents a caller-sent
+// destination from weakening the readiness postcondition, while EveJS remains
+// authoritative for proximity, access, reciprocal link, fuel, and toll checks.
+app.post("/api/bridge/flight/jump-through-structure", requireAuth, async (req, res, next) => {
+  if (
+    !requireWriteConfirmation(
+      req,
+      res,
+      "This activates that structure jump gate, consuming its fuel and possibly charging an ISK toll. Confirm to continue.",
+    )
+  ) {
+    return;
+  }
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const structureID = Number(req.body && req.body.structureID) || 0;
+  if (structureID <= 0) {
+    res.status(400).json({
+      ok: false,
+      error: "INVALID_STRUCTURE_GATE",
+      message: "A positive structureID is required.",
+    });
+    return;
+  }
+  try {
+    const before = await readHeldFlight(held, req.webSessionID);
+    if (!requireInSpace(res, before.flight)) {
+      return;
+    }
+    const destination = await heldTopLevelCall(
+      held,
+      req.webSessionID,
+      "structureJumpBridgeMgr",
+      "GetJbStructureDestination",
+      [structureID],
+      null,
+    );
+    const destinationSolarSystemID = Number(destination.result) || 0;
+    const fromSolarSystemID = Number(before.flight.solarSystemID) || 0;
+    if (destinationSolarSystemID <= 0 || destinationSolarSystemID === fromSolarSystemID) {
+      res.status(409).json({
+        ok: false,
+        error: "STRUCTURE_JUMP_DESTINATION_UNAVAILABLE",
+        message: "That structure gate does not currently expose a valid destination.",
+        notifications: destination.notifications,
+      });
+      return;
+    }
+    const expected = {
+      fromSolarSystemID,
+      toSolarSystemID: destinationSolarSystemID,
+      shipID: Number(before.flight.shipID) || Number(held.activeShipID) || null,
+    };
+    if (!await acquireRouteTransition(res, held, "stargate", expected)) {
+      return;
+    }
+    const outcome = await heldTopLevelCall(
+      held,
+      req.webSessionID,
+      "structureJumpBridgeMgr",
+      "CmdJumpThroughStructureStargate",
+      [structureID],
+      null,
+    );
+    markTransitionAccepted(held);
+    const after = await awaitRouteTransition(held, req.webSessionID, "stargate", expected);
+    if (!after.ok) {
+      sendTransitionTimeout(res, after, [...destination.notifications, ...outcome.notifications]);
+      return;
+    }
+    res.json({
+      ok: true,
+      applied: true,
+      result: outcome.result ?? null,
+      destinationSolarSystemID,
+      flight: { ...after.flight, transition: after.transition },
+      transition: after.transition,
+      notifications: [...destination.notifications, ...outcome.notifications, ...after.notifications],
+    });
+  } catch (error) {
+    if (held.transition && held.transition.kind === "stargate") {
+      if (held.transition.phase === "requested") {
+        cancelHeldTransition(held);
+      } else if (held.transition.phase !== "failed") {
+        markTransitionFailed(held, error && error.message);
+      }
+    }
+    if (error && error.code === "SESSION_NOT_FOUND") {
+      forgetBridgeSession(req.webSessionID);
+    }
+    next(error);
+  }
+});
+
+// Dock at the destination station: beyonce.CmdDock(stationID, shipID). If the
+// ship is out of docking range the handler refuses with a DockingApproach user
+// error (surfaced as the reason); on the live server the sim completes the
+// pending dock, so the page polls flight status to see the docked state.
+app.post("/api/bridge/flight/dock", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const stationID = Number(req.body && req.body.stationID) || 0;
+  if (stationID <= 0) {
+    res.status(400).json({ ok: false, error: "INVALID_STATION", message: "A positive stationID is required." });
+    return;
+  }
+  try {
+    const before = await readHeldFlight(held, req.webSessionID);
+    if (!requireInSpace(res, before.flight)) {
+      return;
+    }
+    const shipID = Number(before.flight.shipID) || 0;
+    const expected = { stationID, shipID };
+    if (!await acquireRouteTransition(res, held, "dock", expected)) {
+      return;
+    }
+    const outcome = await boundCall(
+      held,
+      req.webSessionID,
+      parkBindSpec(before.flight.solarSystemID),
+      "CmdDock",
+      [stationID, shipID],
+      null,
+    );
+    markTransitionAccepted(held);
+    // R24 measured Handle_CmdDock answering 200/null while DECLINING silently
+    // (warp landing pending, ship immobile, docking approach required…), and
+    // the autopilot's silent-dock ladder exists to re-issue a dock that did
+    // not take. That ladder only works if this route ANSWERS — so dock waits
+    // on a SHORT non-latching probe rather than the full readiness barrier. A
+    // dock the sim accepted seats within a couple of seconds; a probe that
+    // ends with the ship still fully in space is the silent decline it almost
+    // certainly is. The transition is cancelled (CmdDock is safe to re-issue —
+    // retail's own client re-docks through DockingApproach) and the in-space
+    // flight goes back so the ladder can decide. Dock therefore never burns
+    // the 45 s barrier and never latches the session.
+    const probeMs = Number(options.dockProbeTimeoutMs) ||
+      Math.min(DOCK_SILENT_DECLINE_PROBE_MS, Number(options.transitionReadyTimeoutMs) || DOCK_SILENT_DECLINE_PROBE_MS);
+    const after = await awaitRouteTransition(held, req.webSessionID, "dock", expected, {
+      timeoutMs: probeMs,
+      latchOnTimeout: false,
+    });
+    if (!after.ok) {
+      if (after.code !== "TRANSITION_SUPERSEDED") {
+        cancelHeldTransition(held);
+      }
+      res.json({
+        ok: true,
+        result: outcome.result,
+        flight: { ...(after.flight || before.flight), transition: publicTransition(held) },
+        transition: publicTransition(held),
+        notifications: [...outcome.notifications, ...(after.notifications || [])],
+      });
+      return;
+    }
+    res.json({
+      ok: true,
+      result: outcome.result,
+      flight: { ...after.flight, transition: after.transition },
+      transition: after.transition,
+      notifications: [...outcome.notifications, ...after.notifications],
+    });
+  } catch (error) {
+    if (held.transition && held.transition.kind === "dock") {
+      // Dock never latches: CmdDock is safe to re-issue, so an error mid-wait
+      // releases the barrier instead of locking the session behind it.
+      cancelHeldTransition(held);
+    }
+    next(error);
+  }
+});
+
+// Approach a gate/target at full speed:
+// beyonce.CmdSetSpeedFraction(1.0) + CmdFollowBall(destinationID, range).
+//
+// R13: the range is no longer hardcoded to 0.0. Retail has TWO callers of this
+// one method and they differ only in that number — the right-click "Approach"
+// menu uses 50 m, and the autopilot's close-the-gap step uses 0.0. So the
+// browser passes what it means: the Overview's Approach button sends the 50 m
+// default, and the decide-loop sends 0. (Keep at range is the same method again
+// at the player's chosen distance — see /flight/keep-at-range below.)
+//
+// An autopilot-warp lands the ship NEAR a gate but often outside jump range, so
+// CmdStargateJump refuses NotWithinMaxJumpDist until the ship follows the gate
+// into range. (Both methods were allowlisted in R5a; R13 adds no pair here.)
+app.post("/api/bridge/flight/approach", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const destinationID = Number(req.body && req.body.destinationID) || 0;
+  if (destinationID <= 0) {
+    res.status(400).json({ ok: false, error: "INVALID_TARGET", message: "A positive destinationID is required." });
+    return;
+  }
+  const range = normalizeFollowRange(req.body && req.body.range, APPROACH_DEFAULT_RANGE_M, 0);
+  if (range === null) {
+    res.status(400).json({
+      ok: false,
+      error: "INVALID_RANGE",
+      message: "The approach range must be a distance in metres.",
+    });
+    return;
+  }
+  try {
+    const before = await readHeldFlight(held, req.webSessionID);
+    if (!requireInSpace(res, before.flight)) {
+      return;
+    }
+    const spec = parkBindSpec(before.flight.solarSystemID);
+    await boundCall(held, req.webSessionID, spec, "CmdSetSpeedFraction", [1.0], null);
+    const outcome = await boundCall(held, req.webSessionID, spec, "CmdFollowBall", [destinationID, range], null);
+    const after = await readHeldFlightAfterCommand(held, req.webSessionID, before);
+    res.json({
+      ok: true,
+      result: outcome.result,
+      flight: after.flight,
+      notifications: [...outcome.notifications, ...after.notifications],
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Keep at range: beyonce.CmdSetSpeedFraction(1.0) + CmdFollowBall(targetID,
+// range). The SAME server method as Approach — retail has no separate
+// keep-at-range command, it just passes a non-zero range. Default 1000 m,
+// floored at 50 m (below that the server treats it as a docking-style approach).
+app.post("/api/bridge/flight/keep-at-range", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const targetID = Number(req.body && req.body.targetID) || 0;
+  if (targetID <= 0) {
+    res.status(400).json({ ok: false, error: "INVALID_TARGET", message: "A positive targetID is required." });
+    return;
+  }
+  const range = normalizeFollowRange(
+    req.body && req.body.range,
+    KEEP_AT_RANGE_DEFAULT_M,
+    KEEP_AT_RANGE_FLOOR_M,
+  );
+  if (range === null) {
+    res.status(400).json({
+      ok: false,
+      error: "INVALID_RANGE",
+      message: "The range to hold must be a distance in metres.",
+    });
+    return;
+  }
+  try {
+    const before = await readHeldFlight(held, req.webSessionID);
+    if (!requireInSpace(res, before.flight)) {
+      return;
+    }
+    const spec = parkBindSpec(before.flight.solarSystemID);
+    await boundCall(held, req.webSessionID, spec, "CmdSetSpeedFraction", [1.0], null);
+    const outcome = await boundCall(held, req.webSessionID, spec, "CmdFollowBall", [targetID, range], null);
+    const after = await readHeldFlightAfterCommand(held, req.webSessionID, before);
+    res.json({
+      ok: true,
+      result: outcome.result,
+      flight: after.flight,
+      notifications: [...outcome.notifications, ...after.notifications],
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Orbit: beyonce.CmdOrbit(targetID, range) (allowlisted in R13). Default 1000 m.
+// The range is coerced the way the retail client coerces it before sending —
+// float below 10, int at or above — so the wire value matches what the real
+// client puts on it.
+app.post("/api/bridge/flight/orbit", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const targetID = Number(req.body && req.body.targetID) || 0;
+  if (targetID <= 0) {
+    res.status(400).json({ ok: false, error: "INVALID_TARGET", message: "A positive targetID is required." });
+    return;
+  }
+  const requested = normalizeFollowRange(req.body && req.body.range, ORBIT_DEFAULT_RANGE_M, 0);
+  if (requested === null) {
+    res.status(400).json({
+      ok: false,
+      error: "INVALID_RANGE",
+      message: "The orbit range must be a distance in metres.",
+    });
+    return;
+  }
+  const range = requested < 10 ? Number(requested) : Math.round(requested);
+  try {
+    const before = await readHeldFlight(held, req.webSessionID);
+    if (!requireInSpace(res, before.flight)) {
+      return;
+    }
+    const spec = parkBindSpec(before.flight.solarSystemID);
+    await boundCall(held, req.webSessionID, spec, "CmdSetSpeedFraction", [1.0], null);
+    const outcome = await boundCall(held, req.webSessionID, spec, "CmdOrbit", [targetID, range], null);
+    const after = await readHeldFlightAfterCommand(held, req.webSessionID, before);
+    res.json({
+      ok: true,
+      result: outcome.result,
+      flight: after.flight,
+      notifications: [...outcome.notifications, ...after.notifications],
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Align to: beyonce.CmdAlignTo(dstID=targetID, bookmarkID=null) (allowlisted in
+// R13). KWARGS ONLY — the retail client never sends a positional target here,
+// and exactly one of dstID / bookmarkID is non-null. This BFF only offers the
+// dstID form (the browser has no bookmarks yet), so bookmarkID is always null.
+app.post("/api/bridge/flight/align", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const targetID = Number(req.body && req.body.targetID) || 0;
+  if (targetID <= 0) {
+    res.status(400).json({ ok: false, error: "INVALID_TARGET", message: "A positive targetID is required." });
+    return;
+  }
+  try {
+    const before = await readHeldFlight(held, req.webSessionID);
+    if (!requireInSpace(res, before.flight)) {
+      return;
+    }
+    const outcome = await boundCall(
+      held,
+      req.webSessionID,
+      parkBindSpec(before.flight.solarSystemID),
+      "CmdAlignTo",
+      [],
+      { dstID: targetID, bookmarkID: null },
+    );
+    const after = await readHeldFlightAfterCommand(held, req.webSessionID, before);
+    res.json({
+      ok: true,
+      result: outcome.result,
+      flight: after.flight,
+      notifications: [...outcome.notifications, ...after.notifications],
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Stop: beyonce.CmdStop() (allowlisted in R13). No arguments at all.
+//
+// In retail, Stop also kills the autopilot (CancelSystemNavigation before,
+// SetOff after). Our autopilot is CLIENT-side, so the browser aborts its own
+// decide-loop around this call — the server half is just CmdStop.
+app.post("/api/bridge/flight/stop", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const before = await readHeldFlight(held, req.webSessionID);
+    if (!requireInSpace(res, before.flight)) {
+      return;
+    }
+    const outcome = await boundCall(
+      held,
+      req.webSessionID,
+      parkBindSpec(before.flight.solarSystemID),
+      "CmdStop",
+      [],
+      null,
+    );
+    const after = await readHeldFlightAfterCommand(held, req.webSessionID, before);
+    res.json({
+      ok: true,
+      result: outcome.result,
+      flight: after.flight,
+      notifications: [...outcome.notifications, ...after.notifications],
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// --- R103 WB-BEYONCE: the 7 Phase-4 BOUND nav/bookmark WRITES -----------------
+//
+// These ride the SAME beyonce remote-park bind (parkBindSpec(solarSystemID) —
+// Moniker("beyonce", solarSystemID)) the R5a/R13 movement verbs use. The BFF
+// reads the session's OWN live flight to recover the current solarSystemID, binds
+// the park for that system, and dispatches each write as a BOUND method off that
+// handle (mirroring the warp/jump/dock routes above). Every route is confirm-gated
+// and requires the ship to be in space. FAST-MODE: none fired live (operator owns
+// EveJS). Handlers return null / a bookmark id; the ack carries `result` through
+// for a future nav/bookmark UI. Args are EDUCATED-GUESS from the handler shapes.
+//
+// ⚠ ARG-INJECTION: every handler resolves ship / scene / char from the SESSION
+// (spaceRuntime.<op>(session, …) / fleetRuntime.<op>(session, …) / creatorID =
+// session.characterID for the bookmark writers). CmdJumpThroughFleet takes a
+// fleet-mate's (charID, shipID) but validates them against the SESSION's own fleet
+// membership and looks up the bridge scoped to the session char — the legitimate
+// cyno-jump mechanism, not a caller-forgeable foreign ship. No foreign-id write —
+// no handoff-doc flag.
+
+/**
+ * Dispatch one confirm-gated BOUND beyonce write off the park bind. Reads the
+ * session's live flight to bind the CURRENT solar system and require in-space;
+ * a lost session drops the held session (page returns to character select).
+ */
+async function dispatchBoundBeyonceWrite(req, res, next, method, args, kwargs = null, transition = null) {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const before = await readHeldFlight(held, req.webSessionID);
+    if (!requireInSpace(res, before.flight)) {
+      return;
+    }
+    const expected = transition
+      ? {
+          ...transition.expected,
+          fromSolarSystemID: Number(before.flight.solarSystemID) || null,
+          shipID: Number(before.flight.shipID) || Number(held.activeShipID) || null,
+        }
+      : null;
+    if (transition && !await acquireRouteTransition(res, held, transition.kind, expected)) {
+      return;
+    }
+    const outcome = await boundCall(
+      held,
+      req.webSessionID,
+      parkBindSpec(before.flight.solarSystemID),
+      method,
+      args,
+      kwargs,
+    );
+    if (transition) {
+      markTransitionAccepted(held);
+    }
+    const after = transition
+      ? await awaitRouteTransition(held, req.webSessionID, transition.kind, expected)
+      : await readHeldFlight(held, req.webSessionID);
+    if (transition && !after.ok) {
+      sendTransitionTimeout(res, after, outcome.notifications);
+      return;
+    }
+    res.json({
+      ok: true,
+      applied: true,
+      result: outcome.result ?? null,
+      flight: transition ? { ...after.flight, transition: after.transition } : after.flight,
+      ...(transition ? { transition: after.transition } : {}),
+      notifications: [...outcome.notifications, ...after.notifications],
+    });
+  } catch (error) {
+    if (transition && held.transition && held.transition.kind === transition.kind) {
+      if (held.transition.phase === "requested") {
+        cancelHeldTransition(held);
+      } else if (held.transition.phase !== "failed") {
+        markTransitionFailed(held, error && error.message);
+      }
+    }
+    if (error && error.code === "SESSION_NOT_FOUND") {
+      forgetBridgeSession(req.webSessionID);
+    }
+    next(error);
+  }
+}
+
+// CmdGotoPoint(x, y, z) — free-flight steer the ship toward an absolute point.
+app.post("/api/bridge/flight/goto-point", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This flies the ship toward that point. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const x = Number(body.x) || 0;
+  const y = Number(body.y) || 0;
+  const z = Number(body.z) || 0;
+  await dispatchBoundBeyonceWrite(req, res, next, "CmdGotoPoint", [x, y, z]);
+});
+
+// CmdGotoBookmark(bookmarkID) — free-flight steer toward a saved bookmark.
+app.post("/api/bridge/flight/goto-bookmark", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This flies the ship toward that bookmark. Confirm to continue.")) {
+    return;
+  }
+  const bookmarkID = Number((req.body || {}).bookmarkID) || 0;
+  await dispatchBoundBeyonceWrite(req, res, next, "CmdGotoBookmark", [bookmarkID]);
+});
+
+// CmdAbandonLoot([itemIDs]) — abandon loot the session ship is holding onto in
+// space (the runtime drops it from the session's inventory-loot claim).
+app.post("/api/bridge/flight/abandon-loot", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This abandons those loot items. Confirm to continue.")) {
+    return;
+  }
+  await dispatchBoundBeyonceWrite(req, res, next, "CmdAbandonLoot", [bridgeIDList((req.body || {}).itemIDs)]);
+});
+
+// CmdFleetTagTarget(itemID, tag) — set (or clear, tag=null) the fleet target tag
+// on an entity. Fleet-scoped server-side.
+app.post("/api/bridge/flight/fleet-tag-target", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This sets that fleet target tag. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const itemID = Number(body.itemID) || 0;
+  const tag = body.tag === undefined || body.tag === null ? null : String(body.tag);
+  await dispatchBoundBeyonceWrite(req, res, next, "CmdFleetTagTarget", [itemID, tag]);
+});
+
+// CmdJumpThroughFleet(otherCharID, otherShipID, beaconID, solarSystemID) — jump
+// through a fleet-mate's cyno bridge. Validated against the session's own fleet
+// membership server-side (the (charID, shipID) name the bridge, not a foreign ship
+// to hijack). Consumes bridge fuel + transitions the session to a new system.
+app.post("/api/bridge/flight/jump-through-fleet", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This jumps your ship through that fleet bridge (changes system). Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const otherCharID = Number(body.otherCharID) || 0;
+  const otherShipID = Number(body.otherShipID) || 0;
+  const beaconID = Number(body.beaconID) || 0;
+  const solarSystemID = Number(body.solarSystemID) || 0;
+  await dispatchBoundBeyonceWrite(
+    req,
+    res,
+    next,
+    "CmdJumpThroughFleet",
+    [otherCharID, otherShipID, beaconID, solarSystemID],
+    null,
+    { kind: "stargate", expected: { toSolarSystemID: solarSystemID } },
+  );
+});
+
+// BookmarkLocation(itemID, folderID, name, comment, expiryMode, subfolderID?) —
+// create a bookmark for an in-space location/entity (creatorID = session char).
+app.post("/api/bridge/flight/bookmark-location", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This creates a location bookmark. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const itemID = Number(body.itemID) || 0;
+  const folderID = Number(body.folderID) || 0;
+  const name = String(body.name ?? "");
+  const comment = String(body.comment ?? "");
+  const expiryMode = Number(body.expiryMode) || 0;
+  const kwargs = body.subfolderID === undefined || body.subfolderID === null
+    ? null
+    : { subfolderID: Number(body.subfolderID) || 0 };
+  await dispatchBoundBeyonceWrite(req, res, next, "BookmarkLocation", [itemID, folderID, name, comment, expiryMode], kwargs);
+});
+
+// BookmarkScanResult(locationID, name, comment, resultID, folderID, expiryMode,
+// subfolderID?) — bookmark a probe-scan result (creatorID = session char).
+app.post("/api/bridge/flight/bookmark-scan-result", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This creates a bookmark from that scan result. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const locationID = Number(body.locationID) || 0;
+  const name = String(body.name ?? "");
+  const comment = String(body.comment ?? "");
+  const resultID = Number(body.resultID) || 0;
+  const folderID = Number(body.folderID) || 0;
+  const expiryMode = Number(body.expiryMode) || 0;
+  const kwargs = body.subfolderID === undefined || body.subfolderID === null
+    ? null
+    : { subfolderID: Number(body.subfolderID) || 0 };
+  await dispatchBoundBeyonceWrite(req, res, next, "BookmarkScanResult", [locationID, name, comment, resultID, folderID, expiryMode], kwargs);
+});
+
+// --- R23 slice A: targeting + module activation -----------------------------
+//
+// THE GENERIC IN-SPACE ACTION LAYER. Everything below is deliberately free of
+// any notion of mining, combat, salvaging or ewar: a target is a target, a
+// module is a module, and the effect name is an ARGUMENT. R23 slice B drives a
+// mining laser through these four routes; a later combat goal drives a turret
+// through the same four routes with a different module and effect name and
+// needs no new BFF surface, no new store slice and no new UI.
+//
+// If you find yourself about to add "mining" to a name in this section, don't.
+
+/** A dogmaIM target list ({type:"list", items:[…]}) as plain itemIDs. */
+function decodeTargetIDList(result) {
+  const items =
+    result && result.type === "list" && Array.isArray(result.items) ? result.items : [];
+  return items
+    .map((value) => Number(value && typeof value === "object" ? value.value : value) || 0)
+    .filter((value) => value > 0);
+}
+
+/** The itemIDs the server says are locked RIGHT NOW. The only authority. */
+async function readLockedTargetIDs(held, webSessionID) {
+  const outcome = await heldTopLevelCall(held, webSessionID, "dogmaIM", "GetTargets", [], null);
+  return { ids: decodeTargetIDList(outcome.result), notifications: outcome.notifications };
+}
+
+/**
+ * Did the module the caller named end up RUNNING? Answered as a set DELTA, not
+ * by asking whether that exact itemID is in the running set.
+ *
+ * The reason is weapon banking. dogmaService.js Handle_Activate silently
+ * redirects a banked weapon to its bank MASTER, and the snapshot then reports
+ * the master's itemID — so a slave weapon can start cycling without its own id
+ * ever appearing, and `ids.includes(itemID)` would call a successful shot a
+ * failure. Asking "is this id running, OR did the running set grow?" is right
+ * either way round.
+ *
+ * Measured live in R29: banking is NOT reachable from this browser today —
+ * banks are built only by dogmaIM.LinkWeapons, which is not allowlisted, and
+ * two same-type turrets fired together each reported their OWN itemID with
+ * `isBanked:false` on every damage message. This is therefore a guard against
+ * a real server behaviour the client cannot currently trigger, not a fix for a
+ * bug firing today. It costs one extra snapshot read and cannot be wrong.
+ *
+ * Returns null when either snapshot could not answer — "unknown", never "off".
+ */
+function activationLanded(idsBefore, idsAfter, itemID) {
+  if (idsAfter === null) {
+    return null;
+  }
+  if (idsAfter.includes(itemID)) {
+    return true;
+  }
+  if (idsBefore === null) {
+    return false;
+  }
+  // The named module is absent, but something new IS cycling that was not
+  // before: that is the bank master standing in for the weapon we asked for.
+  const before = new Set(idsBefore);
+  if (idsAfter.some((id) => !before.has(id))) {
+    return true;
+  }
+  // Nothing is running at all, so nothing started. Unambiguous.
+  if (idsAfter.length === 0) {
+    return false;
+  }
+  // Otherwise the running set did not change and the module we named is not in
+  // it. From OUTSIDE, with no bank map, this has two indistinguishable causes:
+  // the weapon joined a bank whose master was already cycling, or the server
+  // took the call and did nothing. This bridge does not get to guess between
+  // "your gun is firing" and "your gun is not", so it says UNKNOWN — the same
+  // answer it gives when the snapshot cannot answer at all.
+  return null;
+}
+
+/**
+ * The module itemIDs the server says are CYCLING right now, read from the space
+ * snapshot's ship projection (which reads the ship entity's own active-effect
+ * map). There is no separate retail call for this, and the browser must never
+ * substitute its own memory of what it clicked.
+ */
+async function readActiveModuleIDs(held) {
+  const outcome = await gateway.readSpaceSnapshot(held.bridgeSessionID, {
+    userid: held.accountID,
+  });
+  const ship = outcome && outcome.space ? outcome.space.ship : null;
+  const ids = ship && Array.isArray(ship.activeModuleIDs) ? ship.activeModuleIDs : null;
+  return {
+    // null (not []) when the snapshot could not answer at all, so the caller can
+    // say "unknown" instead of "nothing is running".
+    ids: ids === null ? null : ids.map((value) => Number(value) || 0).filter((v) => v > 0),
+    notifications: outcome ? outcome.notifications : [],
+  };
+}
+
+// What is locked right now. The page polls this alongside the space snapshot.
+app.get("/api/bridge/targets", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const locked = await readLockedTargetIDs(held, req.webSessionID);
+    res.json({ ok: true, targetIDs: locked.ids, notifications: locked.notifications });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Lock a target: dogmaIM.AddTarget(targetID) -> [pendingFlag, targetIDList].
+//
+// A lock is NOT instant — the server acquires it over a duration that depends
+// on the ship's scan resolution and the target's signature — so AddTarget
+// answering 200 does not mean the target is locked. The pending flag says the
+// server ACCEPTED the attempt; the re-read of GetTargets says whether it has
+// landed yet. Both are reported separately and the page shows "Locking…" until
+// a later poll sees the target in the locked list.
+//
+// Every refusal (out of range, too many locked, already warping, no such ball)
+// is the handler's own reason, passed through untouched.
+app.post("/api/bridge/targets/lock", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const targetID = Number(req.body && req.body.targetID) || 0;
+  if (targetID <= 0) {
+    res.status(400).json({ ok: false, error: "INVALID_TARGET", message: "A target is required." });
+    return;
+  }
+  try {
+    const before = await readHeldFlight(held, req.webSessionID);
+    if (!requireInSpace(res, before.flight)) {
+      return;
+    }
+    const outcome = await heldTopLevelCall(
+      held,
+      req.webSessionID,
+      "dogmaIM",
+      "AddTarget",
+      [targetID],
+      null,
+    );
+    // AddTarget answers the retail pair [pendingFlag, targetIDList].
+    const pair = Array.isArray(outcome.result) ? outcome.result : [];
+    const accepted = Number(pair[0]) === 1;
+    // A 200 is not proof: ask the server what is actually locked.
+    const locked = await readLockedTargetIDs(held, req.webSessionID);
+    res.json({
+      ok: true,
+      targetID,
+      // The lock has LANDED.
+      locked: locked.ids.includes(targetID),
+      // The server accepted the attempt and is still acquiring it.
+      acquiring: accepted && !locked.ids.includes(targetID),
+      targetIDs: locked.ids,
+      notifications: [...outcome.notifications, ...locked.notifications],
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Unlock one target: dogmaIM.RemoveTarget(targetID). The handler returns null
+// whether or not anything was dropped, so the re-read is the whole answer.
+//
+// Unlocking is deliberately ONE TARGET AT A TIME: dogmaIM.RemoveTargets and
+// ClearTargets (drop every lock in a single call) are NOT allowlisted, so a
+// stray click here can only ever cost one lock.
+app.post("/api/bridge/targets/unlock", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const targetID = Number(req.body && req.body.targetID) || 0;
+  if (targetID <= 0) {
+    res.status(400).json({ ok: false, error: "INVALID_TARGET", message: "A target is required." });
+    return;
+  }
+  try {
+    const before = await readHeldFlight(held, req.webSessionID);
+    if (!requireInSpace(res, before.flight)) {
+      return;
+    }
+    // A lock that is still being ACQUIRED is not in the locked list yet, and
+    // RemoveTarget does not touch it — CancelAddTarget is the verb for that.
+    // Cancelling first makes one "Unlock" button correct in both states; a
+    // cancel for a target that was never pending is a no-op on the server.
+    const cancelled = await heldTopLevelCall(
+      held,
+      req.webSessionID,
+      "dogmaIM",
+      "CancelAddTarget",
+      [targetID],
+      null,
+    );
+    const outcome = await heldTopLevelCall(
+      held,
+      req.webSessionID,
+      "dogmaIM",
+      "RemoveTarget",
+      [targetID],
+      null,
+    );
+    const locked = await readLockedTargetIDs(held, req.webSessionID);
+    res.json({
+      ok: true,
+      targetID,
+      // The only claim worth making: it is no longer locked.
+      released: !locked.ids.includes(targetID),
+      targetIDs: locked.ids,
+      notifications: [
+        ...cancelled.notifications,
+        ...outcome.notifications,
+        ...locked.notifications,
+      ],
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Switch a module ON: dogmaIM.Activate(moduleItemID, effectName, targetID, repeat).
+//
+// GENERIC BY CONSTRUCTION. The browser does not know, and must not guess, which
+// effect a given module runs: an EMPTY effect name makes the server resolve the
+// module's own default activation effect from its typeID. A caller that DOES
+// know (slice B sends "miningLaser") may name one, and combat will name its
+// own — but that is the caller's argument, not this route's business.
+//
+// `repeat` is the retail cycle flag: -1 keeps cycling until something stops it,
+// 0 runs a single cycle. Default -1, the retail default for a held module.
+//
+// The handler owns every refusal — module not online, no target, target not
+// locked, out of range, not enough capacitor, wrong charge/crystal — and each
+// arrives with its own reason, which is passed through untouched. This BFF
+// never pre-judges whether a module can run.
+app.post("/api/bridge/modules/activate", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const body = req.body || {};
+  const itemID = Number(body.itemID) || 0;
+  if (itemID <= 0) {
+    res.status(400).json({ ok: false, error: "INVALID_MODULE", message: "A module is required." });
+    return;
+  }
+  const effect = typeof body.effect === "string" ? body.effect : "";
+  const targetID = Number(body.targetID) || 0;
+  const repeat = body.repeat === 0 || body.repeat === "0" ? 0 : -1;
+  try {
+    const before = await readHeldFlight(held, req.webSessionID);
+    if (!requireInSpace(res, before.flight)) {
+      return;
+    }
+    // Read the running set BEFORE, so success can be judged as a set DELTA
+    // rather than by asking whether this exact itemID came back.
+    const activeBefore = await readActiveModuleIDs(held);
+    const outcome = await heldTopLevelCall(
+      held,
+      req.webSessionID,
+      "dogmaIM",
+      "Activate",
+      [itemID, effect, targetID > 0 ? targetID : null, repeat],
+      null,
+    );
+    // A 200 is not proof: ask the server which modules are actually cycling.
+    const active = await readActiveModuleIDs(held);
+    res.json({
+      ok: true,
+      itemID,
+      // null when the snapshot could not answer — "unknown", never "off".
+      active: activationLanded(activeBefore.ids, active.ids, itemID),
+      activeModuleIDs: active.ids,
+      notifications: [...outcome.notifications, ...active.notifications],
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Switch a module OFF: dogmaIM.Deactivate(moduleItemID, effectName). Same
+// generality, same re-read.
+//
+// ⚠ PROPULSION MODULES NEED THEIR EFFECT NAMED, and the browser cannot know it.
+// The eve.js handler routes an afterburner/MWD to deactivatePropulsionModule
+// ONLY when the effect argument says so; an empty effect takes the generic
+// path, which answers success while the prop mod keeps cycling (a marked
+// server-side asymmetry — ACTIVATE infers the module's default effect from its
+// type, DEACTIVATE does not; dogmaService.js Handle_Deactivate). So the caller
+// may send the module's typeID and the BFF resolves the prop effect from the
+// SDE's own typeDogma. Live case: Rada Hjoren's 1MN Civilian Afterburner —
+// Deactivate(itemID, "") returned 200, stopped:false, and the burner ran on;
+// with "moduleBonusAfterburner" it stops.
+app.post("/api/bridge/modules/deactivate", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const body = req.body || {};
+  const itemID = Number(body.itemID) || 0;
+  if (itemID <= 0) {
+    res.status(400).json({ ok: false, error: "INVALID_MODULE", message: "A module is required." });
+    return;
+  }
+  const typeID = Number(body.typeID) || 0;
+  let effect = typeof body.effect === "string" ? body.effect : "";
+  if (!effect && typeID > 0) {
+    effect = staticData.getPropulsionEffectName(typeID) || "";
+  }
+  try {
+    const before = await readHeldFlight(held, req.webSessionID);
+    if (!requireInSpace(res, before.flight)) {
+      return;
+    }
+    const activeBefore = await readActiveModuleIDs(held);
+    const outcome = await heldTopLevelCall(
+      held,
+      req.webSessionID,
+      "dogmaIM",
+      "Deactivate",
+      [itemID, effect],
+      null,
+    );
+    const active = await readActiveModuleIDs(held);
+    const landed = activationLanded(activeBefore.ids, active.ids, itemID);
+    res.json({
+      ok: true,
+      itemID,
+      stopped: landed === null ? null : !landed,
+      activeModuleIDs: active.ids,
+      notifications: [...outcome.notifications, ...active.notifications],
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// --- R23 slice B: the mining loop -------------------------------------------
+//
+// mine -> haul -> refine -> sell. Note what is NOT here: there is no "start
+// mining" route and no mining cycle. Mining a rock IS slice A's generic
+// lock-then-activate with a mining laser's itemID, flying to the belt is R5a's
+// warp and R13's orbit, and selling the minerals is R16's market. Slice B adds
+// only what was genuinely missing — a place to see the ore, a way to get it
+// home, the survey scanner, and the refinery.
+//
+// The BROWSER NEVER SIMULATES A CYCLE. It does not predict yield, it does not
+// count down a rock, and it does not decide when a hold is full. It asks the
+// server and shows the answer.
+
+// The ore/gas/ice hold ladder (server-side flags 134/135/181/182), with the
+// ship's ordinary cargo hold as the fallback the mining runtime itself falls
+// back to. THESE NUMBERS NEVER LEAVE THIS FILE: the browser is handed a NAME
+// per hold ("Ore hold", "Ice hold") and never a flagID (R7d / R9a).
+const MINING_HOLDS = Object.freeze([
+  Object.freeze({ key: "ore", flag: 134, label: "Ore hold" }),
+  Object.freeze({ key: "gas", flag: 135, label: "Gas hold" }),
+  Object.freeze({ key: "ice", flag: 181, label: "Ice hold" }),
+  Object.freeze({ key: "asteroid", flag: 182, label: "Asteroid hold" }),
+  // The fallback: a hull with no specialised hold mines straight into cargo,
+  // so a miner flying a frigate must still be able to see and unload the ore.
+  Object.freeze({ key: "cargo", flag: ITEM_FLAG_CARGO_HOLD, label: "Cargo hold" }),
+]);
+
+/** A util.KeyVal capacity reading ({capacity, used}) as plain numbers, or null. */
+function decodeCapacityReading(result) {
+  const entries =
+    result && result.args && Array.isArray(result.args.entries) ? result.args.entries : [];
+  const read = (key) => {
+    const entry = entries.find((pair) => Array.isArray(pair) && pair[0] === key);
+    const value = entry ? entry[1] : undefined;
+    const numeric = Number(value && typeof value === "object" ? value.value : value);
+    return Number.isFinite(numeric) ? numeric : null;
+  };
+  const capacity = read("capacity");
+  const used = read("used");
+  return capacity === null && used === null ? null : { capacity, used };
+}
+
+// Read the ship's mining holds. Every hold in the ladder is read independently
+// (Promise.allSettled) so one that the hull does not have — or one whose read
+// fails — never blanks the rest, and a hold that answers nothing at all is
+// simply reported as absent rather than as an empty hold.
+app.get("/api/bridge/ship/ore-hold", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    await readHeldFlight(held, req.webSessionID);
+    const shipID = held.activeShipID;
+    if (!shipID) {
+      res.status(409).json({ ok: false, error: "NO_ACTIVE_SHIP", message: "No active ship." });
+      return;
+    }
+    const spec = cargoBindSpec(held, shipID);
+    const settled = await Promise.allSettled(
+      MINING_HOLDS.flatMap((hold) => [
+        boundCall(held, req.webSessionID, spec, "List", [hold.flag], null),
+        boundCall(held, req.webSessionID, spec, "GetCapacity", [hold.flag], null),
+      ]),
+    );
+    for (const entry of settled) {
+      if (entry.status === "rejected" && entry.reason && entry.reason.code === "SESSION_NOT_FOUND") {
+        next(entry.reason);
+        return;
+      }
+    }
+    const holds = MINING_HOLDS.map((hold, index) => {
+      const listed = settled[index * 2];
+      const capacity = settled[index * 2 + 1];
+      // R7d: the shared row decoder carries flagID and locationID, and NEITHER
+      // may reach the browser — the whole point of naming the holds here is
+      // that the page never learns 134 exists. Only what a player reads about
+      // a stack survives: what it is, and how much of it there is.
+      const rows =
+        listed.status === "fulfilled"
+          ? decodeInventoryRows(listed.value.result).map((row) => ({
+              itemID: row.itemID,
+              typeID: row.typeID,
+              quantity: row.quantity,
+            }))
+          : null;
+      const reading =
+        capacity.status === "fulfilled" ? decodeCapacityReading(capacity.value.result) : null;
+      return {
+        // A NAME, never a flag number. The browser has no idea 134 exists.
+        key: hold.key,
+        label: hold.label,
+        // null (not []) when the read failed: "we could not look" is not the
+        // same as "the hold is empty", and the page says which.
+        items: rows,
+        capacity: reading,
+        // A hull without this hold answers a zero capacity; say so plainly so
+        // the page can leave it out instead of showing an empty 0 / 0 bar.
+        present: reading !== null && Number(reading.capacity) > 0,
+        error:
+          listed.status === "rejected"
+            ? String((listed.reason && listed.reason.code) || "READ_FAILED")
+            : capacity.status === "rejected"
+              ? String((capacity.reason && capacity.reason.code) || "READ_FAILED")
+              : null,
+      };
+    });
+    res.json({ ok: true, activeShipID: shipID, stationID: held.stationID, holds });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Unload mined ore into the station hangar. This is R3's invbroker.Add in the
+// unfit direction: the DESTINATION (the hangar) is the bound object and the ship
+// is the source location — no new server method at all.
+//
+// Docked-only, because there is nowhere else for it to go.
+app.post("/api/bridge/ship/ore-hold/unload", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const body = req.body || {};
+  const requested = Array.isArray(body.itemIDs)
+    ? body.itemIDs.map((value) => Number(value) || 0).filter((value) => value > 0)
+    : [];
+  if (requested.length === 0) {
+    res.status(400).json({
+      ok: false,
+      error: "NOTHING_SELECTED",
+      message: "Choose what to unload first.",
+    });
+    return;
+  }
+  try {
+    const before = await readHeldFlight(held, req.webSessionID);
+    if (!before.flight || before.flight.docked !== true) {
+      res.status(409).json({
+        ok: false,
+        error: "NOT_DOCKED",
+        message: "Dock at a station before unloading.",
+      });
+      return;
+    }
+    const shipID = held.activeShipID;
+    if (!shipID) {
+      res.status(409).json({ ok: false, error: "NO_ACTIVE_SHIP", message: "No active ship." });
+      return;
+    }
+    const hangarSpec = hangarBindSpec(held);
+    const notifications = [];
+    for (const itemID of requested) {
+      const outcome = await boundCall(
+        held,
+        req.webSessionID,
+        hangarSpec,
+        "Add",
+        [itemID, shipID],
+        { flag: ITEM_FLAG_HANGAR },
+      );
+      notifications.push(...outcome.notifications);
+    }
+    // A 200 is not proof — invbroker can decline a move silently. The answer is
+    // what the HOLDS say afterwards: anything still sitting in a mining hold
+    // did not move, and is named as such rather than assumed moved.
+    const spec = cargoBindSpec(held, shipID);
+    const stillHeld = new Set();
+    for (const hold of MINING_HOLDS) {
+      try {
+        const listed = await boundCall(held, req.webSessionID, spec, "List", [hold.flag], null);
+        for (const row of decodeInventoryRows(listed.result)) {
+          stillHeld.add(row.itemID);
+        }
+      } catch {
+        // A hold that cannot be re-read leaves its items unverified; they are
+        // reported as not-moved rather than silently counted as moved.
+      }
+    }
+    const moved = requested.filter((itemID) => !stillHeld.has(itemID));
+    res.json({
+      ok: true,
+      requested,
+      moved,
+      remaining: requested.filter((itemID) => stillHeld.has(itemID)),
+      notifications,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// --- R40 ship bays ---------------------------------------------------------
+//
+// EVERY bay a hull can have, by NAME. A "bay" is nothing but an inventory FLAG
+// on the ship's own inventory — exactly the mechanism R12 fitting uses for slot
+// flags — so enumerating a hull's bays is one GetCapacity per candidate flag.
+//
+// WHY THIS ROUTE EXISTS AT ALL (the client-first rule). Bound-object calls are
+// BFF-only: /api/bridge/call is a TOP-LEVEL proxy and cannot dispatch on a
+// bound handle, so the browser physically cannot run the bind-then-List
+// two-step. The existing routes each read a fixed slice and none of them
+// answers "what bays does THIS ship have": /ship/ore-hold covers the four
+// mining holds plus cargo and only for the ACTIVE ship; /drones covers the
+// drone bay, again active-ship only; /inventory/container/:itemID binds an
+// arbitrary itemID but calls List/GetCapacity with NO flag, which answers for
+// one unnamed default hold and can never enumerate the rest. A ship sitting in
+// the hangar that the player has not boarded is unreadable today.
+//
+// It adds NO eve.js allowlist pairs. GetInventoryFromId (the bind), ListByFlags
+// and GetCapacity are all ALREADY allowlisted (evejsWebGatewayRuntime.js) and
+// already driven from this file — GetInventoryFromId by containerBindSpec,
+// GetCapacity by /api/bridge/inventory, ListByFlags by /api/bridge/drones. So
+// no gateway restart is required and no new server surface is exposed.
+//
+// WHICH FLAGS. Only the flags eve.js actually MAPS to a hull attribute are
+// asked about. That is not fussiness: _calculateCapacity initialises capacity
+// to 1000000.0 and returns it untouched when no branch matches, so asking about
+// an unmapped flag (151 specialized material bay, for instance) yields a
+// phantom 1,000,000 m³ bay on every hull in the game. Asking only about mapped
+// flags means a capacity of 0 always means "this hull has no such bay".
+//
+// THESE NUMBERS NEVER LEAVE THIS FILE (R7d/R9a): the browser is handed a key
+// and a LABEL per bay and never learns that 134 exists.
+const SHIP_BAYS = Object.freeze([
+  Object.freeze({ key: "cargo", flag: ITEM_FLAG_CARGO_HOLD, label: "Cargo hold" }),
+  // The same flag ITEM_FLAG_DRONE_BAY names for /api/bridge/drones; spelled out
+  // here because that constant is declared further down this file and a const
+  // cannot be read before its declaration is evaluated.
+  Object.freeze({ key: "drone", flag: 87, label: "Drone bay" }),
+  Object.freeze({ key: "shipMaintenance", flag: 90, label: "Ship maintenance bay" }),
+  Object.freeze({ key: "fuel", flag: 133, label: "Fuel bay" }),
+  Object.freeze({ key: "ore", flag: 134, label: "Ore hold" }),
+  Object.freeze({ key: "gas", flag: 135, label: "Gas hold" }),
+  Object.freeze({ key: "mineral", flag: 136, label: "Mineral hold" }),
+  Object.freeze({ key: "salvage", flag: 137, label: "Salvage hold" }),
+  Object.freeze({ key: "ship", flag: 138, label: "Ship hold" }),
+  Object.freeze({ key: "smallShip", flag: 139, label: "Small ship hold" }),
+  Object.freeze({ key: "mediumShip", flag: 140, label: "Medium ship hold" }),
+  Object.freeze({ key: "largeShip", flag: 141, label: "Large ship hold" }),
+  Object.freeze({ key: "industrialShip", flag: 142, label: "Industrial ship hold" }),
+  Object.freeze({ key: "ammo", flag: 143, label: "Ammo hold" }),
+  Object.freeze({ key: "commandCenter", flag: 148, label: "Command center hold" }),
+  Object.freeze({ key: "planetary", flag: 149, label: "Planetary commodities hold" }),
+  Object.freeze({ key: "quafe", flag: 154, label: "Quafe bay" }),
+  Object.freeze({ key: "fleet", flag: 155, label: "Fleet hangar" }),
+  Object.freeze({ key: "fighter", flag: 158, label: "Fighter bay" }),
+  Object.freeze({ key: "corpse", flag: 174, label: "Corpse bay" }),
+  Object.freeze({ key: "booster", flag: 176, label: "Booster bay" }),
+  Object.freeze({ key: "subsystem", flag: 177, label: "Subsystem bay" }),
+  Object.freeze({ key: "ice", flag: 181, label: "Ice hold" }),
+  Object.freeze({ key: "asteroid", flag: 182, label: "Asteroid hold" }),
+  Object.freeze({ key: "mobileDepot", flag: 183, label: "Mobile depot hold" }),
+  Object.freeze({ key: "colony", flag: 185, label: "Colony resources hold" }),
+  Object.freeze({ key: "expedition", flag: 188, label: "Expedition hold" }),
+]);
+
+// Which bays a ship has, what each one holds, and how full it is.
+//
+// ABSENT IS NOT EMPTY, AND NEITHER IS UNKNOWN. Three states cross the wire,
+// because conflating them is the mistake worldHasNoContracts exists to prevent:
+//   present === true   the hull HAS this bay (capacity > 0)
+//   present === false  the hull does NOT have it (the server answered 0)
+//   present === null   we could not tell — the capacity read itself FAILED
+// A 200 on this route is not proof any individual bay was read.
+app.get("/api/bridge/ship/:shipID/bays", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const shipID = Number(req.params.shipID) || 0;
+  if (shipID <= 0) {
+    res.status(400).json({ ok: false, error: "INVALID_SHIP", message: "A ship is required." });
+    return;
+  }
+  // The bind is the SAME call a container binds with — a ship's bays are just
+  // its own inventory, so there is no ship-specific bind method.
+  const spec = containerBindSpec(shipID);
+  try {
+    // One capacity read per candidate flag, all independent: a hull that
+    // refuses one bay must not blank the other twenty-six.
+    const settled = await Promise.allSettled(
+      SHIP_BAYS.map((bay) =>
+        boundCall(held, req.webSessionID, spec, "GetCapacity", [bay.flag], null),
+      ),
+    );
+    for (const entry of settled) {
+      if (entry.status === "rejected" && entry.reason && entry.reason.code === "SESSION_NOT_FOUND") {
+        next(entry.reason);
+        return;
+      }
+    }
+    const readings = SHIP_BAYS.map((bay, index) => {
+      const outcome = settled[index];
+      if (outcome.status !== "fulfilled") {
+        // Could not look. NOT "the hull lacks this bay".
+        return { bay, capacity: null, present: null, error: String((outcome.reason && outcome.reason.code) || "READ_FAILED") };
+      }
+      const reading = decodeCapacityReading(outcome.value.result);
+      if (reading === null || reading.capacity === null) {
+        return { bay, capacity: reading, present: null, error: "NO_CAPACITY_REPORTED" };
+      }
+      return { bay, capacity: reading, present: Number(reading.capacity) > 0, error: null };
+    });
+
+    // Contents come from ONE ListByFlags over just the bays that exist, rather
+    // than a List per bay: the rows carry their own flagID, so a single read
+    // fills every bay at once. An absent bay is never asked about.
+    const presentReadings = readings.filter((entry) => entry.present === true);
+    let byFlag = null;
+    let listError = null;
+    if (presentReadings.length > 0) {
+      try {
+        const listed = await boundCall(
+          held,
+          req.webSessionID,
+          spec,
+          "ListByFlags",
+          [presentReadings.map((entry) => entry.bay.flag)],
+          null,
+        );
+        byFlag = new Map(presentReadings.map((entry) => [entry.bay.flag, []]));
+        for (const row of decodeInventoryRows(listed.result)) {
+          const bucket = byFlag.get(row.flagID);
+          if (bucket) {
+            // R7d: flagID and locationID are wire detail and must NOT reach the
+            // browser. Only what a player reads about a stack survives — what
+            // it is, how much of it there is, and enough to name and act on it.
+            bucket.push({
+              itemID: row.itemID,
+              typeID: row.typeID,
+              groupID: row.groupID,
+              categoryID: row.categoryID,
+              quantity: row.quantity,
+              singleton: row.singleton,
+            });
+          }
+        }
+      } catch (error) {
+        if (error && error.code === "SESSION_NOT_FOUND") {
+          next(error);
+          return;
+        }
+        listError = String(error.code || "READ_FAILED");
+      }
+    }
+
+    res.json({
+      ok: true,
+      shipID,
+      activeShipID: held.activeShipID || null,
+      bays: readings.map((entry) => ({
+        key: entry.bay.key,
+        label: entry.bay.label,
+        present: entry.present,
+        capacity: entry.capacity,
+        // null is "we could not look"; [] is "we looked, and it is empty".
+        // An absent bay has no contents to speak of and stays null.
+        items:
+          entry.present === true && byFlag !== null ? byFlag.get(entry.bay.flag) || [] : null,
+        error: entry.error || (entry.present === true ? listError : null),
+      })),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// The survey scanner: miningScanMgr.perform_scan() -> [[entityID, yieldTypeID,
+// remainingQuantity], …]. Read-only, session-scoped, no arguments. This is how
+// the player learns how much ore a rock has left; the browser MERGES it into
+// the overview rather than computing anything of its own.
+app.get("/api/bridge/mining/scan", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const before = await readHeldFlight(held, req.webSessionID);
+    if (!requireInSpace(res, before.flight)) {
+      return;
+    }
+    const outcome = await heldTopLevelCall(
+      held,
+      req.webSessionID,
+      "miningScanMgr",
+      "perform_scan",
+      [],
+      null,
+    );
+    res.json({ ok: true, results: outcome.result, notifications: outcome.notifications });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// IN-SPACE ORE COMPRESSION — the fleet mechanic.
+//
+// `inSpaceCompressionMgr.CompressItemInSpace(itemID, facilityBallID)` swaps one
+// ore stack for its compressed type at the same quantity (~100x less volume in
+// this build), using a mining support ship on grid as the facility: a hull
+// running an Industrial Core plus a compression module, either your own or a
+// FLEET-MATE's, and you have to be inside its range.
+//
+// ⚠ EVERY GUARD IS THE SERVER'S, AND THAT IS THE POINT. This route sends the
+// caller's own itemIDs and the ball they named; `resolveInSpaceCompressionContext`
+// then checks in-space, same-scene, live compression typelists (i.e. the modules
+// really are running), own-ship-or-same-fleet, and range — and the handler
+// refuses any item the caller does not own or that is not in their own ship. So
+// there is nothing useful for this route to re-derive, and re-deriving it in a
+// second place is how the two copies drift apart.
+//
+// Confirm-gated like every other write here. One stack per request keeps the
+// failure honest: the handler answers a refusal and a not-compressible item with
+// the SAME null, so a batch could not say which stack was which. The caller
+// re-reads its hold and judges by the stack's type having changed.
+app.post("/api/bridge/mining/compress", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  if (!requireWriteConfirmation(req, res, "This compresses that ore stack using the support ship on grid. Confirm to continue.")) {
+    return;
+  }
+  const body = req.body || {};
+  const itemID = Number(body.itemID) || 0;
+  const facilityID = Number(body.facilityID) || 0;
+  if (itemID <= 0 || facilityID <= 0) {
+    res.status(400).json({
+      ok: false,
+      error: "INVALID_TARGET",
+      message: "An itemID and the facility ship's ID are both required.",
+    });
+    return;
+  }
+  try {
+    const before = await readHeldFlight(held, req.webSessionID);
+    if (!requireInSpace(res, before.flight)) {
+      return;
+    }
+    const outcome = await heldTopLevelCall(
+      held,
+      req.webSessionID,
+      "inSpaceCompressionMgr",
+      "CompressItemInSpace",
+      [itemID, facilityID],
+      null,
+    );
+    // The handler returns [sourceItemID, sourceTypeID, sourceQuantity,
+    // outputItemID, outputTypeID, outputQuantity] on success and NULL on any
+    // refusal. `compressed` says which happened without pretending to know why —
+    // the caller re-reads the hold for the truth.
+    res.json({
+      ok: true,
+      compressed: outcome.result !== null && outcome.result !== undefined,
+      result: outcome.result ?? null,
+      notifications: outcome.notifications,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// R3's bound-object machinery, reused: Moniker('reprocessingSvc', stationID).
+// Keyed by station so docking somewhere else binds that station's refinery
+// rather than reusing a stale OID.
+function reprocessingBindSpec(held) {
+  return {
+    key: `reprocessing:${held.stationID}`,
+    service: "reprocessingSvc",
+    method: "MachoBindObject",
+    args: [held.stationID],
+    kwargs: null,
+  };
+}
+
+/** One value out of a util.KeyVal, unwrapping a marshaled long but NOT a
+ * nested list/dict (which the caller still needs whole). */
+function readKeyValField(entries, key) {
+  const entry = entries.find((pair) => Array.isArray(pair) && pair[0] === key);
+  const value = entry ? entry[1] : undefined;
+  if (value && typeof value === "object" && value.type === "long") {
+    return value.value;
+  }
+  return value;
+}
+
+function keyValEntries(value) {
+  return value && value.args && Array.isArray(value.args.entries) ? value.args.entries : [];
+}
+
+/**
+ * GetQuotes' [tax, efficiencyByTypeID, quotesByItemID] triple, as plain data.
+ *
+ * ⚠ `recoverables` is a LIST of util.KeyVals — NOT a dict of typeID -> amount —
+ * and the amount the player actually receives is the `client` field on each
+ * (`unrecoverable` is the station's share, which is exactly what the player must
+ * not be shown as theirs). Getting this wrong would put a confidently wrong
+ * mineral count on screen, so it is read from the real handler's shape
+ * (services/station/reprocessingService.js buildRecoverableEntry).
+ */
+function decodeReprocessingQuotes(result) {
+  const triple = Array.isArray(result) ? result : [];
+  const taxRaw = Number(triple[0]);
+  const dictEntries = (value) =>
+    value && value.type === "dict" && Array.isArray(value.entries) ? value.entries : [];
+  const quotes = [];
+  for (const [itemID, quote] of dictEntries(triple[2])) {
+    const entries = keyValEntries(quote);
+    const numericItemID = Number(itemID) || 0;
+    if (numericItemID <= 0) {
+      continue;
+    }
+    const recoverables = readKeyValField(entries, "recoverables");
+    const outputs = [];
+    const recoverableItems =
+      recoverables && recoverables.type === "list" && Array.isArray(recoverables.items)
+        ? recoverables.items
+        : [];
+    for (const recoverable of recoverableItems) {
+      const fields = keyValEntries(recoverable);
+      const typeID = Number(readKeyValField(fields, "typeID")) || 0;
+      // `client` is the player's share. Anything else on the entry is the
+      // station's, and must never be presented as what the player gets.
+      const quantity = Number(readKeyValField(fields, "client")) || 0;
+      if (typeID > 0 && quantity > 0) {
+        outputs.push({ typeID, quantity });
+      }
+    }
+    const iskCost = Number(readKeyValField(entries, "totalISKCost"));
+    quotes.push({
+      itemID: numericItemID,
+      typeID: Number(readKeyValField(entries, "typeID")) || null,
+      quantityToProcess: Number(readKeyValField(entries, "quantityToProcess")) || null,
+      leftOvers: Number(readKeyValField(entries, "leftOvers")) || null,
+      // What this stack costs in ISK, as the station computed it.
+      iskCost: Number.isFinite(iskCost) ? iskCost : null,
+      outputs,
+    });
+  }
+  return {
+    // null rather than 0 when the server did not give a rate: "we do not know
+    // the tax" and "the tax is nothing" are different, and a wrong 0 would
+    // understate what this costs.
+    taxRate: Number.isFinite(taxRaw) ? taxRaw : null,
+    quotes,
+  };
+}
+
+// What reprocessing these stacks WOULD produce, and what the station will take.
+// A pure read: nothing is consumed and nothing is charged by this route. The
+// tax comes back first in the retail triple and is passed through as its own
+// field, because the page must show it BEFORE the player commits.
+app.get("/api/bridge/reprocessing/quote", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const itemIDs = String((req.query && req.query.itemIDs) || "")
+    .split(",")
+    .map((value) => Number(value.trim()) || 0)
+    .filter((value) => value > 0);
+  if (itemIDs.length === 0) {
+    res.status(400).json({
+      ok: false,
+      error: "NOTHING_SELECTED",
+      message: "Choose what to reprocess first.",
+    });
+    return;
+  }
+  try {
+    const before = await readHeldFlight(held, req.webSessionID);
+    if (!before.flight || before.flight.docked !== true) {
+      res.status(409).json({
+        ok: false,
+        error: "NOT_DOCKED",
+        message: "Dock at a station to use its refinery.",
+      });
+      return;
+    }
+    const outcome = await boundCall(
+      held,
+      req.webSessionID,
+      reprocessingBindSpec(held),
+      "GetQuotes",
+      [itemIDs],
+      null,
+    );
+    const decoded = decodeReprocessingQuotes(outcome.result);
+    res.json({
+      ok: true,
+      stationID: held.stationID,
+      taxRate: decoded.taxRate,
+      quotes: decoded.quotes,
+      notifications: outcome.notifications,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ⚠ REPROCESS CONSUMES THE INPUT STACKS AND CHARGES ISK TAX. It is the only
+// destructive route in the mining loop, so it refuses outright unless the caller
+// explicitly confirms — a second gate behind the page's own two-step
+// confirmation, exactly like R12's destroy-rig. Neither a stray click nor a
+// stray POST can consume a hold full of ore.
+app.post("/api/bridge/reprocessing/reprocess", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const body = req.body || {};
+  const itemIDs = Array.isArray(body.itemIDs)
+    ? body.itemIDs.map((value) => Number(value) || 0).filter((value) => value > 0)
+    : [];
+  if (itemIDs.length === 0) {
+    res.status(400).json({
+      ok: false,
+      error: "NOTHING_SELECTED",
+      message: "Choose what to reprocess first.",
+    });
+    return;
+  }
+  if (body.confirm !== true) {
+    res.status(400).json({
+      ok: false,
+      error: "CONFIRMATION_REQUIRED",
+      message:
+        "Reprocessing consumes the ore and charges the station's tax. This action must be confirmed explicitly.",
+    });
+    return;
+  }
+  try {
+    const before = await readHeldFlight(held, req.webSessionID);
+    if (!before.flight || before.flight.docked !== true) {
+      res.status(409).json({
+        ok: false,
+        error: "NOT_DOCKED",
+        message: "Dock at a station to use its refinery.",
+      });
+      return;
+    }
+    const spec = reprocessingBindSpec(held);
+    // Reprocess(itemIDs, fromLocationID, ownerID, outputLocationID?, outputFlagID?)
+    // — the station hangar is both the source and the destination, so the
+    // minerals land where the ore was.
+    const outcome = await boundCall(
+      held,
+      req.webSessionID,
+      spec,
+      "Reprocess",
+      [itemIDs, held.stationID, held.characterID || 0, null, null],
+      null,
+    );
+    // A 200 is not proof: re-read the hangar and report which stacks are
+    // actually gone. A stack still present was NOT reprocessed, whatever the
+    // call answered.
+    let stillPresent = null;
+    try {
+      const listed = await boundCall(
+        held,
+        req.webSessionID,
+        hangarBindSpec(held),
+        "List",
+        [ITEM_FLAG_HANGAR],
+        null,
+      );
+      stillPresent = new Set(decodeInventoryRows(listed.result).map((row) => row.itemID));
+    } catch {
+      // The hangar could not be re-read, so nothing can be claimed either way.
+      stillPresent = null;
+    }
+    res.json({
+      ok: true,
+      requested: itemIDs,
+      // null when the verification read failed — "we could not check", which is
+      // reported as such and never as success.
+      processed: stillPresent === null ? null : itemIDs.filter((id) => !stillPresent.has(id)),
+      remaining: stillPresent === null ? null : itemIDs.filter((id) => stillPresent.has(id)),
+      notifications: outcome.notifications,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// R11 space overview + ship HUD. A read-only snapshot of what the ship can see
+// right now — the visible entities around it and the active ship's shield /
+// armor / hull / capacitor. The browser polls this ~1s while in space with the
+// overview open (the retail client re-renders its own overview on the same
+// 0.5-1.0s cadence) and computes distance, sorting and filtering itself from
+// the returned positions, exactly as the real client does. Read-only: it starts
+// no movement; the Warp to / Approach buttons on each row reuse the existing
+// atomic-move routes above (/api/bridge/flight/warp and /approach).
+app.get("/api/bridge/space/snapshot", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const outcome = await gateway.readSpaceSnapshot(held.bridgeSessionID, {
+      userid: held.accountID,
+    });
+    res.json({ ok: true, space: outcome.space, notifications: outcome.notifications });
+  } catch (error) {
+    if (error && error.code === "SESSION_NOT_FOUND") {
+      forgetBridgeSession(req.webSessionID);
+    }
+    next(error);
+  }
+});
+
+// --- R25 slice A: drones ----------------------------------------------------
+//
+// The first thing on this bridge that KEEPS FIGHTING after the browser stops
+// asking, and that is the whole point. An idle combat drone auto-engages
+// whatever shoots the ship it was launched from — the server's own behaviour
+// (droneRuntime's incoming-aggression hook, gated on a per-drone `aggressive`
+// setting that DEFAULTS ON). So for a miner sitting in a belt the minimum
+// viable defence is LAUNCHING. Engage below is for CHOOSING a victim; it is not
+// what makes a player defended, and this BFF does not imply that it is.
+//
+// ⚠ THE SERVICE SPLIT. Launch and scoop are `ship`; every in-space order is
+// `entity`. One feature, two services.
+//
+// ⚠ LAUNCH ANSWERS 200 WHEN IT REFUSES. The server's handler returns an empty
+// dict on outright failure and an error tuple per itemID on partial failure —
+// bandwidth, the active-drone cap, a wrong bay flag and a vanished stack all
+// arrive that way. Nothing here reads a 200 as a launch: every route below
+// re-reads the SPACE SNAPSHOT and reports what is actually out there.
+
+// The ship's drone bay flag. Like the mining holds and the slot flags, this
+// number NEVER leaves this file — the browser is handed drones by name.
+const ITEM_FLAG_DRONE_BAY = 87;
+
+/**
+ * The drones the SERVER says are in space under this ship's control.
+ *
+ * Owner AND controller are both checked. `ownerID` alone would also match a
+ * drone this character owns but launched from a hull they have since swapped
+ * out of; `controllerID` alone would match a drone flown by this hull for
+ * someone else. A drone the panel offers a Recall button for must be both.
+ */
+async function readDronesInSpace(held) {
+  const outcome = await gateway.readSpaceSnapshot(held.bridgeSessionID, {
+    userid: held.accountID,
+  });
+  const space = outcome && outcome.space ? outcome.space : null;
+  const entities = space && Array.isArray(space.entities) ? space.entities : null;
+  if (entities === null) {
+    // null, not [] — "we could not look" is not "you have no drones in space",
+    // and a page that confuses the two invites a player to launch a second set.
+    return { drones: null, notifications: outcome ? outcome.notifications : [] };
+  }
+  const shipID = Number(held.activeShipID) || 0;
+  const characterID = Number(held.characterID) || 0;
+  const drones = entities
+    .filter((row) => row && row.kind === "drone")
+    .filter((row) => {
+      const owner = Number(row.ownerID) || 0;
+      const controller = Number(row.controllerID) || 0;
+      return (
+        (characterID > 0 && owner === characterID) ||
+        (shipID > 0 && controller === shipID)
+      );
+    })
+    .map((row) => ({
+      itemID: Number(row.itemID) || 0,
+      typeID: Number(row.typeID) || null,
+      // A NAME. The panel never renders the itemID it keys rows by (R7d).
+      name: typeof row.name === "string" && row.name.length > 0 ? row.name : null,
+      // ⚠ OWNED IS NOT FLOWN. The filter above deliberately keeps a drone this
+      // CHARACTER owns even when this hull does not control it — that is how an
+      // orphaned drone (session lost, ship swapped, pod-and-reboard) stays
+      // visible instead of silently becoming someone else's salvage. But Recall
+      // and Engage only work on drones under THIS ship's control, so the page
+      // has to be able to tell the two apart: a controlled drone gets the order
+      // buttons, an uncontrolled one gets Reconnect and Scoop.
+      //
+      // A BOOLEAN, not the controllerID — the id itself must not reach the
+      // browser (R7d), and the only question the page has is this one.
+      controlled: shipID > 0 && (Number(row.controllerID) || 0) === shipID,
+      // A WORD, or null for "we could not tell" — never a raw activity enum.
+      activity: typeof row.droneActivity === "string" ? row.droneActivity : null,
+      // What it is busy with, so the page can name the rock or the rat.
+      targetID: Number(row.targetEntityID) || null,
+      shieldRatio: typeof row.shieldRatio === "number" ? row.shieldRatio : null,
+      armorRatio: typeof row.armorRatio === "number" ? row.armorRatio : null,
+      hullRatio: typeof row.hullRatio === "number" ? row.hullRatio : null,
+    }));
+  return { drones, notifications: outcome ? outcome.notifications : [] };
+}
+
+// The whole Drones panel: what is in the bay, what is in space, and the two
+// limits the server enforces on a launch.
+//
+// The LIMITS ADD NO ALLOWLIST PAIR. maxActiveDrones and droneBandwidth are
+// ordinary ship dogma attributes, and dogmaIM.ShipGetInfo — allowlisted since
+// R6 for the fitting panel — already answers the ship's whole attribute map.
+// The raw result is passed through and decoded browser-side, exactly as the
+// fitting route does, so the attribute IDs live in one place.
+//
+// The three reads are INDEPENDENT (allSettled): a bay that cannot be read must
+// not blank the drones already flying, and vice versa.
+app.get("/api/bridge/drones", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    await readHeldFlight(held, req.webSessionID);
+    const shipID = held.activeShipID;
+    if (!shipID) {
+      res.status(409).json({ ok: false, error: "NO_ACTIVE_SHIP", message: "No active ship." });
+      return;
+    }
+    const noShip = () =>
+      Promise.reject(Object.assign(new Error("No active ship."), { code: "NO_ACTIVE_SHIP" }));
+    const [bay, shipInfo, inSpace] = await Promise.allSettled([
+      boundCall(
+        held,
+        req.webSessionID,
+        cargoBindSpec(held, shipID),
+        "ListByFlags",
+        [[ITEM_FLAG_DRONE_BAY]],
+        null,
+      ),
+      heldTopLevelCall(held, req.webSessionID, "dogmaIM", "ShipGetInfo", [], null),
+      shipID ? readDronesInSpace(held) : noShip(),
+    ]);
+    for (const settled of [bay, shipInfo, inSpace]) {
+      if (settled.status === "rejected" && settled.reason && settled.reason.code === "SESSION_NOT_FOUND") {
+        next(settled.reason);
+        return;
+      }
+    }
+    const settledCode = (settled) =>
+      settled.status === "rejected"
+        ? String((settled.reason && settled.reason.code) || "READ_FAILED")
+        : null;
+    // R7d: the shared row decoder carries flagID and locationID and NEITHER may
+    // reach the browser. Only what a player reads about a drone stack survives.
+    const bayRows =
+      bay.status === "fulfilled"
+        ? decodeInventoryRows(bay.value.result).map((row) => ({
+            itemID: row.itemID,
+            typeID: row.typeID,
+            quantity: row.quantity,
+          }))
+        : null;
+    res.json({
+      ok: true,
+      activeShipID: shipID,
+      // null (not []) on a failed read: "we could not look in the bay" is not
+      // "the bay is empty", and the panel says which.
+      bay: bayRows,
+      inSpace: inSpace.status === "fulfilled" ? inSpace.value.drones : null,
+      // Raw, decoded browser-side alongside the fitting panel's attributes.
+      shipInfo: shipInfo.status === "fulfilled" ? shipInfo.value.result : null,
+      errors: {
+        bay: settledCode(bay),
+        shipInfo: settledCode(shipInfo),
+        inSpace: settledCode(inSpace),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * The shared tail of every drone mutation: re-read what is actually in space
+ * and answer with it.
+ *
+ * Not one of the four server calls below returns anything a caller can trust.
+ * LaunchDrones answers a dict that is empty on failure; CmdEngage,
+ * CmdMineRepeatedly and CmdReturnBay answer a dict that is empty on SUCCESS and
+ * carries per-drone error tuples otherwise. The snapshot is the authority, and
+ * it is the same authority in all four cases.
+ */
+async function answerWithDronesInSpace(res, held, extra, notifications) {
+  let after = { drones: null, notifications: [] };
+  try {
+    after = await readDronesInSpace(held);
+  } catch {
+    // The re-read failed; `inSpace: null` says so rather than claiming an
+    // outcome the server never confirmed.
+  }
+  res.json({
+    ok: true,
+    ...extra,
+    inSpace: after.drones,
+    notifications: [...notifications, ...after.notifications],
+  });
+}
+
+// Manual fallback for an abandoned/uncontrolled drone already within scoop
+// range. Normal recall remains entity.CmdReturnBay, which flies owned drones
+// home and scoops automatically. ScoopDrone is confirm-gated because a
+// successful call moves and may re-owner an inventory item. The raw RPC takes
+// only a drone-id list; the acting ship is session-scoped, and this route still
+// pins the held active ship against the live flight before dispatch.
+app.post("/api/bridge/drones/scoop", requireAuth, async (req, res, next) => {
+  if (!requireWriteConfirmation(req, res, "This scoops the selected abandoned drones into the active ship's drone bay. Confirm to continue.")) {
+    return;
+  }
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const droneIDs = strictPositiveIDList((req.body || {}).droneIDs);
+  if (droneIDs === null) {
+    sendDedicatedWriteInputError(res, "INVALID_DRONE_IDS", "droneIDs must be a non-empty list of positive integers.");
+    return;
+  }
+  try {
+    const context = await readPinnedActiveShip(held, req.webSessionID, res);
+    if (!context || !requireInSpace(res, context.flight)) {
+      return;
+    }
+    const outcome = await heldTopLevelCall(
+      held,
+      req.webSessionID,
+      "ship",
+      "ScoopDrone",
+      [droneIDs],
+      null,
+    );
+    res.json({ ok: true, applied: true, result: outcome.result ?? null, notifications: outcome.notifications });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Launch from the bay: ship.LaunchDrones([[itemID, qty], …], whoseBehalfID,
+// ignoreWarning).
+//
+// The BFF does NOT pre-check bandwidth or the active-drone cap. The server owns
+// both limits, refuses per drone with its own reason, and would have to be
+// re-implemented here to guess — so the page shows the limits, sends the
+// request, and reports what came back in space.
+app.post("/api/bridge/drones/launch", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const body = req.body || {};
+  const requested = Array.isArray(body.drones)
+    ? body.drones
+        .map((entry) => ({
+          itemID: Number(entry && entry.itemID) || 0,
+          quantity: Math.max(1, Number(entry && entry.quantity) || 1),
+        }))
+        .filter((entry) => entry.itemID > 0)
+    : [];
+  if (requested.length === 0) {
+    res.status(400).json({
+      ok: false,
+      error: "NOTHING_SELECTED",
+      message: "Choose which drones to launch first.",
+    });
+    return;
+  }
+  try {
+    const before = await readHeldFlight(held, req.webSessionID);
+    if (!requireInSpace(res, before.flight)) {
+      return;
+    }
+    // What was ALREADY out, so "launched" can mean "new since the request"
+    // rather than "everything in space". A read that fails here does not block
+    // the launch — it just makes the outcome unverifiable, which is reported as
+    // such below rather than guessed at.
+    let beforeSpace = { drones: null, notifications: [] };
+    try {
+      beforeSpace = await readDronesInSpace(held);
+    } catch {
+      beforeSpace = { drones: null, notifications: [] };
+    }
+    const already = new Set((beforeSpace.drones || []).map((drone) => drone.itemID));
+    const outcome = await heldTopLevelCall(
+      held,
+      req.webSessionID,
+      "ship",
+      "LaunchDrones",
+      [requested.map((entry) => [entry.itemID, entry.quantity]), held.characterID || 0, false],
+      null,
+    );
+    let after = { drones: null, notifications: [] };
+    try {
+      after = await readDronesInSpace(held);
+    } catch {
+      after = { drones: null, notifications: [] };
+    }
+    res.json({
+      ok: true,
+      requested: requested.map((entry) => entry.itemID),
+      inSpace: after.drones,
+      // The only honest claim: which drones are in space NOW that were not
+      // before. A launch the server declined simply does not appear here, and
+      // the panel reports "nothing launched" instead of a phantom success.
+      //
+      // null when EITHER read failed — without the "before" list, a drone in
+      // space now could equally have been there all along, so there is nothing
+      // to claim in either direction.
+      launched:
+        after.drones === null || beforeSpace.drones === null
+          ? null
+          : after.drones.filter((drone) => !already.has(drone.itemID)),
+      notifications: [...beforeSpace.notifications, ...outcome.notifications, ...after.notifications],
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/** Normalize a `droneIDs` body field for the three entity orders below. */
+function readDroneIDs(body) {
+  return Array.isArray(body && body.droneIDs)
+    ? body.droneIDs.map((value) => Number(value) || 0).filter((value) => value > 0)
+    : [];
+}
+
+/**
+ * The three in-space orders. All three are the SAME shape — entity.<Cmd>(
+ * [droneIDs], targetID?) followed by the same snapshot re-read — so they share
+ * one implementation and differ only in the method name and whether a target is
+ * required.
+ */
+function droneOrderRoute(routePath, method, { needsTarget }) {
+  app.post(routePath, requireAuth, async (req, res, next) => {
+    const held = requireHeldBridgeSession(req, res);
+    if (!held) {
+      return;
+    }
+    const body = req.body || {};
+    const droneIDs = readDroneIDs(body);
+    if (droneIDs.length === 0) {
+      res.status(400).json({
+        ok: false,
+        error: "NO_DRONES",
+        message: "Choose which drones to order first.",
+      });
+      return;
+    }
+    const targetID = Number(body.targetID) || 0;
+    if (needsTarget && targetID <= 0) {
+      res.status(400).json({ ok: false, error: "INVALID_TARGET", message: "A target is required." });
+      return;
+    }
+    try {
+      const before = await readHeldFlight(held, req.webSessionID);
+      if (!requireInSpace(res, before.flight)) {
+        return;
+      }
+      const outcome = await heldTopLevelCall(
+        held,
+        req.webSessionID,
+        "entity",
+        method,
+        needsTarget ? [droneIDs, targetID] : [droneIDs],
+        null,
+      );
+      await answerWithDronesInSpace(
+        res,
+        held,
+        {
+          droneIDs,
+          targetID: needsTarget ? targetID : null,
+          // R34 — THE SERVER'S OWN REASON, PER DRONE, FORWARDED RAW.
+          //
+          // ⚠ THIS IS THE REPAIR OF A LOSS, NOT A NEW FEATURE. `droneRuntime.js`
+          // writes a plain-language sentence for every drone it refuses —
+          // `appendDroneError(response, droneID, "…")`, thirteen distinct
+          // sentences, all already player-ready — into the call RESULT dict,
+          // keyed by droneID. This route used to forward `outcome.notifications`
+          // alone and drop `outcome.result` on the floor, so a refusal the
+          // server had already explained in words reached the player as
+          // nothing whatsoever. R33 had to PREDICT one of those thirteen
+          // client-side because there was nothing to render; the other twelve
+          // could not be predicted at all.
+          //
+          // NOTHING IS DECODED OR TRANSLATED HERE, deliberately. R31's rule is
+          // that the BFF forwards the raw structure and the browser is the only
+          // place a refusal becomes words — the wording then stays inside reach
+          // of the tests that pin it, instead of being re-spelled here.
+          //
+          // ⚠ THE DICT IS KEYED BY droneID, and that key is an ID (R7d). It is
+          // forwarded because it is the ONLY thing that attributes a sentence to
+          // a drone; the browser turns it into a NAME and drops it, and no
+          // reader of this field may render it.
+          result: outcome.result ?? null,
+        },
+        outcome.notifications,
+      );
+    } catch (error) {
+      next(error);
+    }
+  });
+}
+
+// Attack that ball.
+//
+// ⚠ The server does NOT require the ship to have the target locked — the
+// drone's own visibility check is the gate. The page drives this from the R23
+// locked target anyway, because "shoot the thing you deliberately locked" is
+// the only version a player can reason about; that is a UI choice, and this
+// route does not pretend it is a server rule.
+droneOrderRoute("/api/bridge/drones/engage", "CmdEngage", { needsTarget: true });
+
+// Mining drones on a rock (and salvage drones on a wreck — the same call).
+droneOrderRoute("/api/bridge/drones/mine", "CmdMineRepeatedly", { needsTarget: true });
+
+// Come home. The runtime flies them back and scoops them into the bay itself
+// once they are inside 2500 m, so there is no second call — and the drones stay
+// in space, visibly "returning", for as long as the trip takes. The re-read
+// reports exactly that rather than pretending the bay is already full.
+droneOrderRoute("/api/bridge/drones/recall", "CmdReturnBay", { needsTarget: false });
+
+// --- R28 Skills: the character sheet and the training queue ----------------
+//
+// TWO DIFFERENT SURFACES ON PURPOSE.
+//
+// The READ is the gateway's v1 GET /skills — a plain-JSON projection that needs
+// no bridge session, because reading what a character knows is not an act of
+// piloting. It arrives with names, group names, the SP threshold for every
+// level of every skill, and the queue's instants as epoch milliseconds against
+// `serverNowMs` sampled in the same read. Nothing is decoded here and nothing
+// is computed here.
+//
+// The WRITE is the retail call skillMgr.SaveNewQueue on the HELD session. It
+// has to be: the gateway's own POST /skill-queue runs under an
+// OFFLINE_COMPANION authorization policy that requires the character to be
+// OFFLINE, and a web login that has selected a character is `retail_client`.
+// (Measured, not assumed — eve.js server/tests/webGatewaySkills.test.js pins
+// both halves.) So the offline command is a companion-app surface for a
+// character who is not playing, and this client's player IS playing.
+//
+// ⚠ A 200 IS NOT PROOF. SaveNewQueue returns null on success AND validates
+// before it writes, so the only honest answer to "did the edit take" is the
+// re-read below — which comes back through the gateway's snapshot of
+// skillQueueRuntime, the same authority the save wrote to.
+async function answerWithSkillSheet(res, account, characterID, extra = {}) {
+  const skills = await gateway.getSkills(account.accountID, characterID);
+  if (!skills) {
+    res.status(404).json({
+      ok: false,
+      error: "CHARACTER_NOT_FOUND",
+      message: "That character was not found.",
+    });
+    return;
+  }
+  res.json({ ok: true, ...extra, skills });
+}
+
+app.get("/api/bridge/skills", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    await answerWithSkillSheet(res, req.account, held.characterID);
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * Save the whole queue (goal R28).
+ *
+ * Adding a skill, removing one and reordering are ALL "save this list" — that
+ * is how retail models it, and inventing three verbs on top of one server call
+ * would only create three ways to disagree with the server. The browser sends
+ * the list it wants; the server validates it as a whole (prerequisites, level
+ * order, Omega gating, the 50-entry cap, the queue-length limit) and refuses
+ * the whole list with ONE of its eleven public codes if any of that fails.
+ *
+ * The refusal codes pass through UNTRANSLATED as the CALL_REFUSED message —
+ * turning `QueueCannotPlaceSkillBeforeRequirements` into a sentence a player
+ * can act on is the page's job (R9a), and doing it here would put the wording
+ * out of reach of the tests that pin it.
+ */
+app.post("/api/bridge/skills/queue", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const body = req.body || {};
+  if (!Array.isArray(body.entries)) {
+    res.status(400).json({
+      ok: false,
+      error: "INVALID_QUEUE",
+      message: "A queue is a list of skills to train.",
+    });
+    return;
+  }
+  // Shape-check only. What is TRAINABLE is the server's judgement, and this
+  // route never pre-refuses on its behalf — a client-side guess about
+  // prerequisites or Omega state is exactly the kind of duplicated mechanic
+  // that drifts out of step with the emulator.
+  const entries = [];
+  for (const entry of body.entries) {
+    const typeID = Number(entry && entry.typeID) || 0;
+    const toLevel = Number(entry && entry.toLevel) || 0;
+    if (!Number.isSafeInteger(typeID) || typeID <= 0 || toLevel < 1 || toLevel > 5) {
+      res.status(400).json({
+        ok: false,
+        error: "INVALID_QUEUE_ENTRY",
+        message: "Each queued skill needs a skill and a level from 1 to 5.",
+      });
+      return;
+    }
+    entries.push([typeID, toLevel]);
+  }
+  try {
+    const outcome = await heldTopLevelCall(
+      held,
+      req.webSessionID,
+      "skillMgr",
+      "SaveNewQueue",
+      [entries],
+      // An empty queue is a PAUSE, not a start: activating nothing would ask
+      // the server to begin training a queue that does not exist.
+      { activate: entries.length > 0 },
+    );
+    await answerWithSkillSheet(res, req.account, held.characterID, {
+      notifications: outcome.notifications,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// --- R41 Planets: the character's colonies ---------------------------------
+//
+// WHERE THIS READ COMES FROM, AND WHY IT IS NOT A BRIDGE CALL.
+//
+// The emulator's colonies live in the `planetRuntimeState` root table, and the
+// gateway's GET /snapshot ALREADY carries them: buildPlanetRuntimeForCharacter
+// filters `coloniesByKey` down to rows whose `ownerID` is the requested
+// character before the snapshot is serialized. That read is owner-scoped by
+// construction and needs no held session — reading what you have built on a
+// planet is not an act of piloting, exactly as reading what you have trained
+// is not (R28).
+//
+// So this route adds ZERO entries to the gateway's deny-by-default call
+// allowlist. That is not laziness, it is the safer of the two options. The
+// planetMgr service DOES expose reads — GetFullNetworkForOwner,
+// GetCommandPinsForPlanet, GetExtractorsForPlanet — and every one of them is
+// deliberately OWNER-AGNOSTIC, because in the retail client they back the
+// in-space planet view where you can see that someone else has a colony:
+//
+//   Handle_GetFullNetworkForOwner takes the ownerID from `args[1]`, so
+//   allowlisting it would let any logged-in browser read ANY character's pin
+//   layout on any planet by passing someone else's ID. GetCommandPinsForPlanet
+//   and GetExtractorsForPlanet iterate `listColoniesForPlanet` across ALL
+//   owners by design.
+//
+// That is the R38 shape precisely: a convenient read that leaks owner-only data
+// for arbitrary IDs, declined. The snapshot answers the same question with the
+// ownership check already applied.
+
+const PI_PIN_KIND_BY_GROUP_ID = Object.freeze({
+  1026: "extractor",
+  1027: "command",
+  1028: "factory",
+  1029: "storage",
+  1030: "launchpad",
+  1063: "extractor-control",
+});
+
+// EveJS stores instants as Windows FILETIME (100ns ticks since 1601) in
+// STRINGS, because they overflow a double. Every instant leaves this route as
+// epoch milliseconds next to a `serverNowMs` sampled in the same read, so the
+// browser never converts a FILETIME and never compares one clock to another.
+const FILETIME_TICKS_PER_MS = 10000n;
+const FILETIME_UNIX_EPOCH_OFFSET = 116444736000000000n;
+
+// ⚠ A DURATION IS IN TICKS TOO, AND THIS ONE COST A ROUND TRIP.
+//
+// An extractor's `cycleTime` is NOT seconds — it is 100ns FILETIME ticks, the
+// same unit as the instants. planetRuntimeStore divides it by SECOND_TICKS
+// (10,000,000) everywhere it uses it. A live read caught this: the real colony
+// on Jita I carries cycleTime 9,000,000,000, which is 900 seconds — a 15-minute
+// extractor cycle, exactly what retail PI uses. Copied across as "seconds" it
+// would have rendered as a cycle 285 years long, and the tests passed happily
+// because the fixture had been written with the same wrong assumption.
+const FILETIME_TICKS_PER_SECOND = 10000000;
+
+function cycleTicksToSeconds(value) {
+  const ticks = Number(value) || 0;
+  if (ticks <= 0) {
+    return 0;
+  }
+  return Math.round(ticks / FILETIME_TICKS_PER_SECOND);
+}
+
+function fileTimeToEpochMs(value) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  const text = String(value).trim();
+  if (!/^\d+$/.test(text)) {
+    return null;
+  }
+  const ticks = BigInt(text);
+  // "0" is EveJS's "never", not 1601 — a launchpad that has never launched
+  // carries lastLaunchTime "0". Answer null so the panel says nothing rather
+  // than printing a date four centuries ago.
+  if (ticks <= FILETIME_UNIX_EPOCH_OFFSET) {
+    return null;
+  }
+  return Number((ticks - FILETIME_UNIX_EPOCH_OFFSET) / FILETIME_TICKS_PER_MS);
+}
+
+function planetPinKind(staticDataSource, typeID) {
+  const type = staticDataSource.getType(typeID);
+  const groupID = Number(type && type.groupID) || 0;
+  return PI_PIN_KIND_BY_GROUP_ID[groupID] || "other";
+}
+
+function projectPinContents(staticDataSource, contents) {
+  if (!contents || typeof contents !== "object" || Array.isArray(contents)) {
+    return [];
+  }
+  return Object.entries(contents)
+    .map(([typeIDText, quantity]) => ({
+      typeID: Number(typeIDText) || 0,
+      typeName: staticDataSource.getTypeName(Number(typeIDText) || 0),
+      quantity: Number(quantity) || 0,
+    }))
+    .filter((entry) => entry.typeID > 0 && entry.quantity > 0)
+    .sort((left, right) => right.quantity - left.quantity);
+}
+
+/**
+ * One extraction program, or null when this pin has none.
+ *
+ * NOTHING IS SIMULATED HERE. The cycle time, the quantity per cycle and both
+ * instants are the server's own numbers, copied across. Whether the program has
+ * run out is not decided here either — the browser compares `expiresAtMs` to
+ * `serverNowMs`, so a page left open goes stale visibly instead of lying.
+ */
+function projectExtractionProgram(staticDataSource, pin) {
+  const resourceTypeID = Number(pin && pin.programType) || 0;
+  const expiresAtMs = fileTimeToEpochMs(pin && pin.expiryTime);
+  const installedAtMs = fileTimeToEpochMs(pin && pin.installTime);
+  if (!resourceTypeID && expiresAtMs === null && installedAtMs === null) {
+    return null;
+  }
+  return {
+    resourceTypeID,
+    resourceTypeName: resourceTypeID ? staticDataSource.getTypeName(resourceTypeID) : null,
+    cycleTimeSeconds: cycleTicksToSeconds(pin && pin.cycleTime),
+    quantityPerCycle: Number(pin && pin.qtyPerCycle) || 0,
+    installedAtMs,
+    expiresAtMs,
+    headCount: Array.isArray(pin && pin.heads) ? pin.heads.length : 0,
+  };
+}
+
+function projectColony(staticDataSource, colony) {
+  const planetID = Number(colony && colony.planetID) || 0;
+  const solarSystemID = Number(colony && colony.solarSystemID) || 0;
+  const planetTypeID = Number(colony && colony.planetTypeID || colony && colony.typeID) || 0;
+  const pins = (Array.isArray(colony && colony.pins) ? colony.pins : []).map((pin) => {
+    const typeID = Number(pin && pin.typeID) || 0;
+    const kind = planetPinKind(staticDataSource, typeID);
+    return {
+      pinID: Number(pin && pin.pinID) || 0,
+      typeID,
+      typeName: staticDataSource.getTypeName(typeID),
+      kind,
+      contents: projectPinContents(staticDataSource, pin && pin.contents),
+      program: kind === "extractor-control"
+        ? projectExtractionProgram(staticDataSource, pin)
+        : null,
+    };
+  }).filter((pin) => pin.pinID > 0);
+  const routes = (Array.isArray(colony && colony.routes) ? colony.routes : []).map((route) => {
+    const commodityTypeID = Number(route && route.commodityTypeID) || 0;
+    return {
+      routeID: Number(route && route.routeID) || 0,
+      path: (Array.isArray(route && route.path) ? route.path : []).map((id) => Number(id) || 0),
+      commodityTypeID,
+      commodityTypeName: commodityTypeID ? staticDataSource.getTypeName(commodityTypeID) : null,
+      commodityQuantity: Number(route && route.commodityQuantity) || 0,
+    };
+  }).filter((route) => route.routeID > 0);
+  return {
+    planetID,
+    // Null, never a stringified id: a planet the static map cannot name is a
+    // fact the panel decides how to word (R7d), not a number to print.
+    planetName: planetID ? staticDataSource.getPlanetName(planetID) : null,
+    solarSystemID,
+    solarSystemName: solarSystemID ? staticDataSource.getSolarSystemName(solarSystemID) : null,
+    planetTypeID,
+    planetTypeName: planetTypeID ? staticDataSource.getTypeName(planetTypeID) : null,
+    commandCenterLevel: Number(colony && colony.level) || 0,
+    lastSimulatedAtMs: fileTimeToEpochMs(colony && colony.currentSimTime),
+    pins,
+    linkCount: (Array.isArray(colony && colony.links) ? colony.links : []).length,
+    routes,
+  };
+}
+
+/**
+ * GET /api/bridge/planets — every colony this character owns.
+ *
+ * ⚠ THE FACT, NOT A GUESS (the worldHasNoContracts rule). "The snapshot carried
+ * a colony table and none of it is yours" is a different statement from "this
+ * gateway did not report colonies at all", and only the first one justifies
+ * telling a player they have no colonies. `coloniesReadable` carries which one
+ * happened; a read that throws never reaches here at all.
+ */
+app.get("/api/bridge/planets", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const snapshot = await gateway.getSnapshot(req.account.accountID, held.characterID);
+    if (!snapshot) {
+      res.status(404).json({
+        ok: false,
+        error: "CHARACTER_NOT_FOUND",
+        message: "That character was not found.",
+      });
+      return;
+    }
+    const runtime = snapshot.planetRuntimeState;
+    const coloniesReadable = Boolean(
+      runtime && typeof runtime === "object" && !Array.isArray(runtime)
+      && runtime.coloniesByKey && typeof runtime.coloniesByKey === "object"
+      && !Array.isArray(runtime.coloniesByKey),
+    );
+    const colonies = coloniesReadable
+      ? Object.values(runtime.coloniesByKey)
+        .map((colony) => projectColony(staticData, colony))
+        .filter((colony) => colony.planetID > 0)
+        .sort((left, right) => (
+          String(left.planetName || "").localeCompare(String(right.planetName || ""))
+          || left.planetID - right.planetID
+        ))
+      : [];
+    res.json({
+      ok: true,
+      characterID: held.characterID,
+      serverNowMs: Date.now(),
+      coloniesReadable,
+      colonies,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// --- R71 plumbing sweep: Phase-1 DATA finisher (PI + asset-safety + strays) --
+// Reachable + decodable so a later goal builds UI cheaply; NO panel/store slice
+// this pass. Every route below issues the held-session call and ships the RAW
+// retail-shaped result envelope out for the browser decoder to interpret.
+// ⚠ structureDirectory.GetNearbyJumpBridges is NOT wired — R63 LEAK (no access
+// gate; returns rival corps' Ansiblex owner/name/destination). See the gateway
+// runtime + webGatewayServiceCall refusal sweep.
+
+// GET /api/bridge/pi-colonies — the SESSION character's PI top-level reads, as TWO
+// independent CRowset reads (Promise.allSettled; empty ≠ failed). Both handlers
+// scope to session.characterID and IGNORE args (the "ForChar" name is a decoy — no
+// foreign-charID path). Farmer has no colonies/launches: both are a real empty CRowset.
+//   • colonies = GetPlanetsForChar()   -> CRowset[solarSystemID, planetID, typeID,
+//     numberOfPins, celestialIndex].
+//   • launches = GetMyLaunchesDetails() -> CRowset[launchID, solarSystemID, itemID,
+//     ownerID, planetID, status, launchTime(long FILETIME), x, y, z].
+// ids stay data (R7d); launchTime bigint-safe. Decoder: web/src/bridge/piColonies.ts.
+app.get("/api/bridge/pi-colonies", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const [colonies, launches] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "planetMgr", "GetPlanetsForChar", [], null),
+      heldTopLevelCall(held, req.webSessionID, "planetMgr", "GetMyLaunchesDetails", [], null),
+    ]);
+    for (const outcome of [colonies, launches]) {
+      if (outcome.status === "rejected" && outcome.reason && outcome.reason.code === "SESSION_NOT_FOUND") {
+        next(outcome.reason);
+        return;
+      }
+    }
+    const settledValue = (outcome) => (outcome.status === "fulfilled" ? outcome.value.result : null);
+    const settledCode = (outcome) =>
+      outcome.status === "rejected" ? String((outcome.reason && outcome.reason.code) || "READ_FAILED") : null;
+    res.json({
+      ok: true,
+      characterID: held.characterID,
+      colonies: settledValue(colonies),
+      launches: settledValue(launches),
+      errors: {
+        colonies: settledCode(colonies),
+        launches: settledCode(launches),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/bridge/asset-safety?solarSystemID=&wrapIDs= — the SESSION's asset-safety
+// surface, as up to FOUR independent reads (Promise.allSettled; empty ≠ failed).
+//   • charItems = GetItemsInSafetyForCharacter() -> {type:"list", items:[KeyVal wrap]}
+//     — the session character's own wraps (args ignored, session.characterID-scoped).
+//   • corpItems = GetItemsInSafetyForCorp()       -> CachedMethodCallResult wrapping the
+//     same wrap-list for the session corp (session.corporationID-scoped; own corp only).
+//   • deliverTo = GetStructuresICanDeliverTo(solarSystemID) -> [list|empty, station|null]
+//     — the session's deliverable structures in a system, ONLY when own wraps exist
+//     there. The ?solarSystemID= arg is a SYSTEM selector, not an ownership selector;
+//     omitted → arg-less (null system) → empty.
+//   • wrapNames = GetWrapNames([wrapIDs]) -> {type:"dict", entries:[[wrapID, name|null]]}
+//     — a NAME lookup for wraps the caller already holds (?wrapIDs=1,2,3); omitted → {}.
+// Farmer has no wraps: charItems/corpItems empty, deliverTo [empty,null], wrapNames {}.
+// Decoder: web/src/bridge/assetSafety.ts. ids/ejectTime(long)/FILETIMEs bigint-safe.
+app.get("/api/bridge/asset-safety", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  const solarSystemID = nonNegativeIntQuery(req.query.solarSystemID, 0);
+  const wrapIDs = String(req.query.wrapIDs ?? "")
+    .split(",")
+    .map((token) => Number.parseInt(token.trim(), 10))
+    .filter((value) => Number.isInteger(value) && value > 0);
+  try {
+    const [charItems, corpItems, deliverTo, wrapNames] = await Promise.allSettled([
+      heldTopLevelCall(held, req.webSessionID, "structureAssetSafety", "GetItemsInSafetyForCharacter", [], null),
+      heldTopLevelCall(held, req.webSessionID, "structureAssetSafety", "GetItemsInSafetyForCorp", [], null),
+      heldTopLevelCall(
+        held,
+        req.webSessionID,
+        "structureAssetSafety",
+        "GetStructuresICanDeliverTo",
+        solarSystemID > 0 ? [solarSystemID] : [],
+        null,
+      ),
+      heldTopLevelCall(
+        held,
+        req.webSessionID,
+        "structureAssetSafety",
+        "GetWrapNames",
+        wrapIDs.length > 0 ? [wrapIDs] : [],
+        null,
+      ),
+    ]);
+    for (const outcome of [charItems, corpItems, deliverTo, wrapNames]) {
+      if (outcome.status === "rejected" && outcome.reason && outcome.reason.code === "SESSION_NOT_FOUND") {
+        next(outcome.reason);
+        return;
+      }
+    }
+    const settledValue = (outcome) => (outcome.status === "fulfilled" ? outcome.value.result : null);
+    const settledCode = (outcome) =>
+      outcome.status === "rejected" ? String((outcome.reason && outcome.reason.code) || "READ_FAILED") : null;
+    res.json({
+      ok: true,
+      requested: { solarSystemID: solarSystemID > 0 ? solarSystemID : null, wrapIDs },
+      charItems: settledValue(charItems),
+      corpItems: settledValue(corpItems),
+      deliverTo: settledValue(deliverTo),
+      wrapNames: settledValue(wrapNames),
+      errors: {
+        charItems: settledCode(charItems),
+        corpItems: settledCode(corpItems),
+        deliverTo: settledCode(deliverTo),
+        wrapNames: settledCode(wrapNames),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/bridge/ship-configuration — the SESSION's own active-ship SMB / fleet-hangar
+// sharing flags (ship.GetShipConfiguration). ⚠ Called ARG-LESS on purpose: the handler
+// does NOT ownership-check a supplied shipID, so forwarding one would let a caller read a
+// FOREIGN ship's config — the route pins it to the session's active ship (_getShipID).
+//   -> {type:"dict", entries:[[allowFleetSMBUsage,bool], …six boolean flags…]}.
+// Decoder: web/src/bridge/shipConfiguration.ts.
+app.get("/api/bridge/ship-configuration", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const outcome = await heldTopLevelCall(
+      held,
+      req.webSessionID,
+      "ship",
+      "GetShipConfiguration",
+      [],
+      null,
+    );
+    res.json({ ok: true, configuration: outcome.result });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/bridge/formations — the STATIC fleet formation-shape reference data
+// (beyonce.GetFormations). No session/entity state; a CachedMethodCallResult wrapping
+// [["Diamond",[[x,y,z],…]], ["Arrow",[…]]]. Decoder: web/src/bridge/formations.ts.
+app.get("/api/bridge/formations", requireAuth, async (req, res, next) => {
+  const held = requireHeldBridgeSession(req, res);
+  if (!held) {
+    return;
+  }
+  try {
+    const outcome = await heldTopLevelCall(
+      held,
+      req.webSessionID,
+      "beyonce",
+      "GetFormations",
+      [],
+      null,
+    );
+    res.json({ ok: true, formations: outcome.result });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// --- R5b Travel: client-side route solver static data ----------------------
+// The browser autopilot's route solver is client-side (roadmap §7 / G2): the
+// system-adjacency graph it runs BFS over is read-only static reference data
+// (like station names), served here from src/staticData.js. This is NOT a
+// gateway/bridge call and NOT a server-side travel job — no live bridge session
+// is touched. Requires the web login session (as every /api route does).
+app.get("/api/map/graph", requireAuth, async (req, res, next) => {
+  try {
+    const graph = staticData.getSolarSystemGraph();
+    res.json({
+      ok: true,
+      source: "static-data",
+      systemCount: Object.keys(graph.systems).length,
+      edgeCount: graph.edges.length,
+      systems: graph.systems,
+      edges: graph.edges,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Resolve a picked destination (a courier destination is a station; the route
+// solver works on systems) to its solar system, from static reference data —
+// the same client-local resolution the select route does for station identity.
+app.get("/api/map/resolve/:id", requireAuth, async (req, res, next) => {
+  try {
+    const id = Number(req.params.id) || 0;
+    if (id <= 0) {
+      res.status(400).json({ ok: false, error: "INVALID_ID", message: "A positive id is required." });
+      return;
+    }
+    const station = staticData.getStation(id);
+    if (station) {
+      const solarSystemID = Number(station.solarSystemID) || null;
+      res.json({
+        ok: true,
+        id,
+        kind: "station",
+        stationID: id,
+        stationName: String(station.stationName || `Station ${id}`),
+        solarSystemID,
+        systemName: solarSystemID ? staticData.getSolarSystemName(solarSystemID) : null,
+      });
+      return;
+    }
+    const system = staticData.getSolarSystem(id);
+    if (system) {
+      res.json({
+        ok: true,
+        id,
+        kind: "system",
+        stationID: null,
+        stationName: null,
+        solarSystemID: id,
+        systemName: staticData.getSolarSystemName(id),
+      });
+      return;
+    }
+    // R38 — the static tables have no answer, but a player structure is a legal
+    // destination and is runtime data. This is the SECOND consumer of the one
+    // shared structure resolver (the first is /api/names); Travel and the
+    // flight readout reach a structure name through here. A structure that
+    // cannot be resolved still falls through to kind:"unknown" below, so the
+    // honest fallback is unchanged when the lookup genuinely fails.
+    let structureLookupFailed = false;
+    if (isPlayerStructureID(id)) {
+      const { records, failed } = await resolveRuntimeStructureNames(req, [id]);
+      structureLookupFailed = failed.has(id);
+      const record = records.get(id);
+      const structureName = record ? record.name : null;
+      if (typeof structureName === "string") {
+        // GetStructureInfo carries the structure's solar system in the SAME
+        // payload as the name, so Travel gets a routable system for free.
+        const solarSystemID = record.solarSystemID;
+        res.json({
+          ok: true,
+          id,
+          kind: "structure",
+          structureID: id,
+          structureName,
+          // A structure is dockable, so the existing station-shaped consumers
+          // (which read stationID/stationName) keep working unchanged rather
+          // than every caller having to learn a new shape.
+          stationID: id,
+          stationName: structureName,
+          solarSystemID,
+          systemName: solarSystemID ? staticData.getSolarSystemName(solarSystemID) : null,
+          // Stated rather than implied: this resolved, so the caller may cache it.
+          lookupFailed: false,
+        });
+        return;
+      }
+    }
+    // ⚠ THE FACT, NOT A GUESS. "Nothing in the world bears this ID" and "we
+    // could not ask" both land on kind:"unknown", but only the first justifies
+    // the client caching the miss. `lookupFailed` separates them so a structure
+    // we simply could not reach is retried instead of being written off.
+    res.json({
+      ok: true,
+      id,
+      kind: "unknown",
+      stationID: null,
+      stationName: null,
+      solarSystemID: null,
+      systemName: null,
+      lookupFailed: structureLookupFailed,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Read-only static station identity by ID (goal R6b): the same client-local
+// resolution the select route returns for the docked station, exposed so the
+// web app can refresh the Station panel's identity (name / system / region /
+// type / security) after the docked station changes (autopilot arrival, manual
+// dock) without a full page reload. Read-only static reference data like
+// /api/map/graph and /api/map/resolve — NOT a gateway/bridge call.
+app.get("/api/map/station/:id", requireAuth, async (req, res, next) => {
+  try {
+    const id = Number(req.params.id) || 0;
+    if (id <= 0) {
+      res.status(400).json({ ok: false, error: "INVALID_ID", message: "A positive id is required." });
+      return;
+    }
+    // Only resolve a real station record (buildStationStatic otherwise returns a
+    // "Station <id>" fallback for any positive ID); an unknown ID is a 404.
+    if (!staticData.getStation(id)) {
+      res.status(404).json({ ok: false, error: "STATION_NOT_FOUND" });
+      return;
+    }
+    res.json({ ok: true, source: "static-data", station: buildStationStatic(id) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Map name search (goal R7a): let a player set a travel destination by NAME
+// instead of a raw EVE ID. Searches the static solar-system + station tables by
+// name and returns capped matches the client hands to startRoute (the R5b route
+// solver + autopilot). Read-only static reference data — like /api/map/graph and
+// /api/agents/find, NOT a gateway/bridge call. Filters by q (min 2 chars) and an
+// optional kind (system|station; default both); caps server-side (default 50 /
+// max 200) so a broad query never dumps the whole table.
+app.get("/api/map/find", requireAuth, async (req, res, next) => {
+  try {
+    const q = typeof req.query.q === "string" ? req.query.q : "";
+    const kind = typeof req.query.kind === "string" ? req.query.kind : undefined;
+    const limit = req.query.limit !== undefined ? Number(req.query.limit) : undefined;
+    const result = staticData.findMapLocations({ q, kind, limit });
+    res.json({
+      ok: true,
+      source: "static-data",
+      q: result.q,
+      kind: result.kind,
+      total: result.total,
+      capped: result.capped,
+      limit: result.limit,
+      count: result.matches.length,
+      matches: result.matches,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * R16 market ITEM SEARCH — how a player picks what to trade.
+ *
+ * The browser never knows a typeID and must never ask the player for one
+ * (R7d), so the market panel searches the static type table by NAME, exactly as
+ * /api/map/find searches systems and stations. Read-only static reference data;
+ * NOT a gateway/bridge call, so it works before (and independently of) the
+ * market daemon.
+ *
+ * Only PUBLISHED types that belong to a market group are offered: the table
+ * also holds test objects and internal placeholders that no market will ever
+ * list, and offering one would produce a server refusal the player could make
+ * no sense of.
+ */
+/**
+ * R17 mail RECIPIENT SEARCH — how a player picks who to write to.
+ *
+ * ⚠ THIS IS THE ONE PLACE THE NAMES RULE RUNS BACKWARDS. R7d says the player
+ * never sees a numeric ID; composing a message needs the opposite direction —
+ * a name typed by the player turned into the characterID SendMail's args[0]
+ * wants. Asking the player for an ID would be exactly what R7d forbids, so the
+ * name is searched here and the id is carried invisibly.
+ *
+ * Read-only static reference data, like /api/map/find and /api/market/find —
+ * NOT a gateway/bridge call, so it works independently of the live session. The
+ * caller's own character is excluded: the server treats a self-addressed
+ * message as a sender copy with no recipient, so offering it would be offering
+ * a message that goes nowhere.
+ */
+app.get("/api/characters/find", requireAuth, async (req, res, next) => {
+  try {
+    const q = typeof req.query.q === "string" ? req.query.q : "";
+    const limit = req.query.limit !== undefined ? Number(req.query.limit) : undefined;
+    const held = req.webSessionID ? bridgeSessions.get(req.webSessionID) : null;
+    const result = staticData.findCharacters({
+      q,
+      limit,
+      excludeCharacterID: held ? held.characterID : 0,
+    });
+    res.json({
+      ok: true,
+      source: "static-data",
+      q: result.q,
+      total: result.total,
+      capped: result.capped,
+      limit: result.limit,
+      count: result.matches.length,
+      matches: result.matches,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/market/find", requireAuth, async (req, res, next) => {
+  try {
+    const q = typeof req.query.q === "string" ? req.query.q : "";
+    const limit = req.query.limit !== undefined ? Number(req.query.limit) : undefined;
+    const result = staticData.findMarketTypes({ q, limit });
+    res.json({
+      ok: true,
+      source: "static-data",
+      q: result.q,
+      total: result.total,
+      capped: result.capped,
+      limit: result.limit,
+      count: result.matches.length,
+      matches: result.matches,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * R83 — BROWSING THE MARKET BY GROUP.
+ *
+ * The panel could only be reached by TYPING a name, which is fine when you know
+ * what you want and useless when you do not. Both of these are STATIC reference
+ * data (the same class as /api/market/find): no gateway call, so browsing works
+ * even when the market daemon itself is not answering, and a player can find out
+ * what exists before asking what it costs.
+ *
+ * `parent` absent or 0 returns the ROOTS. An unknown group returns an empty list
+ * rather than a 404 — "this group holds nothing" is a real answer the panel
+ * renders, and a 404 would make an ordinary empty branch look like a failure.
+ */
+app.get("/api/market/groups", requireAuth, async (req, res, next) => {
+  try {
+    const parent = req.query.parent !== undefined ? Number(req.query.parent) : 0;
+    const groups = staticData.getMarketGroupChildren(parent);
+    res.json({
+      ok: true,
+      source: "static-data",
+      parent: Number.isFinite(parent) ? parent : 0,
+      count: groups.length,
+      groups,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/market/group-types", requireAuth, async (req, res, next) => {
+  try {
+    const group = Number(req.query.group) || 0;
+    const result = staticData.getMarketGroupTypes(group);
+    res.json({
+      ok: true,
+      source: "static-data",
+      group,
+      total: result.total,
+      capped: result.capped,
+      count: result.types.length,
+      types: result.types,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * R38 — PLAYER-STRUCTURE NAMES. The one runtime name read, shared by every
+ * name path in this BFF.
+ *
+ * ⚠ WHY THIS EXISTS AT ALL. Every other name in this app comes from the static
+ * SDE, which is why /api/names and /api/map/resolve were both able to be
+ * honest "read-only static reference data, NOT a gateway call". A player-owned
+ * Upwell structure breaks that assumption: it is created at runtime, lives only
+ * in the game store, and appears in NO static table. Both static paths
+ * therefore answered "unknown" for a structure that very much has a name, and
+ * a docked Astrahus rendered as "an unnamed place".
+ *
+ * ⚠ THIS IS THE ONLY PLACE A STRUCTURE NAME IS FETCHED. Both /api/names (the
+ * batch path Assets/overview/contracts/market use) and /api/map/resolve/:id
+ * (the path Travel and the flight readout use) call through here. Resolving a
+ * structure name anywhere else — or teaching a panel to call the gateway
+ * itself — reintroduces exactly the duplicated mechanic this goal exists to
+ * avoid.
+ *
+ * THE READ: structureDirectory.GetStructureInfo(structureID) -> util.KeyVal.
+ * For a structure the caller's corp owns it returns the full directory record;
+ * for one it does not own, the public eight-key payload. BOTH carry `itemName`,
+ * which is the only field taken here — so this works for any structure, owned
+ * or not, docked at or not. Verified live against structure 1030000000001
+ * ("Perimeter - asdf", an Astrahus).
+ *
+ * ⚠ null IS A REAL ANSWER, NOT A FAILURE. GetStructureInfo returns null for a
+ * structure that does not exist — confirmed live for an unknown ID, for an NPC
+ * station ID, and for 0. That is a DEFINITIVE "this is not a player structure",
+ * safe for the client to cache forever. It is categorically different from "we
+ * could not ask" (no character online, gateway error), which must NOT be cached
+ * as a name-less result or the panel would be stuck on the fallback for the
+ * rest of the session. `failed` carries that second case out separately —
+ * the `worldHasNoContracts` rule: assert the negative only when the read
+ * actually succeeded.
+ */
+
+// Retail's structure ID floor. NPC stations live in the 60,000,000 range; every
+// player-deployed Upwell structure is allocated above 1e12. Below this, a miss
+// in the static station table is a genuine unknown and never worth a round trip.
+const STRUCTURE_ID_FLOOR = 1000000000000;
+
+// A names batch can legitimately carry hundreds of IDs, but only a handful can
+// ever be structures. GetStructureInfo is per-structure (see the allowlist note
+// on why the batch GetStructures is deliberately NOT reachable), so this bounds
+// the fan-out a single request can provoke.
+const STRUCTURE_NAME_LOOKUP_CAP = 25;
+
+// Structure names change only when someone renames the structure, so a short
+// TTL removes the per-panel-load round trip without letting a rename go stale
+// for long. Only DEFINITIVE outcomes are cached — never a failure.
+//
+// ⚠ PROCESS-WIDE, NOT PER-SESSION, AND THAT IS DELIBERATE. A structure's name
+// is public: Handle_GetStructureInfo applies no access check and hands its
+// public payload — itemName included — to any session that asks, owner or not.
+// So one account's cached name tells another account nothing it could not
+// fetch for itself, and sharing the cache means the second viewer of a
+// structure pays no round trip. Nothing owner-only is cached here: only the
+// name, system and type are kept, never the services/fuel/timer fields the
+// owner branch also returns.
+const STRUCTURE_NAME_TTL_MS = 60000;
+const structureNameCache = new Map();
+
+function isPlayerStructureID(id) {
+  return Number.isSafeInteger(id) && id >= STRUCTURE_ID_FLOOR;
+}
+
+function readCachedStructureName(structureID, now) {
+  const hit = structureNameCache.get(structureID);
+  if (!hit || hit.expiresAt <= now) {
+    structureNameCache.delete(structureID);
+    return undefined;
+  }
+  return { name: hit.name, solarSystemID: hit.solarSystemID, typeID: hit.typeID };
+}
+
+/**
+ * Resolve player-structure IDs on the caller's live session.
+ *
+ * Returns `{ records, failed }` where `records` maps a structureID to
+ * `{ name, solarSystemID, typeID }` — `name` null when the server said "no such
+ * structure" — and `failed` holds the IDs that could not be asked about at all.
+ * An ID never appears in both.
+ *
+ * ⚠ The system and type come out of the SAME KeyVal as the name. A caller that
+ * needs a structure's system must read it from here rather than making a second
+ * call; GetStructureInfo already carries it.
+ */
+async function resolveRuntimeStructureNames(req, structureIDs) {
+  const records = new Map();
+  const failed = new Set();
+  const wanted = [...new Set(structureIDs.filter(isPlayerStructureID))];
+  if (wanted.length === 0) {
+    return { records, failed };
+  }
+
+  const now = Date.now();
+  const toFetch = [];
+  for (const structureID of wanted) {
+    const cached = readCachedStructureName(structureID, now);
+    if (cached !== undefined) {
+      records.set(structureID, cached);
+    } else {
+      toFetch.push(structureID);
+    }
+  }
+  if (toFetch.length === 0) {
+    return { records, failed };
+  }
+
+  // No character online means no session to ask on. That is a FAILURE to look
+  // up, not a finding that the structure is nameless — the caller must be able
+  // to tell those apart, so these go to `failed` and nothing is cached.
+  const held = bridgeSessions.get(req.webSessionID) || null;
+  if (!held) {
+    for (const structureID of toFetch) {
+      failed.add(structureID);
+    }
+    return { records, failed };
+  }
+
+  const remember = (structureID, record) => {
+    records.set(structureID, record);
+    structureNameCache.set(structureID, { ...record, expiresAt: now + STRUCTURE_NAME_TTL_MS });
+  };
+
+  for (const structureID of toFetch.slice(0, STRUCTURE_NAME_LOOKUP_CAP)) {
+    try {
+      const outcome = await heldTopLevelCall(
+        held,
+        req.webSessionID,
+        "structureDirectory",
+        "GetStructureInfo",
+        [structureID],
+        null,
+      );
+      const result = outcome && outcome.result;
+      if (result === null || result === undefined) {
+        // The definitive "not a player structure" — cacheable.
+        remember(structureID, { name: null, solarSystemID: null, typeID: null });
+        continue;
+      }
+      const entries = keyValEntries(result);
+      const itemName = readKeyValField(entries, "itemName");
+      // A structure row with a blank name is a nameless structure (null), not a
+      // failed lookup — the empty string must never reach a panel as a label.
+      const name =
+        typeof itemName === "string" && itemName.trim().length > 0 ? itemName : null;
+      remember(structureID, {
+        name,
+        solarSystemID: Number(readKeyValField(entries, "solarSystemID")) || null,
+        typeID: Number(readKeyValField(entries, "typeID")) || null,
+      });
+    } catch (_error) {
+      // Refusal, transport error, reaped session: we do not know. Not cached.
+      failed.add(structureID);
+    }
+  }
+  // Anything past the cap was never asked about — also "we do not know".
+  for (const structureID of toFetch.slice(STRUCTURE_NAME_LOOKUP_CAP)) {
+    failed.add(structureID);
+  }
+  return { records, failed };
+}
+
+// Batch name resolution (goal R7c): the names-everywhere UI pass turns raw IDs
+// into names across every tab, so a list of many IDs (an inventory of typeIDs,
+// a guest list of corp IDs, ...) resolves in ONE round-trip. POST /api/names
+// takes { items: [{kind, id}] } and returns { names: { "kind:id": name } } over
+// the existing static getters. Each item is echoed (a name string, or null for a
+// definitive unknown the client caches); the batch is capped server-side so an
+// oversized request can't scan the whole item table.
+//
+// R38: no longer PURELY static. Static resolution runs first and answers
+// everything it can; only the `station`/`structure` items it could not name AND
+// whose ID is above the player-structure floor fall through to the runtime read
+// above. A request with no such items still makes zero gateway calls, so the
+// common case is unchanged. `unresolved` names the keys whose lookup could not
+// be completed — the client must not cache those as "unknown".
+// The kinds that can legally denote a place a player structure could be. A
+// structure arrives as "station" from every existing caller (Assets asks for
+// the location it found an item at, and does not know the difference); the
+// explicit "structure" kind is for callers that do.
+const STRUCTURE_NAME_KINDS = new Set(["station", "structure"]);
+
+app.post("/api/names", requireAuth, async (req, res, next) => {
+  try {
+    const items = Array.isArray(req.body && req.body.items) ? req.body.items : [];
+    const result = staticData.resolveNames({ items });
+    const names = { ...result.names };
+
+    // Only the static misses that could be a player structure are candidates —
+    // a name the SDE already answered is never re-asked, and an ID below the
+    // structure floor is a genuine static unknown.
+    const candidates = [];
+    for (const [key, value] of Object.entries(names)) {
+      if (value !== null) {
+        continue;
+      }
+      const separator = key.indexOf(":");
+      const kind = key.slice(0, separator);
+      const id = Number(key.slice(separator + 1)) || 0;
+      if (STRUCTURE_NAME_KINDS.has(kind) && isPlayerStructureID(id)) {
+        candidates.push({ key, id });
+      }
+    }
+
+    const unresolved = [];
+    let runtimeUsed = false;
+    if (candidates.length > 0) {
+      runtimeUsed = true;
+      const { records, failed } = await resolveRuntimeStructureNames(
+        req,
+        candidates.map((candidate) => candidate.id),
+      );
+      for (const candidate of candidates) {
+        if (failed.has(candidate.id)) {
+          // Stays null in `names`, but named here so the client leaves it
+          // uncached and retries rather than believing it is nameless.
+          unresolved.push(candidate.key);
+          continue;
+        }
+        const record = records.get(candidate.id);
+        if (record && typeof record.name === "string") {
+          names[candidate.key] = record.name;
+        }
+      }
+    }
+
+    res.json({
+      ok: true,
+      // Named on the wire so a consumer can see whether a live session was
+      // involved at all, rather than inferring it.
+      source: runtimeUsed ? "static-data+runtime-structures" : "static-data",
+      count: Object.keys(names).length,
+      capped: result.capped,
+      limit: result.limit,
+      names,
+      unresolved,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * R24 slice C — MODULE CYCLE TIMES, from static reference data.
+ *
+ * How long a module takes to run one cycle is attribute **73** (`duration`, in
+ * milliseconds), and it is already sitting in the static dogma table:
+ * Miner I / Miner II = 15000, Modulated Strip Miner II = 45000. `staticData`
+ * has exposed `getTypeDogmaAttribute` since it was written and nothing has ever
+ * called it — this is the first caller. ZERO bridge calls: like /api/names and
+ * /api/map/graph this is read-only reference data that cannot vary by player,
+ * so it never needs a round trip to EveJS.
+ *
+ * ⚠ WHAT THIS NUMBER IS NOT. It is the BASE duration on the type, before the
+ * pilot's skills, the ship's role bonuses, rigs, implants or heat. The server
+ * computes the EFFECTIVE duration (it is what it puts in an `OnGodmaShipEffect`
+ * cycle event), but there is still no allowlisted call that returns effective
+ * per-module attributes — the same wall that blocks DPS. So this route answers
+ * `baseCycleMs`, named `base` all the way to the screen, and the page prefers
+ * the server's own figure whenever a cycle event has told it one. A number
+ * presented as the truth when it is only the starting point is worse than no
+ * number at all.
+ */
+const CYCLE_TIME_TYPE_LIMIT = 500;
+const ATTRIBUTE_DURATION = 73;
+
+// A GET, deliberately: this is an idempotent read of unchanging reference data
+// with no player context in it at all. Nothing here mutates, so nothing here
+// should look like it might.
+app.get("/api/types/cycle-times", requireAuth, async (req, res, next) => {
+  try {
+    const requested = String((req.query && req.query.typeIDs) || "")
+      .split(",")
+      .map((part) => part.trim())
+      .filter((part) => part.length > 0);
+    const seen = new Set();
+    const baseCycleMs = {};
+    for (const raw of requested) {
+      const typeID = Number(raw) || 0;
+      if (typeID <= 0 || seen.has(typeID)) {
+        continue;
+      }
+      seen.add(typeID);
+      if (seen.size > CYCLE_TIME_TYPE_LIMIT) {
+        break;
+      }
+      const value = Number(staticData.getTypeDogmaAttribute(typeID, ATTRIBUTE_DURATION, null));
+      // null, never 0: a module with no duration attribute does not cycle, and
+      // "0 ms" would read as an instant one.
+      baseCycleMs[String(typeID)] = Number.isFinite(value) && value > 0 ? value : null;
+    }
+    res.json({
+      ok: true,
+      source: "static-data",
+      // Named on the wire, not just in a comment: every consumer is forced to
+      // acknowledge that this is the base figure.
+      baseCycleMs,
+      capped: requested.length > CYCLE_TIME_TYPE_LIMIT,
+      limit: CYCLE_TIME_TYPE_LIMIT,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * R15 industry RECIPES — the static half of the industry panel.
+ *
+ * Every NAME the panel needs is already reachable through /api/names: a
+ * blueprint and its product are ordinary types ("type"), and a facility is a
+ * station ("station") in a system ("system"). What /api/names cannot answer is
+ * the RECIPE — which activities a blueprint supports, what each one consumes,
+ * how long it takes, and what it produces. That comes from the 5,081 blueprint
+ * definitions in static data, and it is what the install preview is built from.
+ *
+ * Read-only reference data (like /api/map/graph or /api/agents/find), NOT a
+ * gateway call: none of it varies by player, so it never needs a round-trip to
+ * EveJS. The player's OWN numbers — efficiencies, runs left, whether a
+ * blueprint is busy — come from the live read instead.
+ */
+const INDUSTRY_DEFINITIONS_MAX = 500;
+
+app.post("/api/industry/blueprints", requireAuth, async (req, res, next) => {
+  try {
+    const requested = Array.isArray(req.body && req.body.blueprintTypeIDs)
+      ? req.body.blueprintTypeIDs
+      : [];
+    const unique = [];
+    const seen = new Set();
+    for (const value of requested) {
+      const typeID = Number(value) || 0;
+      if (typeID > 0 && !seen.has(typeID)) {
+        seen.add(typeID);
+        unique.push(typeID);
+      }
+    }
+    const capped = unique.length > INDUSTRY_DEFINITIONS_MAX;
+    const slice = capped ? unique.slice(0, INDUSTRY_DEFINITIONS_MAX) : unique;
+    const definitions = {};
+    for (const typeID of slice) {
+      const definition = staticData.getIndustryBlueprint(typeID);
+      // A definitive null is echoed too, so the client can cache the miss.
+      definitions[String(typeID)] = definition
+        ? {
+            blueprintTypeID: definition.blueprintTypeID,
+            blueprintName: definition.blueprintName,
+            productTypeID: definition.productTypeID,
+            productName: definition.productName,
+            maxProductionLimit: definition.maxProductionLimit,
+            activities: definition.activities || {},
+          }
+        : null;
+    }
+    res.json({
+      ok: true,
+      source: "static-data",
+      count: slice.length,
+      capped,
+      limit: INDUSTRY_DEFINITIONS_MAX,
+      definitions,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Agent Finder (goal R6a): list agents from the static agentAuthority reference
+// table so the player can find a courier agent to travel to (the per-station
+// GetAgents roster is unreliable for this). Read-only static reference data —
+// like /api/map/graph, NOT a gateway/bridge call. Filters server-side by kind
+// (default courier) + optional level and caps the result so the ~11k-agent
+// dataset never crosses the wire whole; the client sorts by jumps from the
+// current system (distancesFrom, a single client-side BFS) and renders a page.
+app.get("/api/agents/find", requireAuth, async (req, res, next) => {
+  try {
+    const kind = typeof req.query.kind === "string" ? req.query.kind : "courier";
+    const level = req.query.level !== undefined ? Number(req.query.level) : null;
+    const limit = req.query.limit !== undefined ? Number(req.query.limit) : undefined;
+    const result = staticData.findAgents({ kind, level, limit });
+    res.json({
+      ok: true,
+      source: "static-data",
+      kind: result.kind,
+      level: result.level,
+      total: result.total,
+      capped: result.capped,
+      limit: result.limit,
+      count: result.agents.length,
+      agents: result.agents,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ── Player Bot Builder library (goal D2) ───────────────────────────────────
+// Per-account CRUD over data/bot-scripts.json. requireAuth gives req.account, so
+// the account is always known; the store enforces ownership, quotas, and the
+// optimistic revision. This is WEB-APP data — it never touches eve.js.
+app.get("/api/botscripts", requireAuth, (req, res, next) => {
+  try {
+    res.json({ ok: true, scripts: botScripts.list(req.account.accountID) });
+  } catch (error) {
+    next(error);
+  }
+});
+app.get("/api/botscripts/:scriptID", requireAuth, (req, res, next) => {
+  try {
+    const record = botScripts.get(req.account.accountID, req.params.scriptID);
+    if (!record) {
+      res.status(404).json({ ok: false, error: "BOTSCRIPT_NOT_FOUND", message: "That bot could not be found." });
+      return;
+    }
+    res.json({
+      ok: true,
+      scriptID: record.scriptID,
+      rev: record.rev,
+      name: record.name,
+      updatedAt: record.updatedAt,
+      doc: record.doc,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+app.post("/api/botscripts", requireAuth, (req, res, next) => {
+  try {
+    const result = botScripts.create(req.account.accountID, req.body ? req.body.doc : undefined);
+    res.json({ ok: true, ...result });
+  } catch (error) {
+    sendBotScriptError(res, error, next);
+  }
+});
+app.post("/api/botscripts/:scriptID", requireAuth, (req, res, next) => {
+  try {
+    const body = req.body || {};
+    const result = botScripts.update(req.account.accountID, req.params.scriptID, body.doc, body.baseRev);
+    res.json({ ok: true, ...result });
+  } catch (error) {
+    sendBotScriptError(res, error, next);
+  }
+});
+app.post("/api/botscripts/:scriptID/delete", requireAuth, (req, res, next) => {
+  try {
+    const removed = botScripts.remove(req.account.accountID, req.params.scriptID);
+    res.json({ ok: true, removed });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ── Server-side bots (src/botHost.js) ───────────────────────────────────────
+// A bot the SERVER flies: it keeps running when the tab that started it goes
+// away. Start names a saved Bot Builder script; the host runs it on a session
+// of its own. Everything is account-scoped through requireAuth, same as the
+// script library above.
+const BOT_START_STATUS = {
+  BOTSCRIPT_INVALID: 400,
+  BOTSCRIPT_REVISION_REQUIRED: 400,
+  BOT_GRANT_REQUIRED: 400,
+  BOT_GRANT_INVALID: 400,
+  BOT_GRANT_STALE: 409,
+  BOT_GRANT_EXPIRED: 409,
+  BOT_SCRIPT_CHANGED: 409,
+  BOT_RESTART_REQUIRES_CONFIRMATION: 409,
+  BOT_SUBBOT_GRANT_UNAVAILABLE: 409,
+  BOT_ALREADY_RUNNING: 409,
+  CHARACTER_IN_USE: 409,
+  BOT_STACK_UNAVAILABLE: 500,
+  BOT_START_FAILED: 502,
+};
+
+app.get("/api/bots", requireAuth, (req, res, next) => {
+  try {
+    res.json({ ok: true, bots: botHost.list(req.account.accountID) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Which characters a server bot is flying, and how each ship is doing —
+// WITHOUT auth, deliberately: the login and character screens mark bot-flown
+// pilots and show their vitals BEFORE any sign-in exists. Exposure is game
+// state only (character IDs, bot phase, shield/armor/hull, hold fill — no
+// account names, script ids, bot ids, or any control), on a server whose
+// login already accepts any password (see the LAN note above /api/login).
+// Everything that inspects or DRIVES a bot stays behind requireAuth.
+app.get("/api/bots/active", (req, res, next) => {
+  try {
+    res.json({ ok: true, characterIDs: botHost.activeCharacterIDs(), bots: botHost.activeBots() });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/bots/start", requireAuth, async (req, res, next) => {
+  try {
+    const body = req.body || {};
+    const characterID = Number(body.characterID || 0);
+    const scriptID = String(body.scriptID || "");
+    if (!Number.isSafeInteger(characterID) || characterID <= 0) {
+      res.status(400).json({ ok: false, error: "INVALID_CHARACTER", message: "A positive characterID is required." });
+      return;
+    }
+    // The character must be the caller's — the same ownership read select does.
+    const character = await store.getCharacterForAccount(req.account.accountID, characterID);
+    if (!character) {
+      res.status(404).json({ ok: false, error: "CHARACTER_NOT_FOUND" });
+      return;
+    }
+    const record = botScripts.get(req.account.accountID, scriptID);
+    if (!record) {
+      res.status(404).json({ ok: false, error: "BOTSCRIPT_NOT_FOUND", message: "That bot could not be found." });
+      return;
+    }
+    // THE HANDOVER IS SERVER-SIDE AND ATOMIC: when the caller's OWN session is
+    // the one flying this character, release it here — then the bot exists the
+    // moment this request answers. The old shape (tab releases itself, THEN
+    // asks the server) left a window where the tab had already fallen to the
+    // login screen while no bot was registered yet, so its bot-flying marks
+    // polled empty until the next tick. Only the caller's own hull moves:
+    // any OTHER session flying the character is still refused by the host's
+    // CHARACTER_IN_USE check below.
+    const callerHeld = bridgeSessions.get(req.webSessionID);
+    if (callerHeld && Number(callerHeld.characterID) === characterID) {
+      await releaseHeldBridgeSession(req.webSessionID);
+    }
+    const outcome = await botHost.start({
+      account: req.account,
+      characterID,
+      scriptID: record.scriptID,
+      scriptName: record.name,
+      scriptRev: record.rev,
+      doc: record.doc,
+      grant: body.grant,
+    });
+    if (!outcome.ok) {
+      res.status(BOT_START_STATUS[outcome.code] || 500).json({
+        ok: false,
+        error: outcome.code,
+        message: outcome.message,
+      });
+      return;
+    }
+    res.json({ ok: true, bot: outcome.bot });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/bots/:botID/stop", requireAuth, async (req, res, next) => {
+  try {
+    const outcome = await botHost.stop(req.params.botID, req.account.accountID);
+    if (!outcome.ok) {
+      res.status(404).json({ ok: false, error: "BOT_NOT_FOUND", message: "No such bot." });
+      return;
+    }
+    res.json({ ok: true, bot: outcome.bot });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ── Icon cache admin (the Settings panel) ───────────────────────────────────
+// Two ways to fill data/icon-cache so type icons serve locally instead of the
+// lettered fallback tile:
+//   1. AUTO-FILL (opt-in, OFF by default): a miss on the icon route is fetched
+//      from images.evetech.net BY THE BFF, saved, and then served — icons fill
+//      in as you browse, downloading only what you actually look at. The BROWSER
+//      still only ever talks to /icon-cache, so R27's "browser never touches an
+//      external image host" rule holds; the BFF is the one reaching the CDN,
+//      exactly as scripts/cache-icons.js already does.
+//   2. BULK PULL: spawn scripts/cache-icons.js to pre-download a whole source —
+//      the gamestore set (fast) or every published type (comprehensive).
+// Off by default keeps the R27 "named tile is the normal case" contract intact
+// until someone opts in here.
+const ICON_SETTINGS_PATH = path.join(config.dataDir, "icon-settings.json");
+const ICON_CACHE_SOURCES = new Set(["gamestore", "all-types"]);
+const ICON_REMOTE_VARIATIONS = new Set(["icon", "bp", "bpc"]);
+
+let iconSettings = { autoDownload: false };
+try {
+  const parsed = JSON.parse(fs.readFileSync(ICON_SETTINGS_PATH, "utf8"));
+  iconSettings = { autoDownload: parsed && parsed.autoDownload === true };
+} catch {
+  // No settings file yet — the off-by-default stands.
+}
+function saveIconSettings() {
+  try {
+    fs.mkdirSync(config.dataDir, { recursive: true });
+    fs.writeFileSync(ICON_SETTINGS_PATH, `${JSON.stringify(iconSettings, null, 2)}\n`);
+  } catch {
+    // Best-effort; the toggle still applies in-memory for this run.
+  }
+}
+
+let iconCacheJob = {
+  running: false,
+  source: null,
+  progress: "",
+  startedAt: null,
+  finishedAt: null,
+  lastResult: null,
+};
+
+function countCachedIcons() {
+  let count = 0;
+  const walk = (dir) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.isFile() && entry.name.endsWith(".png")) count += 1;
+    }
+  };
+  walk(config.iconCacheDir);
+  return count;
+}
+
+// AUTO-FILL — sits in front of the icon static mount below. On a miss (auto-fill
+// on), fetch the icon from the CDN, save it, and fall through to let the static
+// mount serve the now-present file. ANY failure just falls through, so the R27
+// 404 contract is preserved unchanged when auto-fill is off or the CDN misses.
+app.get(/^\/icon-cache\/types\/(\d+)\/([a-z]+)\/(\d+)\.png$/, async (req, res, next) => {
+  if (!iconSettings.autoDownload) {
+    next();
+    return;
+  }
+  const size = Number(req.params[0]);
+  const variation = String(req.params[1]);
+  const typeID = Number(req.params[2]);
+  if (!ICON_REMOTE_VARIATIONS.has(variation) || !Number.isInteger(typeID) || typeID <= 0) {
+    next();
+    return;
+  }
+  const target = path.join(config.iconCacheDir, "types", String(size), variation, `${typeID}.png`);
+  if (fs.existsSync(target)) {
+    next();
+    return;
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  try {
+    const url = staticDataModule.getRemoteTypeIconUrl(typeID, size, variation);
+    if (url) {
+      const response = await fetch(url, { signal: controller.signal });
+      const ctype = String(response.headers.get("content-type") || "");
+      if (response.ok && ctype.startsWith("image/")) {
+        const bytes = Buffer.from(await response.arrayBuffer());
+        if (bytes.length > 0) {
+          fs.mkdirSync(path.dirname(target), { recursive: true });
+          const tmp = `${target}.tmp-${process.pid}`;
+          fs.writeFileSync(tmp, bytes);
+          fs.renameSync(tmp, target);
+        }
+      }
+    }
+  } catch {
+    // Fall through to the static 404 on any CDN/write failure.
+  } finally {
+    clearTimeout(timer);
+  }
+  next();
+});
+
+app.get("/api/icons/status", requireAuth, (req, res) => {
+  res.json({
+    ok: true,
+    cachedCount: countCachedIcons(),
+    autoDownload: iconSettings.autoDownload,
+    running: iconCacheJob.running,
+    source: iconCacheJob.source,
+    progress: iconCacheJob.progress,
+    startedAt: iconCacheJob.startedAt,
+    finishedAt: iconCacheJob.finishedAt,
+    lastResult: iconCacheJob.lastResult,
+  });
+});
+
+app.post("/api/icons/settings", requireAuth, (req, res) => {
+  const autoDownload = Boolean(req.body && req.body.autoDownload);
+  iconSettings = { autoDownload };
+  saveIconSettings();
+  res.json({ ok: true, autoDownload });
+});
+
+app.post("/api/icons/cache", requireAuth, (req, res) => {
+  if (iconCacheJob.running) {
+    res.status(409).json({ ok: false, error: "ICON_CACHE_BUSY", message: "An icon pull is already running." });
+    return;
+  }
+  const source = String((req.body && req.body.source) || "all-types");
+  if (!ICON_CACHE_SOURCES.has(source)) {
+    res.status(400).json({ ok: false, error: "ICON_CACHE_BAD_SOURCE", message: "source must be 'gamestore' or 'all-types'." });
+    return;
+  }
+  let child;
+  try {
+    child = spawn(process.execPath, ["scripts/cache-icons.js", "--source", source, "--delay-ms", "50"], {
+      cwd: config.repoRoot,
+      env: process.env,
+      windowsHide: true,
+    });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: "ICON_CACHE_SPAWN_FAILED", message: String((error && error.message) || error) });
+    return;
+  }
+  iconCacheJob = {
+    running: true,
+    source,
+    progress: "Starting…",
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+    lastResult: null,
+  };
+  const onData = (buf) => {
+    const lines = String(buf).split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    if (lines.length) iconCacheJob.progress = lines[lines.length - 1].slice(0, 200);
+  };
+  child.stdout.on("data", onData);
+  child.stderr.on("data", onData);
+  child.on("error", (error) => {
+    iconCacheJob.running = false;
+    iconCacheJob.finishedAt = new Date().toISOString();
+    iconCacheJob.lastResult = `Error: ${error.message}`;
+  });
+  child.on("close", (code) => {
+    iconCacheJob.running = false;
+    iconCacheJob.finishedAt = new Date().toISOString();
+    iconCacheJob.lastResult = code === 0 ? "Done." : `Exited with code ${code}.`;
+  });
+  res.json({ ok: true, started: true, source });
+});
+
+// ⚠ ORDER IS LOAD-BEARING BELOW THIS LINE. The icon cache MUST stay above the
+// SPA catch-all, and it MUST keep `fallthrough: false` (R27). That flag is the
+// only reason a missing icon answers 404: without it the request falls through
+// to the catch-all, the browser receives index.html with a 200, `<img onerror>`
+// never fires, and every uncached icon becomes a permanently broken image.
+app.use(config.iconCacheUrlPath, express.static(config.iconCacheDir, {
+  fallthrough: false,
+  immutable: true,
+  maxAge: "30d",
+}));
+
+// R45: the Svelte SPA build is the ONLY app, and it is served at the root.
+// Its asset URLs are root-absolute (vite.config.ts `base: "/"`) — the base and
+// this mount point must always agree, or the document loads and its assets
+// 404 into the catch-all below as a 200 text/html, which renders blank.
+const webAppDir = path.join(config.repoRoot, "public", "dist");
+
+// The app used to live at /dist/. Send that bookmark to the canonical root
+// rather than serving a second copy at a second URL. 302, not 301, so the
+// redirect is never baked into a browser cache we cannot reach.
+app.get(/^\/dist\/?$/, (req, res) => {
+  res.redirect("/");
+});
+
+// The hashed build assets must FAIL CLOSED, exactly like the icon cache above,
+// and for the same reason. Without `fallthrough: false` a request for a bundle
+// that is not on disk falls into the catch-all and comes back as `index.html`
+// with a 200 and `text/html` — so a browser holding a stale index.html asks for
+// the previous hash, is handed a document, and dies on `Unexpected token '<'`
+// instead of getting a clean 404 it could recover from. Measured on 2026-07-21:
+// a rebuild replaced index-CR6BU842.js, and the deleted name still answered 200.
+// The comment above this block already described this failure; the code did not
+// prevent it. Vite hashes every filename, so a long immutable cache is safe.
+app.use("/assets", express.static(path.join(webAppDir, "assets"), {
+  fallthrough: false,
+  immutable: true,
+  maxAge: "30d",
+}));
+
+app.use(express.static(webAppDir));
+app.get(/.*/, (req, res) => {
+  res.sendFile(path.join(webAppDir, "index.html"));
+});
+
+app.use((error, req, res, next) => {
+  void next;
+  errorLogger(error);
+  const statusCode =
+    Number.isFinite(error && error.statusCode) && error.statusCode >= 400
+      ? error.statusCode
+      : 500;
+  res.status(statusCode).json({
+    ok: false,
+    error: error && error.code ? error.code : error.message || "SERVER_ERROR",
+    message: error && error.message ? error.message : "Server error",
+  });
+});
+
+return app;
+}
+
+function startServer(options = {}) {
+  const appToStart = options.app || createApp(options);
+  const host = options.host || config.host;
+  const port = options.port === undefined ? config.port : Number(options.port);
+  const server = http.createServer(appToStart);
+  server.listen(port, host, () => {
+    const address = server.address();
+    const activePort = address && typeof address === "object" ? address.port : port;
+    if (options.silent !== true) {
+      console.log(`EveJS Web POC listening on http://${host}:${activePort}`);
+      console.log(`Using EveJS gateway: ${process.env.EVEJS_GATEWAY_URL || "http://127.0.0.1:26002/_evejs-web/v1"}`);
+    }
+    // Bots that were running when the server last stopped come back now —
+    // AFTER listen, because every server bot drives this server over loopback.
+    if (options.resumeServerBots !== false) {
+      void appToStart.locals.botHost?.resume().catch((error) => console.error(error));
+    }
+  });
+  return server;
+}
+
+const app = createApp();
+const server = require.main === module ? startServer({ app }) : null;
+
+module.exports = {
+  app,
+  createApp,
+  server,
+  startServer,
+};

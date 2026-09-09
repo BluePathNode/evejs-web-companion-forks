@@ -1,0 +1,14 @@
+const fs = require("fs");
+const c = fs.readFileSync("C:/Users/Astap/Documents/Eve-Dev/evejs-web-companion-fork/web/src/bots/macroCatalogView.ts", "utf8");
+const idx = c.indexOf('"fleet-warp-to-broadcast": entry(');
+console.log(c.slice(idx, idx + 900));
+console.log("---FLOW DEFENSE RETURN---");
+const f = fs.readFileSync("C:/Users/Astap/Documents/Eve-Dev/evejs-web-companion-fork/web/src/app/flow.ts", "utf8");
+const i2 = f.indexOf("tractors.push(slot.module.itemID)");
+console.log(f.slice(i2 - 200, i2 + 400));
+console.log("---OBS WIRE---");
+const i3 = f.indexOf("tractorModuleIDs: capabilities.defense.tractors");
+console.log(f.slice(i3 - 120, i3 + 200));
+console.log("---DEFENSE INTERFACE---");
+const i4 = f.indexOf("/** Tractor beams (group name");
+console.log(f.slice(i4, i4 + 250));

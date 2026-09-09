@@ -1,0 +1,8125 @@
+// The R2 page controller: drives the login -> character select -> docked
+// station panel flow and feeds every outcome into the client-state store as
+// events ("how to add a page", docs/bridge-wire-contract.md). The Svelte view
+// is a pure reader of the store; this module owns all fetch/decode logic so
+// it stays framework-agnostic and unit-testable under node:test.
+
+import { getCharacterSelectionData } from "../bridge/characterSelection.ts";
+import {
+  getStationGuests,
+  getStationInfoCached,
+  getStationItemBits,
+} from "../bridge/stationPanel.ts";
+import { decodeCapacity, decodeContainer, decodeInventoryRows } from "../bridge/inventoryShip.ts";
+import { decodeShipBays } from "../bridge/shipBays.ts";
+import { buildSlots, decodeChargeFits, decodeResources, decodeShipAttributes } from "../bridge/fitting.ts";
+import { deriveShipStats } from "../bridge/shipStats.ts";
+import {
+  decodeBlueprints,
+  decodeDefinition,
+  decodeFacilities,
+  decodeJobs,
+  decodeSlotUsage,
+  industryRefusalMessage,
+} from "../bridge/industry.ts";
+import {
+  decodeEscrow,
+  decodeOrderBook,
+  decodeOwnOrders,
+  decodePriceHistory,
+  decodeTransactions,
+  marketRefusalMessage,
+  toAmountString,
+} from "../bridge/market.ts";
+import { decodeMailbox, mailRefusalMessage } from "../bridge/mail.ts";
+import {
+  activityReadError,
+  decodeActivityCalendar,
+  decodeActivityNotifications,
+} from "../bridge/activity.ts";
+import {
+  contractRefusalMessage,
+  decodeContractDetail,
+  decodeContractList,
+  decodeContractSearch,
+  decodeContractSummary,
+} from "../bridge/contracts.ts";
+import {
+  assetRefusalMessage,
+  decodeAssetItems,
+  decodeAssetStations,
+} from "../bridge/personalAssets.ts";
+import {
+  AGENT_BUTTON,
+  decodeBriefing,
+  decodeConversation,
+  decodeJournal,
+} from "../bridge/agents.ts";
+import {
+  decodeCashBalance,
+  decodeCharStandings,
+  decodeLpBalances,
+} from "../bridge/rewards.ts";
+import {
+  decodeCashBalance as decodeWalletCash,
+  decodeCorpDivisions,
+  decodeEntryTypeLabels as decodeWalletEntryTypeLabels,
+  decodeJournal as decodeWalletJournal,
+  decodeTransactions as decodeWalletTransactions,
+  normalizeDivisionNames,
+} from "../bridge/wallet.ts";
+import {
+  classifyStandingKind,
+  decodeStandingCompositions,
+  decodeStandingTransactions,
+} from "../bridge/standings.ts";
+import {
+  decodeCharacterDescription,
+  decodeCharacterIdentity,
+  decodeCloneSummary,
+  decodeHomeStationID,
+} from "../bridge/characterSheet.ts";
+import { decodeFlightStatus, dockedLocationID } from "../bridge/flight.ts";
+import { decodeSpaceSnapshot, decodeTargetIDs } from "../bridge/space.ts";
+import {
+  decodeMiningHolds,
+  decodeReprocessingQuotes,
+  decodeSurveyResults,
+  decodeTaxRate,
+} from "../bridge/mining.ts";
+import {
+  decodeDroneBay,
+  decodeDroneLimits,
+  decodeDroneOrderRefusals,
+  decodeDronesInSpace,
+} from "../bridge/drones.ts";
+import { decodeSkillSheet, skillQueueRefusal } from "../bridge/skills.ts";
+import { decodeColonyReport } from "../bridge/planets.ts";
+import { createSpacePoller, targetsReadIsDue, type SpacePoller } from "./spacePoll.ts";
+import type { RequestPriority } from "./transport.ts";
+import type { FlightStepResult } from "./api.ts";
+import { BridgeCallError } from "../bridge/callMethod.ts";
+import { refusalWords as sayRefusalWords } from "../bridge/refusals.ts";
+import { readDictEntry, type JsonValue } from "../bridge/wire.ts";
+import * as api from "./api.ts";
+import type { ClientStore } from "../store/clientStore.ts";
+import type {
+  ActivityCalendarEventRow,
+  ActivityCalendarResponseRow,
+  ActivityNotificationRow,
+  AgentAction,
+  ChatChannel,
+  DestinationMatch,
+  DroneInSpace,
+  DroneOrderReport,
+  FittingSlot,
+  FleetAction,
+  FlightStatus,
+  InventoryItemRow,
+  InventoryPlace,
+  SlotFamily,
+  StationStatic,
+} from "../store/types.ts";
+import {
+  decodeChatChannel,
+  decodeChatChannelName,
+  decodeMessageEntry,
+} from "../bridge/chat.ts";
+import { decodeDirectionalScanHitIDs } from "../bridge/boundScanWrites.ts";
+import { nameKey, type NameRef } from "../store/names.ts";
+import {
+  buildSystemGraph,
+  distancesFrom,
+  solveRoute,
+  type SystemGraph,
+} from "../nav/routeSolver.ts";
+// R30 slice A — reading the already-cached gate graph as "what is on this grid
+// and where does it go", so a stargate row can offer a jump.
+import { buildGateLinks, type GateLink } from "../space/gateLinks.ts";
+import type { AgentFinderRow } from "../store/types.ts";
+import {
+  AUTOPILOT_WARP_MIN_RANGE_M,
+  createAutopilot,
+  type AutopilotController,
+  type AutopilotDeps,
+  type RoutePlan,
+} from "../nav/autopilotLoop.ts";
+import {
+  createMiningBot,
+  destinationHold,
+  holdItemIDs,
+  holdShouldHaul,
+  lowestHealth,
+  type MiningBotController,
+  type MiningBotDeps,
+  type MiningPlan,
+} from "../nav/miningBotLoop.ts";
+import { canMyShipOrderDrone, hostileRows } from "../space/overview.ts";
+// R43 — one declaration of which bots exist, what each needs before it can
+// start, and who is allowed to hold the ship.
+import {
+  MINING_BOT_REQUIREMENTS,
+  MISSION_BOT_REQUIREMENTS,
+  createShipClaim,
+  evaluateRequirements,
+  type MiningBotReads,
+  type MissionBotReads,
+} from "../nav/botRegistry.ts";
+import { highSlotMiningModules, isDockableKind, ungroupedHighSlotModules } from "../space/rowActions.ts";
+import {
+  DEFAULT_MAX_JUMPS,
+  createMissionBot,
+  type MissionBotController,
+  type MissionBotDeps,
+  type MissionPlan,
+} from "../nav/missionBotLoop.ts";
+// Player Bot Builder runner — the fourth decide-loop, composing the SAME calls
+// the mining/mission bots fire, driven by the player's blocks.
+import {
+  createScriptRunner,
+  type ScriptRunnerController,
+  type ScriptRunnerDeps,
+} from "../nav/scriptRunner.ts";
+import {
+  createCapabilityCache,
+  type CapabilityScope,
+} from "../nav/scriptCapabilities.ts";
+import { SCRIPT_MACROS, resolveStationRef, scriptTravelHome } from "../nav/scriptMacros.ts";
+import type { ScriptObservation } from "../nav/scriptConditions.ts";
+import { decodeBoundSmallServices, decodeFullState } from "../bridge/boundSmallServices.ts";
+import { decodeFormations } from "../bridge/formations.ts";
+import { scannerStateFromBoundRead } from "../scanner/scannerCenter.ts";
+import { decodeFittings } from "../bridge/fittings.ts";
+import { decodeActiveBookmarks } from "../bridge/bookmarks.ts";
+import {
+  authoritativeFleetMemberCharacterIDs,
+  decodeFleetCenter,
+  decodeFleetInviteNotification,
+} from "../bridge/fleetCenter.ts";
+import { decodeAvailableFleetAds, decodeMyFleetFinderAdvert } from "../bridge/fleetAds.ts";
+import type { BotScript, WorldRef } from "../bots/botScript.ts";
+import { decodeScriptValue } from "../bots/scriptCodec.ts";
+import { expandSubBots, hasSubBots, type BotResolution, type SubBotReference } from "../bots/subBots.ts";
+
+/**
+ * What the player asked the mission bot to do (goal R36).
+ *
+ * `maxJumps` and `maxMissions` are the PLAYER's limits and are the whole reason
+ * the bot is safe to walk away from: the courier dropoff is the corp's
+ * lowest-`solarSystemID` station, so routes are long by construction and can
+ * cross lowsec. The bot refuses an offer that exceeds them rather than
+ * committing an unattended ship to a trip nobody sanctioned.
+ */
+export interface MissionBotRequest {
+  readonly agentID: number;
+  readonly agentName: string | null;
+  readonly agentStationID: number;
+  readonly agentStationName: string | null;
+  /** Refuse any job whose delivery is further than this. */
+  readonly maxJumps: number;
+  /** Stop after this many completed jobs; 0 keeps going until stopped. */
+  readonly maxMissions: number;
+}
+
+export { DEFAULT_MAX_JUMPS };
+
+/**
+ * What the player asked the mining bot to do (goal R26).
+ *
+ * `miningModuleIDs` is the player's OWN pick from the ship's online modules,
+ * by name. The browser does not decide which of your modules is a mining
+ * laser: it would have to guess, and a wrong guess fires a turret at a rock.
+ */
+export interface MiningBotRequest {
+  readonly beltID: number;
+  readonly beltName: string | null;
+  readonly stationID: number;
+  readonly stationName: string | null;
+  readonly miningModuleIDs: readonly number[];
+  /** Remaining fraction (0-1) of any health layer that ends the run. */
+  readonly healthFloor: number;
+  readonly useDrones: boolean;
+}
+
+export interface AppFlowOptions {
+  readonly baseUrl?: string;
+  readonly fetch?: typeof fetch;
+  /**
+   * R10 — injectable EventSource factory for the live event channel. Defaults
+   * to the browser's own EventSource; tests supply a fake.
+   */
+  readonly eventSource?: (url: string) => api.EventSourceLike;
+  /**
+   * R107 multibox — when true, this flow carries its OWN session token on every
+   * call (via `callOptions.token`) instead of the per-tab global in
+   * sessionToken.ts, so several flows can be live in ONE browser tab without
+   * their calls colliding on the shared token/cookie. The login handler captures
+   * the token onto the call options; logout clears it. Default false keeps the
+   * single-session path (main.ts, every existing test) byte-for-byte unchanged.
+   */
+  readonly perSessionToken?: boolean;
+  /**
+   * Server bot host — a session token this flow starts out holding, so a
+   * headless flow whose owner ALREADY authenticated (the bot-start route runs
+   * under requireAuth) can skip `login()` entirely instead of round-tripping a
+   * password the server would have to accept. Only read in per-session mode:
+   * a shared-global flow has no per-flow token to seed.
+   */
+  readonly initialSessionToken?: string | null;
+  /**
+   * Multibox — whether this flow may hold a live push (SSE) connection.
+   * Default true keeps the single-session path unchanged; roster sessions
+   * start false and the App enables exactly one (the active pilot), because
+   * each open EventSource occupies one of the browser's ~6 per-origin
+   * connections for its whole life. See AppFlow.setLivePush.
+   */
+  readonly livePush?: boolean;
+}
+
+/**
+ * What the panel asks for when it places an order. `side` decides which retail
+ * call is used, and they are NOT symmetric: buying names a TYPE, selling names
+ * a specific STACK (`itemID`), because the sell handler moves that stack into
+ * escrow.
+ */
+export interface MarketOrderRequest {
+  readonly side: "buy" | "sell";
+  readonly typeID: number;
+  readonly price: number;
+  readonly quantity: number;
+  readonly durationDays: number;
+  /** Required for a sell: the stack being handed over. */
+  readonly itemID?: number;
+}
+
+/**
+ * How a `startRoute` attempt ended. Every failure is ALSO written to the
+ * travel slice (`travel/plan-error`) for the Travel panel; the return value
+ * exists for callers that are not the Travel panel — the mission bot's
+ * `startTravel` dep throws on `started: false`, because a bot that believes a
+ * flight is running when the plan never reached the autopilot spins "Flying
+ * to…" forever with the real reason hidden in a panel nobody is watching.
+ * `cause` carries the underlying thrown error when there was one, so the
+ * loops' transport-transient classification reads the real code.
+ */
+export type RouteStartOutcome =
+  | { readonly started: true }
+  | { readonly started: false; readonly reason: string; readonly cause?: unknown };
+
+export interface AppFlow {
+  /** Boot health ping — sets the health slice online/offline (gates the login). */
+  checkHealth(): Promise<void>;
+  /** Who-cares login, then the typed reference call to fill the character list. */
+  login(username: string, password: string): Promise<void>;
+  /**
+   * R107 multibox — the session token THIS flow authenticates as, for the
+   * character bar and verification. Non-null between login and logout in
+   * per-session mode; null otherwise (single-session flows keep the token in the
+   * per-tab global, not here).
+   */
+  sessionToken(): string | null;
+  /**
+   * The request options owned by THIS flow (base URL, injected fetch and its
+   * per-session token). Components that call api.ts directly must use this
+   * instead of reconstructing only the token and silently dropping the rest.
+   */
+  requestOptions(): api.ApiOptions;
+  /**
+   * Create a character on the signed-in account, then re-read the roster so the
+   * select screen shows it. Runs with NO character online — that is the state
+   * this exists for.
+   */
+  createCharacter(request: api.CreateCharacterRequest): Promise<api.CreateCharacterResult>;
+  /** Select a character onto the persistent session, then run the docked reads. */
+  selectCharacter(characterID: number): Promise<void>;
+  /** Refresh the docked station-panel reads on the live session. */
+  refreshStationPanel(): Promise<void>;
+  /** Load the Inventory & Ship panel (station hangar + active-ship cargo). */
+  loadInventory(): Promise<void>;
+  /** Move a selected item hangar <-> active-ship cargo, then refresh. */
+  moveItem(itemID: number, direction: "toCargo" | "toHangar", qty?: number | null): Promise<void>;
+  /** Stack all loose stacks in the hangar or active-ship cargo, then refresh. */
+  stackContainer(target: "hangar" | "cargo"): Promise<void>;
+  /** Board a hangar ship (it becomes active), then refresh. */
+  boardShip(shipID: number): Promise<void>;
+  /**
+   * Board the corvette while docked (the station-services "Board my Corvette"):
+   * the server spawns/repairs/starter-fits one as needed, then refresh.
+   */
+  boardCorvette(): Promise<void>;
+  /**
+   * Leave the active ship while docked — the character ends up in their
+   * capsule, the ship stays in the hangar — then refresh.
+   */
+  leaveShip(): Promise<void>;
+  // --- R14 inventory depth ---
+  /** Tick or untick a row for a bulk move / trash. */
+  toggleSelection(itemID: number): void;
+  /** Drop every tick (e.g. after acting, or on leaving a place). */
+  clearSelection(): void;
+  /** Open a container and read its contents; null closes it. */
+  openContainer(containerID: number | null): Promise<void>;
+  /** Goal R40 — expand a ship in the Ships card and read its bays; null closes it. */
+  openShipBays(shipID: number | null): Promise<void>;
+  /**
+   * Move items between two places. A single item with a `qty` is a SPLIT; more
+   * than one item is a single batch move. Reports what ACTUALLY applied.
+   */
+  transferItems(
+    itemIDs: readonly number[],
+    from: InventoryPlace,
+    to: InventoryPlace,
+    qty?: number | null,
+  ): Promise<void>;
+  /** Re-merge one stack into another of the same type. */
+  mergeStacks(
+    sourceItemID: number,
+    destinationItemID: number,
+    place: InventoryPlace,
+  ): Promise<void>;
+  /** DESTROY items. The caller must have confirmed first — this is irreversible. */
+  trashItems(itemIDs: readonly number[], place: InventoryPlace): Promise<void>;
+  /** Read the corporation hangar at the docked station. */
+  loadCorpHangar(): Promise<void>;
+  /** Show a different corporation hangar division. */
+  selectCorpDivision(division: number): void;
+  /** Load the Fitting panel (the active ship's slots + resource readings). */
+  loadFitting(): Promise<void>;
+  /**
+   * Load the bound-dogma snapshot (active ship + fitted modules with their
+   * SERVER-effective attributes), so a clicked module can show its effective
+   * stats. Refreshed automatically alongside loadFitting; exposed for a manual
+   * refresh too.
+   */
+  loadDogma(): Promise<void>;
+  /**
+   * Fit a module from the station hangar or the ship's cargo. `slot` picks a
+   * specific slot by family + index, or "auto" to let the SERVER choose one.
+   */
+  fitModule(
+    itemID: number,
+    source: "hangar" | "cargo",
+    slot: { readonly family: SlotFamily; readonly index: number } | "auto",
+  ): Promise<void>;
+  /** Unfit a module back to the station hangar or the ship's cargo. */
+  unfitModule(itemID: number, destination: "hangar" | "cargo"): Promise<void>;
+  /** Bring a fitted module online, or take it offline. */
+  setModuleOnline(itemID: number, online: boolean): Promise<void>;
+  /**
+   * Load charges into modules, then re-read the fit so the panel shows what the
+   * SERVER put in them. Compatibility is the server's call — an incompatible
+   * charge comes back as its own refusal, not as a control the panel hid.
+   */
+  loadAmmo(
+    moduleIDs: readonly number[],
+    chargeItemIDs: readonly number[],
+    source: api.AmmoPlace,
+  ): Promise<void>;
+  /** Empty modules of their charges into cargo or the station hangar. */
+  unloadAmmo(moduleIDs: readonly number[], destination: api.AmmoPlace): Promise<void>;
+  /**
+   * DESTROY a fitted rig. Rigs cannot be unfitted, so this is irreversible —
+   * the panel confirms before calling it and the BFF confirms again.
+   */
+  destroyRig(itemID: number): Promise<void>;
+  /**
+   * Load the Industry panel: the player's blueprints, their jobs, their used
+   * job slots, and the facilities their region offers. Also fetches the static
+   * recipes for the blueprint types it saw, and the names for everything.
+   */
+  loadIndustry(): Promise<void>;
+  /**
+   * What the player HAS of each material an install would consume, read from
+   * the SERVER. Feeds the confirm step so the decision is informed.
+   */
+  previewIndustryJob(request: api.IndustryJobRequest): Promise<Readonly<Record<string, number>>>;
+  /**
+   * INSTALL a job. Spends materials and charges an installation fee, so the
+   * panel confirms before calling it and the BFF confirms again.
+   */
+  installIndustryJob(request: api.IndustryJobRequest): Promise<void>;
+  /** DELIVER a finished job (the retail CompleteJob). */
+  deliverIndustryJob(jobID: number): Promise<void>;
+  /**
+   * CANCEL a job. Returns the blueprint but NOT the materials or the fee, so
+   * this is confirmed twice as well.
+   */
+  cancelIndustryJob(jobID: number): Promise<void>;
+  /**
+   * Load the Market panel: an item's order book (when one is chosen), the
+   * player's own orders, their closed-order history, their trades, their
+   * escrow, their price history and their ISK — plus every NAME those need.
+   */
+  loadMarket(typeID: number | null): Promise<void>;
+  /**
+   * Search tradable items by NAME — how the player picks what to look at.
+   * Static reference data, so it answers even when the market daemon does not.
+   */
+  findMarketTypes(q: string): Promise<readonly api.MarketTypeMatch[]>;
+  /**
+   * R83 — BROWSE the market tree. Static reference data, so both of these work
+   * even when the market daemon itself is not answering: a player can find out
+   * what EXISTS before asking what it costs.
+   */
+  loadMarketGroups(parentGroupID: number): Promise<readonly api.MarketGroupNode[]>;
+  loadMarketGroupTypes(
+    marketGroupID: number,
+  ): Promise<{ readonly types: readonly api.MarketTypeMatch[]; readonly total: number; readonly capped: boolean }>;
+  /**
+   * PLACE A BUY ORDER. Sets ISK aside immediately and charges a broker's fee,
+   * so the panel confirms before calling it and the BFF confirms again. What
+   * the server ACTUALLY charged lands in the store as `lastOutcome`.
+   */
+  placeMarketOrder(request: MarketOrderRequest): Promise<void>;
+  /** CANCEL an order. Returns what it held; the fee already paid is not. */
+  cancelMarketOrder(orderID: string): Promise<void>;
+  /** CHANGE an order's price. Charges a fee and moves a buy order's escrow. */
+  modifyMarketOrder(orderID: string, price: number): Promise<void>;
+  /**
+   * Refresh the read-only Activity Center: recent notificationMgr reads,
+   * current-month calendar data and the existing mailbox unread count.
+   */
+  loadActivity(): Promise<void>;
+  /** Refresh current-system scan sites and the independent formation reference. */
+  loadScanner(): Promise<void>;
+  /** Launch every probe EveJS currently says is safe to launch. */
+  launchScannerProbes(): Promise<void>;
+  /** Analyze using EveJS's current authoritative probe geometry. */
+  analyzeScannerSignatures(): Promise<void>;
+  /** Recover the current held session's active probes. */
+  recoverScannerProbes(): Promise<void>;
+  /** Reconnect the session character's lost probes, then refresh scanner state. */
+  reconnectScannerProbes(): Promise<void>;
+  /** Refresh authoritative membership, hierarchy, MOTD and join-request reads. */
+  loadFleet(): Promise<void>;
+  /** Form a fleet, then re-read membership before settling. */
+  formFleet(): Promise<void>;
+  /** Invite one character by ID, then re-read the authoritative fleet. */
+  inviteFleetMember(characterID: number): Promise<void>;
+  /** Accept the pending OnFleetInvite observed for this live session. */
+  acceptFleetInvite(): Promise<void>;
+  /** Leave the current fleet, then re-read membership before settling. */
+  leaveFleet(): Promise<void>;
+  /**
+   * Load the Mail panel: the whole inbox, plus the NAME of everyone who sent or
+   * received a message. ⚠ The inbox is a DELTA SYNC the BFF cold-starts, so
+   * this is always the entire mailbox rather than a page of it.
+   */
+  loadMail(): Promise<void>;
+  /**
+   * Open one message. ⚠ The body arrives as plain TEXT — mailMgr.GetBody
+   * answers a zlib-DEFLATED buffer and the BFF inflates it. `markRead` makes
+   * this a WRITE, and whether the flag really moved is RE-READ afterwards.
+   */
+  openMail(messageID: number, markRead: boolean): Promise<void>;
+  /** Close the open message without touching the server. */
+  closeMail(): void;
+  /**
+   * Find someone to write to, by NAME. Static reference data; the id it
+   * carries is never shown to the player (R7d).
+   */
+  findCharacters(q: string): Promise<readonly api.CharacterMatch[]>;
+  /**
+   * SEND a message. Not a costly or destructive write, so no confirm gate —
+   * but an empty recipient list is refused, because the SERVER will not refuse
+   * it and mail addressed to nobody would look sent.
+   */
+  sendMail(request: api.MailSendRequest): Promise<void>;
+  /**
+   * Load the Contracts panel: the public courier browse, the player's own
+   * contracts (waiting / taken on / expired), the summary counts, and every
+   * NAME those need. READS ONLY — every contract mutator is refused at the
+   * gateway.
+   *
+   * ⚠ An empty public browse is EXPECTED: EveJS has no contract generator, so
+   * there is nothing to find until a player creates one.
+   */
+  loadContracts(page: number): Promise<void>;
+  /** Open one contract in full: its items and its route endpoints, by name. */
+  openContract(contractID: number): Promise<void>;
+  /** Close the open contract without touching the server. */
+  closeContract(): void;
+  /**
+   * Load the Personal Assets panel: every station holding this character's
+   * items, and every NAME those need. READS ONLY — the bound global-assets
+   * object implements no write at all.
+   *
+   * ⚠ The station list is the SERVER's aggregation, not ours. Do not walk
+   * containers in the browser to rebuild it.
+   */
+  loadPersonalAssets(): Promise<void>;
+  /**
+   * Expand one asset location and read what is there; null collapses it and
+   * touches no server. A read that fails is recorded against that station
+   * alone and never thrown.
+   */
+  openAssetStation(stationID: number | null): Promise<void>;
+  /**
+   * Set course for an asset location. Wraps `startRoute` — it builds no
+   * navigation of its own.
+   */
+  setDestinationToAssetStation(stationID: number): Promise<void>;
+  /** Load the docked station's agent roster (agentMgr.GetAgents). */
+  loadAgents(): Promise<void>;
+  /** Open a conversation with an agent (bound DoAction(None)). */
+  openConversation(agentID: number): Promise<void>;
+  /**
+   * Take a conversation action (DoAction on the bound agent): request / accept /
+   * decline. Accepting a courier refreshes the briefing + journal; declining
+   * clears the briefing and refreshes the journal.
+   */
+  chooseAction(agentID: number, action: AgentAction): Promise<void>;
+  /** Load the accepted-courier briefing (bound reads on the agent). */
+  loadBriefing(agentID: number): Promise<void>;
+  /** Load the mission journal (agentMgr.GetMyJournalDetails). */
+  loadJournal(): Promise<void>;
+  /**
+   * Load the accepted courier's package from the station hangar into the active
+   * ship. Both the briefing's cargo TYPE and its QUANTITY are needed: the type
+   * alone does not identify the package, because courier cargo is ordinary
+   * goods the player may already hold. Goes through the verifying
+   * /api/bridge/inventory/transfer and raises if nothing actually moved.
+   */
+  loadPackageIntoShip(cargoTypeID: number, cargoQuantity: number): Promise<void>;
+  /**
+   * Set the browser autopilot to the mission dropoff (a station): reuses the
+   * R5b route solver + decide-loop via startRoute(dropoffStationID).
+   */
+  setAutopilotToDropoff(dropoffStationID: number): Promise<void>;
+  /**
+   * R6 — the post-completion reward readout (Step 12): wallet / LP / standings.
+   * The journal (the fourth Step-12 read) refreshes via loadJournal.
+   */
+  loadRewards(): Promise<void>;
+  /**
+   * R50 — the Wallet + Corp Wallet tabs: the personal ISK balance and the
+   * corporation division balances, in one pull. Both tabs call this on mount.
+   */
+  loadWallet(): Promise<void>;
+  /**
+   * R55 — the Standings page: the character's own standings and the
+   * corporation's, in one pull, with every entity id resolved to a name.
+   */
+  loadStandings(): Promise<void>;
+  /**
+   * R55 — load one entity's drill-down: a char row's standing history or a corp
+   * row's per-member composition. `scope` says which section the row is in.
+   */
+  loadStandingDetail(fromID: number, scope: "char" | "corp"): Promise<void>;
+  /** R55 — close the open standings drill-down. */
+  closeStandingDetail(): void;
+  /**
+   * R56 — the Character Sheet page: who the character is (name / security / corp
+   * / alliance), the bio, the home station and the clone's implants, in one pull,
+   * with every entity id resolved to a name (R7d). Called on the panel's mount.
+   */
+  loadCharacterSheet(): Promise<void>;
+  /** Refresh the flight status (location + ship movement state). */
+  loadFlightStatus(): Promise<void>;
+  /** Undock from the station (the session enters space). */
+  undock(): Promise<void>;
+  /**
+   * Warp to a chosen gate/celestial through the bound park. `minRange` null is
+   * the autopilot warp; a number warps to that distance from the target (R13).
+   */
+  warpTo(destinationID: number, minRange?: number | null): Promise<void>;
+  /**
+   * R11 — approach an object at full speed (the same atomic move the autopilot
+   * uses to close the last gap to a gate). Offered on every overview row.
+   * R13 — the range is retail's: 50 m from the menu, 0 from the autopilot.
+   */
+  approach(destinationID: number, range?: number | null): Promise<void>;
+  /** R13 — hold a set distance from a target (CmdFollowBall at that range). */
+  keepAtRange(targetID: number, range?: number | null): Promise<void>;
+  /** R13 — circle a target at a set distance (CmdOrbit). */
+  orbit(targetID: number, range?: number | null): Promise<void>;
+  /** R13 — point the ship at a target and hold that heading (CmdAlignTo). */
+  alignTo(targetID: number): Promise<void>;
+  /**
+   * R13 — cut the engines (CmdStop). As in retail, this also switches the
+   * autopilot off: stopping the ship must not leave something still flying it.
+   */
+  stopShip(): Promise<void>;
+  /** R11 — read what is currently around the ship (and the ship's condition). */
+  loadSpaceSnapshot(): Promise<void>;
+  /**
+   * R11/R30 — CLAIM and RELEASE the ~1s space feed. Reference-counted, not a
+   * switch: every panel that shows live space data claims on mount and releases
+   * on unmount, and the feed keeps running until the LAST viewer lets go.
+   *
+   * It was a plain on/off flag with a single caller (the Overview panel), which
+   * meant switching to any other tab unmounted that panel and froze the whole
+   * cockpit — snapshot, locks, gauges, distances, hostiles. The count is what
+   * lets a player set a destination on Travel without the ship they are flying
+   * going still behind them.
+   *
+   * Claiming is not the same as polling: the feed still stops when the ship is
+   * docked or the browser tab is hidden, and resumes on its own when either of
+   * those goes away. Callers must pair every claim with exactly one release.
+   */
+  startSpacePolling(): void;
+  stopSpacePolling(): void;
+  // --- R23 slice A: the GENERIC in-space action layer --------------------
+  // Deliberately free of any notion of mining or combat. A target is a target;
+  // a module is a module; the effect name is an OPTIONAL argument (omit it and
+  // the server resolves the module's own default activation effect from its
+  // typeID — the browser never guesses which effect a module runs). A later
+  // combat goal reuses all five of these unchanged.
+  /** R23 — read the locked-target list (the only authority on what is locked). */
+  loadTargets(): Promise<void>;
+  /** R23 — lock a ball. Acquisition takes time; the lock is not instant. */
+  lockTarget(targetID: number): Promise<void>;
+  /** R23 — release ONE lock (or abandon one still being acquired). */
+  unlockTarget(targetID: number): Promise<void>;
+  /** R23 — switch a module on. `repeat` is -1 continuous (default) or 0 single-cycle. */
+  activateModule(
+    itemID: number,
+    opts?: { effect?: string; targetID?: number | null; repeat?: -1 | 0 },
+  ): Promise<void>;
+  /** R23 — switch a module off. */
+  deactivateModule(itemID: number, opts?: { effect?: string; typeID?: number }): Promise<void>;
+  /**
+   * Start or stop overloading a module. ⚠ Overloading damages it — the server
+   * refuses an offline, burnt-out or non-overloadable module, and a pilot
+   * without Thermodynamics, in its own words.
+   */
+  setModuleOverload(itemID: number, overloaded: boolean): Promise<void>;
+  /**
+   * Repair a damaged module with nanite paste — the complement to overloading,
+   * without which a burnt-out module could never be brought back.
+   */
+  repairModule(itemID: number): Promise<void>;
+  /** Bank every weapon into groups, or break every bank. */
+  setWeaponBanks(linked: boolean): Promise<void>;
+  // --- R23 slice B: the mining loop --------------------------------------
+  // Built ON TOP of the generic layer above, not into it. There is no "start
+  // mining" method: mining a rock is lockTarget + activateModule with a mining
+  // laser. The browser never simulates a cycle or predicts a yield.
+  /** R23 — read the ship's ore / gas / ice holds (falling back to cargo). */
+  loadMiningHolds(): Promise<void>;
+  /** R23 — run the survey scanner; the panel merges the results into the overview. */
+  runSurveyScan(): Promise<void>;
+  /** R23 — ask the station refinery what these stacks yield, and its ISK tax. */
+  loadReprocessingQuote(itemIDs: readonly number[]): Promise<void>;
+  /** R23 — move mined ore into the station hangar (docked only). */
+  unloadMiningHolds(itemIDs: readonly number[]): Promise<void>;
+  /**
+   * R23 — ⚠ CONSUMES the stacks and CHARGES the station's ISK tax. The panel
+   * confirms first (showing the quote and the tax) and the BFF confirms again.
+   */
+  reprocessItems(itemIDs: readonly number[]): Promise<void>;
+  // --- R25 slice A: drones -------------------------------------------------
+  //
+  // ⚠ NOT ONE of these four server calls can be trusted on its return value.
+  // The launch handler answers 200 with an EMPTY DICT when it refuses, and the
+  // three in-space orders answer an empty dict on SUCCESS. So every method here
+  // lands what the BFF re-read out of the space snapshot afterwards, and a
+  // refusal surfaces as a silent-decline rather than as a phantom success.
+
+  /** R25 — the bay, the drones in space, and the server's launch limits. */
+  loadDrones(): Promise<void>;
+  /**
+   * R25 — launch from the bay.
+   *
+   * ⚠ THIS IS THE DEFENCE. An idle combat drone auto-engages whatever shoots
+   * the ship it came from (the server's own behaviour, on by default), so a
+   * miner who launches is defended with no further clicks. `engageDrones` is
+   * for CHOOSING a victim, not for being protected.
+   */
+  launchDrones(itemIDs: readonly number[]): Promise<void>;
+  /** R25 — set drones on a target. */
+  engageDrones(droneIDs: readonly number[], targetID: number): Promise<void>;
+  /** R25 — put mining drones on a rock. */
+  mineWithDrones(droneIDs: readonly number[], targetID: number): Promise<void>;
+  /** R25 — bring drones home (the runtime scoops them itself inside 2500 m). */
+  recallDrones(droneIDs: readonly number[]): Promise<void>;
+  /**
+   * Take control of drones this ship owns but does not fly — the recovery path
+   * for an orphaned drone, which Recall and Engage cannot reach.
+   */
+  reconnectDrones(droneIDs: readonly number[]): Promise<void>;
+  /** Scoop drones straight into the bay; needs no control, only range. */
+  scoopDrones(droneIDs: readonly number[]): Promise<void>;
+  /**
+   * ⚠⚠ DEV-ONLY. Run one of this world's chat commands and return the server's
+   * own reply. Reaches ~150 commands including destructive ones; the reply
+   * carries "Command failed: …" for a refusal rather than throwing.
+   *
+   * Afterwards the panels that could have changed are re-read, because a GM
+   * command mutates the world behind every open panel at once.
+   */
+  runGmCommand(command: string): Promise<string>;
+  // --- R28: skills ---------------------------------------------------------
+  //
+  // ⚠ A queue save answers with the RE-READ sheet, never with its own return
+  // value: skillMgr.SaveNewQueue returns null on success, so believing the call
+  // would mean believing nothing at all.
+
+  /** R28 — the character sheet, the queue, and the server's clock. */
+  loadSkills(): Promise<void>;
+  /**
+   * R28 — save the WHOLE queue. Adding, removing and reordering are all this
+   * one call, exactly as the server models it. `[]` pauses training.
+   *
+   * `context` is the skill the player was acting on; it is used only to word a
+   * refusal ("Gunnery needs another skill first"), because the server's refusal
+   * codes do not carry a name.
+   */
+  saveSkillQueue(
+    entries: readonly { readonly typeID: number; readonly toLevel: number }[],
+    label: string,
+    context?: string,
+  ): Promise<void>;
+  /**
+   * Spend unallocated skill points into one skill. What was actually spent is
+   * read from the server's new free-SP total, never from what was asked for.
+   */
+  applyFreeSkillPoints(skillTypeID: number, points: number): Promise<void>;
+  // --- R41: planetary colonies ---------------------------------------------
+  //
+  // READ ONLY, and deliberately so. The write path the emulator exposes
+  // (restart the expired extractors) changes what a colony is DOING, and this
+  // slice ships the ability to look before it ships the ability to act.
+
+  /** R41 — every colony this character owns, and what is on each planet. */
+  loadPlanets(): Promise<void>;
+  /** R41 — open one colony, or close the open one with null. View state. */
+  selectColony(planetID: number | null): void;
+  /** Jump through an NPC stargate (fromGate -> toGate). */
+  jump(fromGateID: number, toGateID: number): Promise<void>;
+  /**
+   * R30 slice A — the stargates in `systemID` and where each one leads.
+   *
+   * NO new server surface: this is a read of the SAME client-side route graph
+   * the R5b autopilot already fetches once and caches (`loadRouteGraph`), served
+   * as static reference data. It exists so a gate row in the overview can say
+   * which system is on the other side and jump through it, instead of pushing a
+   * flying player to another tab to type two raw gate IDs by hand.
+   *
+   * Throws if the graph cannot be read; the caller states that honestly rather
+   * than rendering gates it silently cannot route.
+   */
+  nearbyGates(systemID: number): Promise<readonly GateLink[]>;
+  /**
+   * Dock at the destination station — ONE `CmdDock`, no closing in. Out of
+   * range the server starts an approach and refuses, and the caller has to
+   * re-issue; for a Dock that closes the distance itself, use `dockAt`.
+   */
+  dock(stationID: number): Promise<void>;
+  /**
+   * R24 slice B — DOCK, the way retail's menu means it: close the distance and
+   * then dock. Runs the same browser decide-loop the travel autopilot runs (one
+   * loop, not two) over a zero-hop plan whose destination is this station, so
+   * it warps, approaches and docks in whatever order the measurement calls for,
+   * reports which phase it is in, and stops with the server's own reason if it
+   * cannot get there. Arrival is confirmed from FLIGHT STATUS, never from the
+   * Dock call's 200.
+   */
+  dockAt(stationID: number): Promise<void>;
+  /**
+   * R6a — find agents from the static reference table (default courier),
+   * annotate each with jumps from the current system (a single client-side
+   * BFS), and sort nearest-first. Surfaces a failure through the finder slice
+   * rather than throwing.
+   */
+  findAgents(filters?: { kind?: string; level?: number | null; limit?: number }): Promise<void>;
+  /**
+   * R6a — set the browser autopilot to a found agent's station (reuses the R5b
+   * route solver + decide-loop via startRoute), and record the target agent so
+   * the player knows who they're flying to.
+   */
+  setDestinationToAgent(agentID: number): Promise<void>;
+  /**
+   * R5b — start the browser autopilot to a destination (station or system ID):
+   * solve the route client-side, then run the decide-loop. Surfaces a plan
+   * error (unreachable / unknown) through the travel slice rather than throwing.
+   */
+  startRoute(destinationID: number): Promise<RouteStartOutcome>;
+  /**
+   * R7a — search the static map by name (systems + stations) so a player can set
+   * a destination without knowing EVE IDs. Returns the matches annotated with
+   * jumps from the current system (best-effort). A too-short query returns []
+   * without a request; a read failure throws (the caller surfaces it).
+   */
+  searchDestinations(
+    query: string,
+    kind?: "system" | "station" | null,
+  ): Promise<DestinationMatch[]>;
+  // --- R26: the mining bot -----------------------------------------------
+  //
+  // A SECOND browser decide-loop, built from the same parts as the autopilot
+  // and never running alongside it (starting the bot aborts the autopilot).
+  // Closing the tab is closing the client: the loop stops, the ship finishes
+  // its last server-side command, and sits.
+  /**
+   * Start the mining bot on a belt, hauling to a station, running the
+   * equipment the PLAYER picked. Surfaces a start problem through the bot
+   * slice rather than throwing.
+   */
+  startMiningBot(request: MiningBotRequest): Promise<void>;
+  /** Pause the bot (it stops issuing; the ship finishes its last move). */
+  pauseMiningBot(): void;
+  /** Resume a paused bot from where it stopped. */
+  resumeMiningBot(): void;
+  /** Stop the bot (it stops and never calls the bridge again). */
+  stopMiningBot(): void;
+  // --- R36: the distribution-mission bot ---------------------------------
+  // A THIRD browser decide-loop. Unlike the mining bot it does not fly the ship
+  // itself: it hands destinations to the SAME autopilot the Travel panel drives,
+  // so there is one flight ladder with one set of bounds.
+  /** Start the mission bot on an agent (requesting, gating, hauling, delivering). */
+  startMissionBot(request: MissionBotRequest): Promise<void>;
+  /** Pause it (it stops issuing; the ship finishes its last move). */
+  pauseMissionBot(): void;
+  /** Resume a paused mission bot from where it left off. */
+  resumeMissionBot(): void;
+  /** Stop it (it stops, stops the autopilot, and never calls the bridge again). */
+  stopMissionBot(): void;
+  // --- Player Bot Builder runner (the fourth decide-loop) ----------------
+  /** Start a player-built script; the live readout is pushed to `store.customBot`. */
+  startCustomBot(doc: BotScript, sourceScriptID?: string | null): Promise<void>;
+  /** Pause it (it stops issuing; the ship finishes its last move). */
+  pauseCustomBot(): void;
+  /** Resume a paused script from where it stopped. */
+  resumeCustomBot(): void;
+  /** Stop it (it stops and never calls the bridge again). */
+  stopCustomBot(): void;
+  /** The character's saved-fitting library (for the Bot Builder's fitting picker). */
+  listSavedFittings(): Promise<readonly import("../bridge/fittings.ts").SavedFitting[]>;
+  /** The character's saved bookmarks (for the Bot Builder's saved-spot picker). */
+  listBookmarks(): Promise<readonly { bookmarkID: number; name: string }[]>;
+  /**
+   * Manual escape hatch: stop every loop, recall drones, and dock at the nearest
+   * station on grid. Always available while a bot runs — the operator's override.
+   */
+  panicRecallAndDock(): Promise<void>;
+  /** Pause the autopilot loop (it stops issuing; the ship finishes its last move). */
+  pauseRoute(): void;
+  /** Resume a paused autopilot loop from where it stopped. */
+  resumeRoute(): void;
+  /** Abort the autopilot loop (it stops and never calls the bridge again). */
+  abortRoute(): void;
+  /**
+   * R7 — read a chat channel's member roster + recent backlog (Local or Corp)
+   * and push it to the store. The panel polls this while open (READ is a backlog
+   * poll). A lost session unwinds to offline; any other failure surfaces through
+   * the chat slice.
+   */
+  loadChat(channel: ChatChannel): Promise<void>;
+  /** R7 — send a message to a chat channel, then refresh its backlog. */
+  sendChatMessage(channel: ChatChannel, message: string): Promise<void>;
+  /** R7 — switch the active chat tab (Local <-> Corp). */
+  setChatChannel(channel: ChatChannel): void;
+  /**
+   * R7c — request display names for a set of `{kind, id}` refs (names-everywhere).
+   * Fire-and-forget: unresolved refs are batched into one /api/names round-trip,
+   * cached (including a definitive "unknown" so they never refetch), and pushed
+   * into the store's `names` slice for pure-reader components. Already-cached or
+   * in-flight refs are skipped; a transient failure is not cached (it can retry).
+   * Never throws and never blocks interaction (the UI shows the ID until the name
+   * lands).
+   */
+  requestNames(refs: readonly NameRef[]): void;
+  /**
+   * Multibox — open or close this pilot's live push channel (SSE). Browsers
+   * allow only ~6 concurrent HTTP/1.1 connections per origin, and every open
+   * EventSource holds one for its whole life, so a tab full of pilots each
+   * holding a stream starves the pool and the NEXT pilot's login/select hangs
+   * forever in the browser's request queue. The roster owner (App.svelte)
+   * keeps push on for the ACTIVE pilot only. A pilot without push still works:
+   * every bridge response carries its notification drain and the panels poll;
+   * only live chat/notification push waits until the pilot is active again.
+   * Enabling while the character is online (re-)opens the stream immediately.
+   */
+  setLivePush(enabled: boolean): void;
+  /** R92 multibox — mark this flow as the pilot on screen (or not). */
+  setForeground(active: boolean): void;
+  /**
+   * In-tab multibox — pause this pilot's background load so a sibling can
+   * login/select. Used while Add Character is open and while the roster is
+   * restoring after refresh: SelectCharacterID is an expensive edge-owner
+   * call, the tab shares one MAX_IN_FLIGHT=4 lane, and leaving space polls
+   * + bot ticks running is what makes the 3rd pilot look like it drops the
+   * others. Resume restores only bots this quiesce paused.
+   */
+  setQuiesced(quiesced: boolean): void;
+  /** Release the persistent session (character offline), back to the select list. */
+  releaseSession(): Promise<void>;
+  logout(): Promise<void>;
+}
+
+/**
+ * True when the session the BFF held can no longer act — the character is not
+ * online on it. Two codes mean this, and both must unwind the same way (stop the
+ * stream, flip the slice offline, so App prunes the pilot rather than leaving a
+ * cockpit whose every read fails):
+ *   • SESSION_NOT_FOUND — the held bridge session is gone (TTL / restart).
+ *   • NO_LIVE_SESSION   — the session is held but its character was taken over
+ *     by another client (retail takeover) or released, so the gateway reports no
+ *     character online. This is exactly what a multibox re-select does to a
+ *     character being flown elsewhere, so R107 must treat it as a lost session
+ *     or the yanked pilot lingers as a zombie cockpit.
+ */
+export function isSessionLost(error: unknown): boolean {
+  return (
+    error instanceof BridgeCallError &&
+    (error.code === "SESSION_NOT_FOUND" || error.code === "NO_LIVE_SESSION")
+  );
+}
+
+/**
+ * The RAW reason a read or a mutation failed — the server's own words, or its
+ * code when it gave none.
+ *
+ * ⚠ THIS IS NOT PLAYER-FACING. It is the machine-readable text: what the
+ * autopilot and the mining bot classify on, and what `describeRefusal` keys off.
+ * Anything that ends up on screen must go through `errorWords`/`refusalWords`
+ * (R31) — a bare `CALL_FAILED` or `101,UI/Menusvc/MenuHints/...` is jargon, and
+ * R9a does not have an exception for error paths.
+ */
+function readErrorReason(error: unknown): string {
+  if (error instanceof BridgeCallError) {
+    return error.code;
+  }
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return String(error);
+}
+
+/**
+ * The RAW reason a mutation was refused, keeping the SERVER's own words.
+ *
+ * readErrorReason() reduces a typed refusal to its code, which is right for the
+ * classification paths. It is WRONG for anything a player reads: a corp hangar
+ * refusal is the invbroker handler's own sentence ("You do not have the
+ * required roles") and a fitting refusal is dogma's ("You do not have enough
+ * CPU to online that module."), and throwing those away to show `CALL_REFUSED`
+ * loses the only useful half. The code is kept as a prefix so the
+ * machine-readable part is not lost either; `describeRefusal` looks past it.
+ *
+ * ⚠ STILL NOT PLAYER-FACING. Everything on screen goes through errorWords().
+ */
+function readRefusalReason(error: unknown): string {
+  if (error instanceof BridgeCallError) {
+    const detail = error.message.trim();
+    return detail === "" || detail === error.code ? error.code : `${error.code}: ${detail}`;
+  }
+  return readErrorReason(error);
+}
+
+/**
+ * R31 — THE SINGLE TRANSLATION SEAM. Any failure, in words a player reads.
+ *
+ * Every player-facing message in this file goes through here or through
+ * flightRefusalWords(). The raw text is logged rather than shown, so it stays
+ * recoverable for diagnosis without being in the player's face, and a refusal
+ * this client has never seen still reads as a sentence instead of a code.
+ */
+function errorWords(error: unknown): string {
+  return sayRefusal(readRefusalReason(error));
+}
+
+/** Turn a raw refusal into a sentence, keeping the raw recoverable (R31). */
+const sayRefusal = sayRefusalWords;
+
+/**
+ * The lane priority a pilot's calls carry, given whether it is on screen.
+ *
+ * ⚠ UNDEFINED, NOT "read", FOR THE FOREGROUND. Absent lets app/api.ts apply its
+ * own default, and — more importantly — lets a call that names its own priority
+ * still win: the space poll passes "poll" whether or not its pilot is on screen,
+ * because a poll is background work even for the pilot you are looking at.
+ */
+export function foregroundCallPriority(active: boolean): RequestPriority | undefined {
+  return active ? undefined : "poll";
+}
+
+export function createAppFlow(store: ClientStore, options: AppFlowOptions = {}): AppFlow {
+  // R107 — in per-session mode the `token` key is present (starting null) so
+  // every api.ts / callMethod.ts call authenticates with THIS flow's token and
+  // never the per-tab global; the login handler fills it in and logout clears
+  // it. In single-session mode the key is absent, so the same call sites fall
+  // back to the global exactly as before. `callOptions` is passed by reference
+  // to every call site below, so mutating `.token` here is seen by later calls.
+  const callOptions: {
+    baseUrl?: string;
+    fetch?: typeof fetch;
+    eventSource?: (url: string) => api.EventSourceLike;
+    token?: string | null;
+    priority?: RequestPriority;
+  } = {
+    ...(options.baseUrl !== undefined ? { baseUrl: options.baseUrl } : {}),
+    ...(options.fetch !== undefined ? { fetch: options.fetch } : {}),
+    ...(options.eventSource !== undefined ? { eventSource: options.eventSource } : {}),
+    ...(options.perSessionToken ? { token: options.initialSessionToken ?? null } : {}),
+  };
+
+  // R6b — the docked station the station-scoped panels are currently synced to,
+  // and a guard so an in-flight relocate is not re-entered. Set on select and
+  // updated whenever a flight-status snapshot reveals the character docked at a
+  // different station (autopilot arrival / manual dock); see observeFlightStatus.
+  let syncedStationID: number | null = null;
+  let relocating = false;
+
+  // --- R10 live event channel ---------------------------------------------
+  // One SSE subscription per online character, opened when select succeeds and
+  // closed when the character goes offline. It feeds the store the session
+  // notifications the page used to discard and the chat messages the Chat panel
+  // used to poll for. Liveness only: every bridge response still carries its
+  // notification drain, so a channel that never opens costs latency, not data.
+  let liveStream: api.BridgeEventSubscription | null = null;
+
+  function applyLiveFrame(frame: unknown): void {
+    if (typeof frame !== "object" || frame === null) {
+      return;
+    }
+    const record = frame as Record<string, JsonValue>;
+
+    // BFF-originated status frame (the gateway socket connected / dropped).
+    if (record.source === "evejs-web-bff" && record.type === "stream-status") {
+      const state = record.state;
+      store.apply({
+        type: "live/status",
+        status:
+          state === "live" || state === "connecting" || state === "degraded" || state === "ended"
+            ? state
+            : "idle",
+      });
+      return;
+    }
+    if (record.source !== "evejs-web-gateway") {
+      return;
+    }
+
+    const cursor = (record.cursor ?? {}) as Record<string, JsonValue>;
+    const epoch = typeof cursor.epoch === "string" ? cursor.epoch : null;
+    const sequence = typeof cursor.sequence === "number" ? cursor.sequence : 0;
+
+    // The gateway could not replay from our cursor: what we hold may have gaps,
+    // so re-read the active chat channel rather than pretend the backlog is
+    // continuous.
+    if (record.type === "snapshot") {
+      store.apply({ type: "live/resynchronize", epoch, sequence });
+      if (record.reason === "cursor_not_replayable") {
+        void loadChat(store.chat.get().activeChannel);
+      }
+      return;
+    }
+    if (record.type !== "event") {
+      return;
+    }
+
+    const event = (record.event ?? {}) as Record<string, JsonValue>;
+    if (event.kind === "chat") {
+      const channel = event.channel === "corp" ? "corp" : "local";
+      const message = decodeMessageEntry(event.entry);
+      if (message) {
+        store.apply({ type: "chat/message", channel, message });
+      }
+      return;
+    }
+    if (event.kind === "notification") {
+      const notification = (event.notification ?? {}) as Record<string, JsonValue>;
+      const method = typeof notification.method === "string" ? notification.method : null;
+      const args = Array.isArray(notification.args) ? (notification.args as unknown[]) : [];
+      const receivedAtMs = Date.now();
+      store.apply({
+        type: "live/notification",
+        epoch,
+        sequence,
+        notification: {
+          kind: typeof notification.kind === "string" ? notification.kind : "unknown",
+          service: typeof notification.service === "string" ? notification.service : null,
+          method,
+          receivedAtMs,
+          args,
+        },
+      });
+      applyPushedNotification(method, args, receivedAtMs);
+    }
+  }
+
+  // --- R24 slices C + D: acting on what the push channel carries -------------
+  //
+  // R10 built this channel and the page only ever used it for LIVENESS. Two of
+  // the notifications on it turn out to carry things the browser cannot get any
+  // other way, and both were VERIFIED end to end against the gateway (see
+  // `server/tests/webGatewaySessionEvents.test.js`, "R24:" — both arrive, with
+  // their payloads intact, on the same `sendNotification` capture stub R10
+  // proved):
+  //
+  //   OnGodmaShipEffect  a module cycle started or stopped, carrying the
+  //                      EFFECTIVE cycle duration (runtime.js:13012). No
+  //                      allowlisted call returns effective per-module
+  //                      attributes, so this event is the only source there is.
+  //   OnItemsChanged     something in the player's items changed. Mining emits
+  //                      it per stack granted (`syncMinedOreChangesToSession`,
+  //                      miningRuntime.js:994-999).
+  //
+  // The two are handled DIFFERENTLY on purpose. The cycle event is used for its
+  // payload, because the payload is the whole point. The items event is used as
+  // a TRIGGER only: it says something moved, and the ore hold is then RE-READ
+  // from the ship. Deriving the hold from a stream of deltas would mean the
+  // page's arithmetic and the ship's contents drifting apart the first time a
+  // frame is missed — and this channel is explicitly allowed to drop and
+  // resynchronise. The authority on what is in the hold is the hold.
+  const fleetSnapshotNotifications = new Set([
+    "OnFleetJoin",
+    "OnFleetLeave",
+    "OnFleetDisbanded",
+    "OnFleetMemberChanged",
+    "OnFleetMove",
+    "OnFleetWingAdded",
+    "OnFleetWingDeleted",
+    "OnFleetWingNameChanged",
+    "OnFleetSquadAdded",
+    "OnFleetSquadDeleted",
+    "OnFleetSquadNameChanged",
+    "OnFleetMotdChanged",
+    "OnFleetOptionsChanged",
+    "OnFleetJoinRequest",
+    "OnFleetJoinRejected",
+  ]);
+  const scannerSnapshotNotifications = new Set([
+    "OnNewProbe",
+    "OnRemoveProbe",
+    "OnProbesIdle",
+    "OnProbeStateChanged",
+    "OnProbeStateUpdated",
+    "OnProbeRangeUpdated",
+    "OnProbePositionsUpdated",
+    "OnReconnectToProbesAvailable",
+    "OnScannerDisconnected",
+    "OnSystemScanStarted",
+    "OnSystemScanStopped",
+    "OnSystemScanDone",
+  ]);
+
+  function applyPushedNotification(
+    method: string | null,
+    args: readonly unknown[],
+    receivedAtMs: number,
+  ): void {
+    const fleetInvite = decodeFleetInviteNotification(method, args, receivedAtMs);
+    if (fleetInvite !== null) {
+      store.apply({ type: "fleet/pending-invite", invite: fleetInvite });
+      if (fleetInvite.inviterID !== null) {
+        requestNames([{ kind: "character", id: fleetInvite.inviterID }]);
+      }
+      return;
+    }
+    if (method !== null && fleetSnapshotNotifications.has(method)) {
+      // The notification is an invalidation, never the roster authority. A
+      // coalesced, single-flight bound read below replaces the full snapshot.
+      scheduleFleetRefresh();
+      return;
+    }
+    if (method !== null && scannerSnapshotNotifications.has(method)) {
+      scheduleScannerRefresh();
+      return;
+    }
+    if (method === "OnGodmaShipEffect") {
+      applyCycleNotification(args);
+      return;
+    }
+    if (method === "OnItemsChanged") {
+      // Coalesced: mining grants ore stack by stack, so a busy cycle can push
+      // several of these at once and one re-read answers all of them.
+      scheduleHoldRefresh();
+      return;
+    }
+    if (method === "OnDamageMessage") {
+      applyDamageNotification(args);
+    }
+  }
+
+  // `OnDamageMessage` (R29). One shot. The payload is a BARE marshaled dict —
+  // not a util.KeyVal — and the fields used here were read off the live wire:
+  //
+  //   attackType  "me" for a shot WE fired; "otherPlayerWeapons" for one fired
+  //               at us. This is the ONLY honest direction signal, and it is
+  //               read rather than inferred from the ids.
+  //   source      the shooter's itemID; `target` the thing hit.
+  //   weapon      the weapon's typeID, for naming.
+  //   damage      what this shot did. ZERO IS REAL — it is a clean miss, and it
+  //               is kept rather than dropped, because "it shot and missed" is
+  //               information the player wants.
+  //   hitQuality  the server's own band. Passed through unnamed; this server
+  //               does not publish the wording, so none is invented.
+  //
+  // Both directions were measured: a rat shooting an idle ship produced 16 of
+  // these with our ship as target, and our two turrets produced their own with
+  // attackType "me". The payload is used for its CONTENT, like the cycle event
+  // above and unlike the items event — but a health re-read is still scheduled,
+  // because the log is a lossy tail and the bars must come from the snapshot.
+  function applyDamageNotification(args: readonly unknown[]): void {
+    const payload = args[0];
+    const attackType = readDictEntry(payload, "attackType");
+    const rawAmount = readDictEntry(payload, "damage");
+    const amountValue =
+      rawAmount && typeof rawAmount === "object" && "value" in (rawAmount as Record<string, unknown>)
+        ? Number((rawAmount as Record<string, unknown>).value)
+        : Number(rawAmount);
+    if (!Number.isFinite(amountValue)) {
+      return;
+    }
+    const dealt = attackType === "me";
+    const other = dealt ? readDictEntry(payload, "target") : readDictEntry(payload, "source");
+    const otherPartyID = Number(other) > 0 ? Number(other) : null;
+    const weapon = Number(readDictEntry(payload, "weapon"));
+    const quality = Number(readDictEntry(payload, "hitQuality"));
+    store.apply({
+      type: "targeting/damage",
+      direction: dealt ? "dealt" : "taken",
+      otherPartyID,
+      weaponTypeID: weapon > 0 ? weapon : null,
+      amount: amountValue,
+      quality: Number.isFinite(quality) ? quality : null,
+      atMs: Date.now(),
+    });
+    // The bars are read, never derived from these frames.
+    scheduleSpaceRefresh();
+  }
+
+  // `OnGodmaShipEffect` args, positionally (godmaMultiEvent.js:44-78, and
+  // runtime.js:13012 which sends the same ten):
+  //   [0] moduleID  [1] effectID  [2] when      [3] isStart  [4] shouldStart
+  //   [5] environment [6] startedAt [7] duration [8] repeat  [9] error
+  //
+  // `duration` is -1 when the effect has none (an instant or passive effect),
+  // and the wire form can be a marshalled real (`{type:"real", value}`) rather
+  // than a bare number. Anything we cannot read as a positive number of
+  // milliseconds is reported as "no duration", never as zero.
+  function applyCycleNotification(args: readonly unknown[]): void {
+    const moduleID = Number(args[0]) || 0;
+    if (!(moduleID > 0)) {
+      return;
+    }
+    const raw = args[7];
+    const numeric =
+      raw && typeof raw === "object" && "value" in (raw as Record<string, unknown>)
+        ? Number((raw as Record<string, unknown>).value)
+        : Number(raw);
+    const durationMs = Number.isFinite(numeric) && numeric > 0 ? numeric : null;
+    const running = Number(args[3]) === 1;
+    const repeat = args[8];
+    store.apply({
+      type: "targeting/cycle",
+      moduleID,
+      durationMs,
+      running,
+      repeating: repeat === true || Number(repeat) > 0,
+      observedAtMs: Date.now(),
+    });
+  }
+
+  // Mining grants ore stack by stack, so one cycle can push several
+  // OnItemsChanged frames back to back. Coalesce them into one re-read.
+  const HOLD_REFRESH_COALESCE_MS = 150;
+  let holdRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  function scheduleHoldRefresh(): void {
+    if (holdRefreshTimer !== null) {
+      return;
+    }
+    holdRefreshTimer = setTimeout(() => {
+      holdRefreshTimer = null;
+      // Best-effort: a failed refresh leaves the last good reading on screen
+      // with its own error, exactly as the panel's poll does.
+      void loadMiningHolds().catch(() => {});
+    }, HOLD_REFRESH_COALESCE_MS);
+    if (typeof holdRefreshTimer === "object" && "unref" in holdRefreshTimer) {
+      (holdRefreshTimer as { unref(): void }).unref();
+    }
+  }
+
+  // A fight pushes a shot per weapon per cycle, from both sides at once. R29
+  // measured 16 incoming frames from ONE frigate in a single engagement, so
+  // these coalesce harder than the hold does: the health bars only need to be
+  // right, not to redraw once per bullet.
+  const SPACE_REFRESH_COALESCE_MS = 400;
+  let spaceRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  function scheduleSpaceRefresh(): void {
+    if (spaceRefreshTimer !== null) {
+      return;
+    }
+    spaceRefreshTimer = setTimeout(() => {
+      spaceRefreshTimer = null;
+      // Best-effort, like the hold refresh: a failed read leaves the last good
+      // snapshot on screen rather than blanking the bars mid-fight.
+      void loadSpaceSnapshot().catch(() => {});
+    }, SPACE_REFRESH_COALESCE_MS);
+    if (typeof spaceRefreshTimer === "object" && "unref" in spaceRefreshTimer) {
+      (spaceRefreshTimer as { unref(): void }).unref();
+    }
+  }
+
+  // Multibox — gate on the live push channel (see AppFlow.setLivePush): while
+  // false this flow opens NO EventSource, so a background pilot never holds one
+  // of the browser's ~6 per-origin connections.
+  let livePushEnabled = options.livePush ?? true;
+
+  // In-tab multibox — when true, this pilot yields the shared transport +
+  // EveJS edge owner so a sibling login/select can finish (see setQuiesced).
+  let quiesced = false;
+  let quiescePausedMining = false;
+  let quiescePausedMission = false;
+  let quiescePausedCustom = false;
+
+  function startLiveStream(): void {
+    stopLiveStream();
+    if (!livePushEnabled) {
+      return; // status stays idle; reads still carry their notification drains
+    }
+    store.apply({ type: "live/status", status: "connecting" });
+    liveStream = api.subscribeBridgeEvents(
+      {
+        onFrame: applyLiveFrame,
+        onOpen: () => store.apply({ type: "live/status", status: "live" }),
+        // EventSource reconnects on its own; the store just records that the
+        // page is back on its polls until frames resume.
+        onError: () => store.apply({ type: "live/status", status: "degraded" }),
+      },
+      callOptions,
+    );
+  }
+
+  function stopLiveStream(): void {
+    if (liveStream) {
+      liveStream.close();
+      liveStream = null;
+    }
+    store.apply({ type: "live/cleared" });
+  }
+
+  async function refreshStationPanel(): Promise<void> {
+    // Retail issues these when the docked UI loads; the page issues them after
+    // select succeeds (push forwarding is a later goal, G6). The three reads
+    // are INDEPENDENT: a slow or failed map.GetStationInfo (the heavy
+    // full-table marshal) must never blank the services row or the guest list.
+    // And because selectCharacter calls this after the view has already
+    // switched to the panel, a failure is reported through the store (visible
+    // in the panel) rather than thrown into an unmounted caller — except a
+    // lost session, which must unwind the flow back to the character list.
+    const labels = ["GetStationItemBits", "GetGuests", "GetStationInfo"] as const;
+    const [bits, guests, cached] = await Promise.allSettled([
+      getStationItemBits(callOptions),
+      getStationGuests(callOptions),
+      getStationInfoCached(callOptions),
+    ]);
+
+    if (bits.status === "fulfilled") {
+      store.apply({ type: "station/bits", bits: bits.value });
+    }
+    if (guests.status === "fulfilled") {
+      store.apply({ type: "station/guests", guests: guests.value });
+    }
+    if (cached.status === "fulfilled") {
+      store.apply({ type: "station/info-cached", cached: cached.value });
+    }
+
+    const failures = [bits, guests, cached]
+      .map((result, index) => ({ result, label: labels[index] }))
+      .filter((entry) => entry.result.status === "rejected") as ReadonlyArray<{
+      result: PromiseRejectedResult;
+      label: string;
+    }>;
+
+    // A lost live session can't be recovered by any read: flip offline and
+    // unwind so the view falls back to the character list.
+    const lost = failures.find((entry) => isSessionLost(entry.result.reason));
+    if (lost) {
+      stopLiveStream();
+        store.apply({ type: "character/offline" });
+      throw lost.result.reason;
+    }
+
+    // Otherwise keep whatever succeeded and surface the rest (null clears a
+    // stale error after a clean refresh). Never throw here.
+    store.apply({
+      type: "station/read-error",
+      message: failures.length
+        ? failures
+            .map((entry) => `${entry.label}: ${errorWords(entry.result.reason)}`)
+            .join("; ")
+        : null,
+    });
+  }
+
+  // Load the Inventory & Ship panel. The two containers are decoded
+  // independently (their own error is preserved) so one failed read never
+  // blanks the other — R2's Promise.allSettled rule, applied here on the BFF's
+  // already-settled per-container results. A lost session unwinds to select.
+  async function loadInventory(): Promise<void> {
+    let panel: Awaited<ReturnType<typeof api.loadInventory>>;
+    try {
+      panel = await api.loadInventory(callOptions);
+    } catch (error) {
+      if (isSessionLost(error)) {
+        // The live session ended out from under the inventory tab: unwind to
+        // the character list like refreshStationPanel/runMutation, so the page
+        // doesn't stay mounted with stale rows on a dead session.
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+      }
+      throw error;
+    }
+    store.apply({
+      type: "inventory/loaded",
+      stationID: panel.stationID,
+      activeShipID: panel.activeShipID,
+      hangar: decodeContainer(panel.hangar.list, panel.hangar.capacity, panel.hangar.error, panel.volumes),
+      cargo: decodeContainer(panel.cargo.list, panel.cargo.capacity, panel.cargo.error, panel.volumes),
+    });
+  }
+
+  // Run a mutation, then refresh the panel. A lost session is rethrown to
+  // unwind the flow; any other failure is surfaced through the store (the page
+  // stays put and shows the reason) rather than thrown into the UI handler.
+  async function runMutation(action: () => Promise<void>): Promise<void> {
+    try {
+      await action();
+      store.apply({ type: "inventory/action-error", message: null });
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+        throw error;
+      }
+      store.apply({ type: "inventory/action-error", message: errorWords(error) });
+      return;
+    }
+    await loadInventory();
+  }
+
+  // --- R14 Inventory depth + corporation hangars ---------------------------
+
+  // R14's readRefusalReason and its rendered half now live at module scope as
+  // readRefusalReason/errorWords — R31 made "keep the handler's own sentence"
+  // the rule for EVERY panel rather than a special case for corp hangars, so
+  // there is one seam instead of two that could drift apart.
+
+  // Turn a transfer result into one honest sentence. A split is judged by the
+  // source stack shrinking (it mints a NEW stack at the destination, so the
+  // requested itemID never appears there), and a decline with no reason is
+  // reported AS a decline with no reason.
+  function describeTransfer(
+    result: { applied: boolean; moved: readonly number[]; declined: readonly number[] },
+    requested: number,
+    qty: number | null,
+  ): string {
+    if (result.applied && qty !== null) {
+      return `Split ${qty} off the stack.`;
+    }
+    if (result.applied && result.declined.length === 0) {
+      return `Moved ${result.moved.length} of ${requested}.`;
+    }
+    if (result.applied) {
+      return `Moved ${result.moved.length} of ${requested}; the server declined the rest without giving a reason.`;
+    }
+    return "The server did not move anything, and gave no reason.";
+  }
+
+  // Reload whatever places are currently on screen. A mutation can touch the
+  // hangar, the open container and a corp division at once (a move out of a
+  // container into a division touches all three), so after any action every
+  // open view is re-read rather than guessing which one changed.
+  async function refreshOpenPlaces(): Promise<void> {
+    const current = store.get().inventory;
+    await loadInventory();
+    if (current.container) {
+      await openContainer(current.container.itemID);
+    }
+    if (current.corp.loaded) {
+      await loadCorpHangar();
+    }
+    // A move out of a ship bay (R51) changes what that bay holds, so the open
+    // ship's bays are re-read too — otherwise the ore just moved out would keep
+    // showing in the hold until the next manual refresh.
+    if (current.openShip) {
+      await openShipBays(current.openShip.itemID);
+    }
+  }
+
+  /**
+   * Re-read everything scoped to WHICH HULL YOU ARE FLYING (goal R87).
+   *
+   * ⚠ THE BUG THIS FIXES. Boarding a ship went through `runMutation`, which
+   * reloads the hangar and the cargo — so `activeShipID` updated and the item
+   * lists were right. But two things are keyed to the hull itself and neither
+   * was touched:
+   *
+   *   • `openShip`, the bays the Ship Inventory tab draws. It is opened once, in
+   *     the panel's `onMount`, and the `inventory/loaded` reducer deliberately
+   *     preserves it across a reload — so after boarding it kept showing the
+   *     bays of the ship you had just STEPPED OUT OF, with its ore and its
+   *     capacities, indefinitely.
+   *   • The fitting slice — slots, resources, stats, dogma. An open Fitting
+   *     window kept the previous hull's modules.
+   *
+   * Both are stale in the worst way: they look live, they are labelled with the
+   * right panel, and nothing about them says they are describing a different
+   * ship.
+   *
+   * ⚠ THIS IS THE REFILL, NOT THE GUARANTEE. R88 moved the invalidation into the
+   * store, where the hull change is OBSERVED (see `inventory/loaded`): the fit
+   * and the bays card are dropped there, so no caller can leave stale hull state
+   * on screen by forgetting to call this. What this adds is promptness — the
+   * panels refill on the same beat as the board instead of sitting empty until
+   * something else asks. Deleting it degrades the experience; deleting the store
+   * half reintroduces the bug.
+   */
+  async function refreshActiveShipViews(): Promise<void> {
+    // Read the hull AFTER the mutation's own reload, so this is the ship the
+    // server ended up putting us in — never the one we asked for. A refused
+    // board leaves it unchanged and this simply re-reads what is already there.
+    const activeShipID = store.get().inventory.activeShipID;
+    // `null` closes the bays card, which is right for leaving a ship entirely.
+    await openShipBays(activeShipID).catch(() => {});
+    // The fit belongs to the hull. Fire-and-forget: a fitting read that fails
+    // must cost the player their module list, never the board that succeeded.
+    await loadFitting().catch(() => {});
+  }
+
+  // Run a mutation and report what the SERVER says actually happened. The BFF
+  // re-reads after every call because invbroker declines silently, so `applied`
+  // here is a real observation, not an echo of the request.
+  async function runInventoryAction(
+    action: () => Promise<{ applied: boolean; declinedSilently: boolean; message: string }>,
+  ): Promise<void> {
+    store.apply({ type: "inventory/outcome", outcome: null });
+    let outcome: { applied: boolean; declinedSilently: boolean; message: string };
+    try {
+      outcome = await action();
+      store.apply({ type: "inventory/action-error", message: null });
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+        throw error;
+      }
+      // A typed refusal carries the HANDLER's own reason; it is surfaced
+      // verbatim rather than reworded.
+      store.apply({ type: "inventory/action-error", message: errorWords(error) });
+      return;
+    }
+    store.apply({ type: "inventory/outcome", outcome });
+    store.apply({ type: "inventory/selection", itemIDs: [] });
+    await refreshOpenPlaces();
+  }
+
+  async function openContainer(containerID: number | null): Promise<void> {
+    if (containerID === null) {
+      store.apply({ type: "inventory/container", container: null });
+      return;
+    }
+    // Carry the container's own typeID so the panel can name it; it is a row in
+    // whichever place the player opened it from.
+    const current = store.get().inventory;
+    const owningRow =
+      current.hangar.rows.find((row) => row.itemID === containerID) ??
+      current.cargo.rows.find((row) => row.itemID === containerID) ??
+      null;
+    let reads: Awaited<ReturnType<typeof api.openContainer>>;
+    try {
+      reads = await api.openContainer(containerID, callOptions);
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+        throw error;
+      }
+      store.apply({
+        type: "inventory/container",
+        container: {
+          itemID: containerID,
+          typeID: owningRow ? owningRow.typeID : 0,
+          rows: [],
+          capacity: null,
+          error: errorWords(error),
+        },
+      });
+      return;
+    }
+    store.apply({
+      type: "inventory/container",
+      container: {
+        itemID: containerID,
+        typeID: owningRow
+          ? owningRow.typeID
+          : (store.get().inventory.container?.typeID ?? 0),
+        rows: decodeInventoryRows(reads.list),
+        capacity: reads.capacity === null ? null : decodeCapacity(reads.capacity),
+        error: null,
+      },
+    });
+  }
+
+  /**
+   * Open a ship in the Ships card and read its bays (goal R40). `null` closes
+   * the card.
+   *
+   * The open and the read are two steps on purpose: the card shows "looking at
+   * this ship…" the moment it is clicked, instead of a hull that appears to
+   * have no bays until the read lands. An empty bay list and a bay list that
+   * has not arrived yet are different pictures.
+   */
+  async function openShipBays(shipID: number | null): Promise<void> {
+    if (shipID === null) {
+      store.apply({ type: "inventory/ship-open", itemID: null, typeID: 0 });
+      return;
+    }
+    // The ship's own typeID, so the card can NAME the hull. It is a row in
+    // whichever place the player clicked it from.
+    const current = store.get().inventory;
+    const owningRow =
+      current.hangar.rows.find((row) => row.itemID === shipID) ??
+      current.cargo.rows.find((row) => row.itemID === shipID) ??
+      null;
+    store.apply({
+      type: "inventory/ship-open",
+      itemID: shipID,
+      typeID: owningRow ? owningRow.typeID : (current.openShip?.typeID ?? 0),
+    });
+    let result: Awaited<ReturnType<typeof api.getShipBays>>;
+    try {
+      result = await api.getShipBays(shipID, callOptions);
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+        throw error;
+      }
+      // The whole read failed, so NOTHING is known about this hull's bays —
+      // which is not the same as a hull with no bays. The card says so.
+      store.apply({
+        type: "inventory/ship-bays",
+        itemID: shipID,
+        bays: [],
+        error: errorWords(error),
+      });
+      return;
+    }
+    store.apply({
+      type: "inventory/ship-bays",
+      itemID: shipID,
+      bays: decodeShipBays(result.bays),
+      error: null,
+    });
+  }
+
+  async function loadCorpHangar(): Promise<void> {
+    let reads: Awaited<ReturnType<typeof api.loadCorpHangar>>;
+    try {
+      reads = await api.loadCorpHangar(callOptions);
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+        throw error;
+      }
+      store.apply({
+        type: "inventory/corp-loaded",
+        available: false,
+        reason: errorWords(error),
+        divisions: [],
+      });
+      return;
+    }
+    store.apply({
+      type: "inventory/corp-loaded",
+      available: reads.available,
+      reason: reads.reason,
+      divisions: reads.divisions.map((division) => ({
+        division: division.division,
+        name: division.name,
+        // A division the character cannot query answers an EMPTY list, not an
+        // error — the server filtered it, and that is the authority.
+        rows: division.list === null ? [] : decodeInventoryRows(division.list),
+        error: division.error,
+      })),
+    });
+  }
+
+  // --- R12 Ship fitting ----------------------------------------------------
+
+  // Load the Fitting panel. The slot read and the resource read are
+  // INDEPENDENT on the BFF, so each keeps its own error and a failed resource
+  // read still shows the fit (and vice versa). A lost session unwinds to
+  // select, exactly as loadInventory does.
+  async function loadFitting(): Promise<void> {
+    let reads: Awaited<ReturnType<typeof api.loadFitting>>;
+    try {
+      reads = await api.loadFitting(callOptions);
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+      }
+      throw error;
+    }
+    store.apply({
+      type: "fitting/loaded",
+      activeShipID: reads.activeShipID,
+      slots: buildSlots(reads.slots, reads.shipInfo, reads.online),
+      chargeFits: decodeChargeFits(reads.chargeFits),
+      resources: decodeResources(reads.shipInfo),
+      // R21 — the derived statistics come off the SAME ShipGetInfo attribute
+      // map as the resource bars. No extra read, and nothing re-simulated:
+      // the server already applied the ship's active-module effects before it
+      // sent this (see bridge/shipStats.ts for why that matters).
+      stats: deriveShipStats(decodeShipAttributes(reads.shipInfo)),
+      slotsError: reads.errors.slots || reads.errors.online,
+      resourcesError: reads.errors.shipInfo,
+    });
+    // R24 slice C — seed each fitted module's BASE cycle length from static
+    // data, so the panel can say how long a module takes before it has ever
+    // been switched on. Best-effort and never blocking: it is reference data,
+    // and a module with no figure simply has none rather than a fabricated one.
+    void seedBaseCycleTimes(store.fitting.get().slots).catch(() => {});
+    // R21 slice B — the per-module EFFECTIVE attributes, refreshed on the same
+    // beat as the fit (and after every fitting action, which reloads via this
+    // path). Fire-and-forget: loadDogma keeps its own error, so the fit is never
+    // held up — or blanked — by a dogma read that stumbles.
+    void loadDogma().catch(() => {});
+  }
+
+  /**
+   * Load the bound-dogma snapshot for the Fitting window: the active ship plus
+   * every fitted module, each carrying the SERVER's post-dogma attribute map
+   * (skills + hull bonuses + in-space effects already applied). The Fitting
+   * panel looks a clicked module up here by itemID to show its effective stats;
+   * nothing is recomputed in the browser.
+   *
+   * Resilient by design. A lost live session unwinds to select exactly like
+   * loadFitting; every OTHER failure is recorded on the slice's own error and
+   * swallowed, because the dogma read is a companion to the fit, never a gate on
+   * it — a fit that loaded must still render even when its module stats do not.
+   */
+  async function loadDogma(): Promise<void> {
+    let decoded: Awaited<ReturnType<typeof api.boundDogma>>;
+    try {
+      decoded = await api.boundDogma(callOptions);
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+        return;
+      }
+      store.apply({ type: "dogma/loaded", allInfo: null, error: errorWords(error) });
+      return;
+    }
+    // The snapshot rides on GetAllInfo; carry that read's own error through so a
+    // partial refusal is stated rather than shown as an empty ship.
+    store.apply({
+      type: "dogma/loaded",
+      allInfo: decoded.allInfo.value,
+      error: decoded.allInfo.error,
+    });
+  }
+
+  /**
+   * R24 slice C — attribute 73 for every fitted module, mapped from TYPE to the
+   * individual module's itemID (which is what the cycle events are keyed by, so
+   * the two sources land in the same place and the server's figure can displace
+   * the base one cleanly).
+   */
+  async function seedBaseCycleTimes(slots: readonly FittingSlot[]): Promise<void> {
+    const typeIDs: number[] = [];
+    for (const slot of slots) {
+      if (slot.module && slot.module.typeID > 0 && !typeIDs.includes(slot.module.typeID)) {
+        typeIDs.push(slot.module.typeID);
+      }
+    }
+    if (typeIDs.length === 0) {
+      return;
+    }
+    const { baseCycleMs } = await api.loadBaseCycleTimes(typeIDs, callOptions);
+    const cycles: Record<number, number | null> = {};
+    for (const slot of slots) {
+      if (slot.module) {
+        cycles[slot.module.itemID] = baseCycleMs[slot.module.typeID] ?? null;
+      }
+    }
+    store.apply({ type: "targeting/base-cycles", cycles });
+  }
+
+  /**
+   * Run a fitting action, then reload the panel so it shows SERVER truth.
+   *
+   * Two refusal shapes have to be handled, and they are not the same thing:
+   *  - a THROWN refusal carries the handler's own reason (e.g. "You do not
+   *    have enough CPU to online that module.") and is surfaced verbatim;
+   *  - a SILENT decline returns success while nothing moved (invbroker's
+   *    fit validation does this for a module you lack the skill for). The BFF
+   *    re-reads the slots and reports `applied: false`; saying only that the
+   *    server declined is honest, where naming a cause would be a guess.
+   */
+  /**
+   * What the named modules are holding, as one comparable string.
+   *
+   * ⚠ THE ONLY WAY TO KNOW AN AMMO CALL DID ANYTHING. dogmaIM.LoadAmmo returns
+   * null whether it loaded or refused, and the BFF therefore answers a flat
+   * `applied: true` either way — measured live, loading an XL projectile round
+   * into a small autocannon came back 200/applied with an empty notification
+   * list and the module untouched. So the RE-READ is the authority, exactly as
+   * it is for locking, module activation and drone orders.
+   */
+  function ammoSignature(moduleIDs: readonly number[]): string {
+    const wanted = new Set(moduleIDs);
+    return store.fitting
+      .get()
+      .slots.filter((slot) => slot.module !== null && wanted.has(slot.module.itemID))
+      .map((slot) => {
+        const charge = slot.module!.charge;
+        return charge ? `${slot.module!.itemID}:${charge.typeID}x${charge.quantity}` : "";
+      })
+      .filter((entry) => entry !== "")
+      .sort()
+      .join("|");
+  }
+
+  /**
+   * Run an ammunition write, then prove it against the re-read.
+   *
+   * `declined` receives the signature before and after; returning true records
+   * the silent decline. A genuine refusal still throws and is reported as the
+   * server worded it, untouched.
+   */
+  async function runAmmoAction(
+    moduleIDs: readonly number[],
+    action: () => Promise<void>,
+    declined: (before: string, after: string) => boolean,
+    declineMessage: string,
+  ): Promise<void> {
+    const before = ammoSignature(moduleIDs);
+    try {
+      await action();
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+        throw error;
+      }
+      store.apply({ type: "fitting/action-error", message: errorWords(error) });
+      return;
+    }
+    await loadFitting();
+    // AFTER the reload: loadFitting clears the action error on success, so a
+    // decline recorded before it would be wiped by its own refresh.
+    if (declined(before, ammoSignature(moduleIDs))) {
+      store.apply({ type: "fitting/action-error", message: declineMessage });
+    }
+  }
+
+  /**
+   * Whether one fitted module is online right now, or null when the fit does
+   * not carry it. Used to prove an online/offline toggle actually landed.
+   */
+  function moduleOnlineState(itemID: number): boolean | null {
+    const slot = store.fitting.get().slots.find((entry) => entry.module?.itemID === itemID);
+    return slot?.module ? slot.module.online : null;
+  }
+
+  async function runFittingAction(
+    action: () => Promise<{ readonly applied: boolean } | void>,
+  ): Promise<void> {
+    let declined = false;
+    try {
+      const outcome = await action();
+      declined = outcome !== undefined && outcome !== null && outcome.applied === false;
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+        throw error;
+      }
+      store.apply({ type: "fitting/action-error", message: errorWords(error) });
+      return;
+    }
+    await loadFitting();
+    // loadFitting clears the action error on success, so a silent decline is
+    // recorded AFTER the reload or it would be wiped by its own refresh.
+    if (declined) {
+      store.apply({
+        type: "fitting/action-error",
+        message: "The server did not apply that change, and gave no reason.",
+      });
+    }
+  }
+
+  // --- R15 Industry --------------------------------------------------------
+
+  /**
+   * Load the Industry panel.
+   *
+   * Two round-trips, and the ORDER matters: the live read has to answer first
+   * because it is what names the blueprint types the static recipes are then
+   * fetched for. The live read is five INDEPENDENT calls on the BFF, so a
+   * player whose region answers no facilities still sees their blueprints and
+   * jobs — each read keeps its own error.
+   *
+   * The recipe fetch is deliberately NOT awaited into the same failure path:
+   * it is static reference data, so a failure there costs the install preview
+   * its material list but must never blank the panel.
+   */
+  async function loadIndustry(): Promise<void> {
+    let reads: Awaited<ReturnType<typeof api.loadIndustry>>;
+    try {
+      reads = await api.loadIndustry(callOptions);
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+      }
+      throw error;
+    }
+    const blueprints = decodeBlueprints(reads.blueprints.result);
+    const jobs = decodeJobs(reads.jobs.result);
+    const facilities = decodeFacilities(reads.facilities.result);
+    store.apply({
+      type: "industry/loaded",
+      ownerID: reads.ownerID,
+      stationID: reads.stationID,
+      solarSystemID: reads.solarSystemID,
+      blueprints,
+      jobs,
+      facilities,
+      slotsUsed: decodeSlotUsage(reads.jobCounts.result),
+      blueprintsError: reads.blueprints.error,
+      // The slot counts are part of the jobs picture; a failure there is a
+      // jobs-side failure rather than a whole-panel one.
+      jobsError: reads.jobs.error || reads.jobCounts.error,
+      facilitiesError: reads.facilities.error,
+    });
+
+    // Every ID the panel will show, resolved to a NAME (R7d). A blueprint and
+    // its product are ordinary types; a facility is a station in a system.
+    const refs: NameRef[] = [];
+    for (const blueprint of blueprints) {
+      refs.push({ kind: "type", id: blueprint.typeID });
+    }
+    for (const job of jobs) {
+      refs.push({ kind: "type", id: job.blueprintTypeID });
+      refs.push({ kind: "type", id: job.productTypeID });
+      refs.push({ kind: "station", id: job.facilityID });
+    }
+    for (const facility of facilities) {
+      refs.push({ kind: "station", id: facility.facilityID });
+      refs.push({ kind: "system", id: facility.solarSystemID });
+    }
+    requestNames(refs);
+
+    // The static recipes for every blueprint type in view — the blueprints the
+    // player holds AND the ones their running jobs are built from (a job's
+    // blueprint may be locked away in the job and absent from the list).
+    const typeIDs = new Set<number>();
+    for (const blueprint of blueprints) {
+      typeIDs.add(blueprint.typeID);
+    }
+    for (const job of jobs) {
+      typeIDs.add(job.blueprintTypeID);
+    }
+    const known = store.get().industry.definitions;
+    const wanted = [...typeIDs].filter((typeID) => typeID > 0 && !(typeID in known));
+    if (wanted.length === 0) {
+      return;
+    }
+    let raw: Readonly<Record<string, JsonValue>>;
+    try {
+      raw = await api.loadIndustryDefinitions(wanted, callOptions);
+    } catch {
+      // Static data only: the panel still lists everything, it just cannot
+      // preview what an install would consume until a later load succeeds.
+      return;
+    }
+    const definitions: Record<number, ReturnType<typeof decodeDefinition>> = {};
+    for (const typeID of wanted) {
+      // A definitive miss is cached as null so it is never refetched.
+      definitions[typeID] = decodeDefinition(raw[String(typeID)]);
+    }
+    store.apply({ type: "industry/definitions", definitions });
+  }
+
+  /**
+   * Run an industry mutation, then reload the panel so it shows SERVER truth.
+   *
+   * The same two refusal shapes R12 and R14 established, and they are not the
+   * same thing:
+   *  - a THROWN refusal carries the handler's own reason. For deliver and
+   *    cancel that is prose ("That industry job is not ready yet."); for
+   *    install it is a structured list of the server's OWN error names, which
+   *    `industryRefusalMessage` turns into a sentence without inventing a
+   *    cause the server did not give.
+   *  - a SILENT decline returns success while nothing happened. The BFF
+   *    re-reads the job and reports `applied: false`; saying only that the
+   *    server declined is honest, where naming a cause would be a guess.
+   */
+  async function runIndustryAction(
+    action: () => Promise<{ readonly applied: boolean }>,
+  ): Promise<void> {
+    let declined = false;
+    try {
+      const outcome = await action();
+      declined = outcome.applied === false;
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+        throw error;
+      }
+      store.apply({
+        type: "industry/action-error",
+        message: industryRefusalMessage(error),
+      });
+      return;
+    }
+    await loadIndustry();
+    // loadIndustry clears the action error on success, so a silent decline is
+    // recorded AFTER the reload or it would be wiped by its own refresh.
+    if (declined) {
+      store.apply({
+        type: "industry/action-error",
+        message: "The server did not apply that change, and gave no reason.",
+      });
+    }
+  }
+
+  // --- R16 Market ----------------------------------------------------------
+
+  /**
+   * Load the Market panel.
+   *
+   * Seven INDEPENDENT reads on the BFF, so a public order book that fails
+   * never hides the player's own orders — and the other way round. The
+   * DAEMON-outage case is kept separate from an empty book on purpose: "nobody
+   * is trading this" and "the market is not answering" are different facts and
+   * the panel says which one happened.
+   *
+   * Nothing here sorts or filters: that is the client-local `marketQuote`
+   * logic, applied at render time in the panel so the player can re-sort
+   * without a round-trip — exactly as retail does it.
+   */
+  async function loadMarket(typeID: number | null): Promise<void> {
+    let reads: Awaited<ReturnType<typeof api.loadMarket>>;
+    try {
+      reads = await api.loadMarket(typeID, callOptions);
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+      }
+      throw error;
+    }
+    const book = decodeOrderBook(reads.book.result);
+    const ownOrders = decodeOwnOrders(reads.ownOrders.result);
+    const orderHistory = decodeOwnOrders(reads.orderHistory.result);
+    // ⚠ The transaction decoder needs the character's OWN id: a trade row names
+    // a buyer and a seller and nothing else, so which side the player was on is
+    // derived by comparison, never guessed.
+    const transactions = decodeTransactions(
+      reads.transactions.result,
+      reads.characterID ?? 0,
+    );
+    store.apply({
+      type: "market/loaded",
+      typeID: reads.typeID,
+      stationID: reads.stationID,
+      solarSystemID: reads.solarSystemID,
+      sells: book.sells,
+      buys: book.buys,
+      ownOrders,
+      orderHistory,
+      transactions,
+      escrow: reads.escrow.error ? null : decodeEscrow(reads.escrow.result),
+      priceHistory: decodePriceHistory(reads.priceHistory.result),
+      cashBalance: toAmountString(reads.cashBalance.result),
+      bookError: reads.book.error,
+      // The own-orders picture is one thing to the player, so a failure in
+      // either half is an own-orders failure.
+      ownOrdersError: reads.ownOrders.error || reads.orderHistory.error,
+      transactionsError: reads.transactions.error,
+      marketUnavailable: reads.marketUnavailable,
+    });
+
+    // Every ID the panel will show, resolved to a NAME (R7d). An order is an
+    // item (a type) at a station in a system.
+    const refs: NameRef[] = [];
+    if (reads.typeID) {
+      refs.push({ kind: "type", id: reads.typeID });
+    }
+    for (const row of [...book.sells, ...book.buys]) {
+      refs.push({ kind: "station", id: row.stationID });
+      refs.push({ kind: "system", id: row.solarSystemID });
+    }
+    for (const row of [...ownOrders, ...orderHistory]) {
+      refs.push({ kind: "type", id: row.typeID });
+      refs.push({ kind: "station", id: row.stationID });
+      refs.push({ kind: "system", id: row.solarSystemID });
+    }
+    for (const row of transactions) {
+      refs.push({ kind: "type", id: row.typeID });
+      refs.push({ kind: "station", id: row.stationID });
+    }
+    requestNames(refs);
+  }
+
+  /**
+   * Run a market write, then reload the panel so it shows SERVER truth, and
+   * record what ACTUALLY happened to the money.
+   *
+   * Three outcomes, handled differently on purpose:
+   *  - a THROWN refusal carries the handler's own reason (or a named market
+   *    error), which `marketRefusalMessage` turns into a sentence without
+   *    inventing a cause the server did not give;
+   *  - a SILENT decline returns success while nothing moved. The BFF judged
+   *    that from its RE-READ (the wallet did not change, or the order is still
+   *    there at the old price), and saying only that the server declined is
+   *    honest where naming a cause would be a guess;
+   *  - success, in which case the amount reported is the WALLET DIFFERENCE the
+   *    BFF measured — never the estimate the confirm step showed.
+   */
+  async function runMarketAction(
+    kind: "buy" | "sell" | "cancel" | "modify",
+    action: () => Promise<api.MarketChangeResult>,
+  ): Promise<void> {
+    let outcome: api.MarketChangeResult;
+    try {
+      outcome = await action();
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+        throw error;
+      }
+      store.apply({ type: "market/action-error", message: marketRefusalMessage(error) });
+      return;
+    }
+    // Reload first: the panel must show the server's own picture of the
+    // player's orders and ISK before it says anything about what happened.
+    await loadMarket(store.get().market.typeID);
+    // loadMarket clears the action error on success, so the verdict is recorded
+    // AFTER the reload or its own refresh would wipe it.
+    store.apply({
+      type: "market/outcome",
+      outcome: {
+        kind,
+        applied: outcome.applied,
+        declinedSilently: outcome.declinedSilently,
+        charged: outcome.charged,
+        balanceAfter: outcome.balanceAfter,
+      },
+    });
+  }
+
+  // --- Activity Center -----------------------------------------------------
+
+  async function loadActivity(): Promise<void> {
+    store.apply({ type: "activity/loading" });
+
+    const now = new Date();
+    const [notificationResult, calendarResult, mailResult] = await Promise.allSettled([
+      api.loadActivityNotifications(callOptions),
+      api.loadActivityCalendar(now.getUTCMonth() + 1, now.getUTCFullYear(), callOptions),
+      // Reuse the existing mail flow so its own authoritative slice and name
+      // resolution stay the one source of truth for unread mail.
+      loadMail(),
+    ] as const);
+
+    // A lost live session invalidates every result, even if another arm won
+    // the race and answered first. Unwind exactly like all other panel reads.
+    for (const result of [notificationResult, calendarResult, mailResult]) {
+      if (result.status === "rejected" && isSessionLost(result.reason)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+        throw result.reason;
+      }
+    }
+
+    const notificationReads: ReturnType<typeof decodeActivityNotifications> =
+      notificationResult.status === "fulfilled"
+        ? decodeActivityNotifications(notificationResult.value)
+        : {
+            notifications: activityReadError<readonly ActivityNotificationRow[]>(
+              `Recent notifications could not be refreshed. ${errorWords(notificationResult.reason)}`,
+            ),
+            unprocessedCount: activityReadError<number>(
+              `Unread notifications could not be refreshed. ${errorWords(notificationResult.reason)}`,
+            ),
+          };
+
+    const calendarReads: ReturnType<typeof decodeActivityCalendar> =
+      calendarResult.status === "fulfilled"
+        ? decodeActivityCalendar(calendarResult.value, now.getTime())
+        : {
+            calendarEvents: activityReadError<readonly ActivityCalendarEventRow[]>(
+              `Calendar events could not be refreshed. ${errorWords(calendarResult.reason)}`,
+            ),
+            calendarResponses: activityReadError<readonly ActivityCalendarResponseRow[]>(
+              `Calendar responses could not be refreshed. ${errorWords(calendarResult.reason)}`,
+            ),
+          };
+
+    store.apply({
+      type: "activity/loaded",
+      ...notificationReads,
+      ...calendarReads,
+      mailError:
+        mailResult.status === "rejected"
+          ? `Mail could not be refreshed. ${errorWords(mailResult.reason)}`
+          : null,
+      refreshedAtMs: Date.now(),
+    });
+
+    // Resolve every entity the panel can show. Unknown owners still render a
+    // safe role word — never their raw game ID.
+    const refs: NameRef[] = [];
+    if (notificationReads.notifications.status === "ready") {
+      for (const notification of notificationReads.notifications.value) {
+        if (notification.senderID > 0) refs.push({ kind: "owner", id: notification.senderID });
+      }
+    }
+    if (calendarReads.calendarEvents.status === "ready") {
+      for (const event of calendarReads.calendarEvents.value) {
+        if (event.ownerID > 0) refs.push({ kind: "owner", id: event.ownerID });
+      }
+    }
+    requestNames(refs);
+  }
+
+  // --- Scanner / Exploration Center ---------------------------------------
+
+  // A flight transition can finish while an older scanner read is still in
+  // flight. Only the newest generation may publish, and a scanner that had
+  // already been opened is refreshed automatically after a system change.
+  let scannerLoadGeneration = 0;
+  let scannerRefreshPromise: Promise<void> | null = null;
+  let scannerRefreshDirty = false;
+  let scannerRefreshScheduled = false;
+
+  function scheduleScannerRefresh(): void {
+    if (scannerRefreshPromise !== null) {
+      scannerRefreshDirty = true;
+      return;
+    }
+    if (scannerRefreshScheduled) {
+      return;
+    }
+    scannerRefreshScheduled = true;
+    queueMicrotask(() => {
+      scannerRefreshScheduled = false;
+      scannerRefreshPromise = (async () => {
+        do {
+          scannerRefreshDirty = false;
+          await loadScanner();
+        } while (scannerRefreshDirty);
+      })().finally(() => {
+        scannerRefreshPromise = null;
+      });
+      void scannerRefreshPromise.catch(() => undefined);
+    });
+  }
+
+  async function loadScanner(): Promise<void> {
+    const generation = ++scannerLoadGeneration;
+    store.apply({ type: "scanner/loading" });
+    const [scanResult, formationsResult, operationsResult] = await Promise.allSettled([
+      api.loadBoundSmallServices(callOptions),
+      api.loadScannerFormations(callOptions),
+      api.loadScannerOperations(callOptions),
+    ] as const);
+
+    for (const result of [scanResult, formationsResult, operationsResult]) {
+      if (result.status === "rejected" && isSessionLost(result.reason)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+        throw result.reason;
+      }
+    }
+
+    let scan = scanResult.status === "fulfilled"
+      ? scannerStateFromBoundRead(decodeBoundSmallServices(scanResult.value).fullState)
+      : {
+          status: "unavailable" as const,
+          reason: "Scanner data could not be read from the live session.",
+        };
+    const formations = formationsResult.status === "fulfilled"
+      ? { status: "ready" as const, value: decodeFormations(formationsResult.value) }
+      : {
+          status: "unavailable" as const,
+          reason: "Formation reference data could not be read from the live session.",
+        };
+    const operations = operationsResult.status === "fulfilled"
+      ? { status: "ready" as const, value: operationsResult.value }
+      : {
+          status: "unavailable" as const,
+          reason: "Probe action state could not be read from the live session.",
+        };
+
+    // A newer refresh (normally the one scheduled by a completed jump) owns
+    // the slice. Let this older response fall away instead of repainting the
+    // previous system after the new request has begun.
+    if (generation !== scannerLoadGeneration) {
+      return;
+    }
+    const rawSolarSystemID = scanResult.status === "fulfilled"
+      ? scanResult.value.solarSystemID
+      : null;
+    const scanSolarSystemID =
+      typeof rawSolarSystemID === "number" &&
+      Number.isSafeInteger(rawSolarSystemID) &&
+      rawSolarSystemID > 0
+        ? rawSolarSystemID
+        : null;
+    const operationsSolarSystemID = operations.status === "ready"
+      ? operations.value.solarSystemID
+      : null;
+    if (
+      scanSolarSystemID !== null
+      && operationsSolarSystemID !== null
+      && scanSolarSystemID !== operationsSolarSystemID
+    ) {
+      scan = {
+        status: "unavailable",
+        reason: "The ship changed systems while scanner data was refreshing.",
+      };
+    }
+    const solarSystemID = operationsSolarSystemID ?? scanSolarSystemID;
+
+    store.apply({
+      type: "scanner/loaded",
+      solarSystemID,
+      scan,
+      formations,
+      operations,
+      refreshedAtMs: Date.now(),
+    });
+
+    if (scan.status === "ready") {
+      const refs: NameRef[] = [];
+      const seen = new Set<number>();
+      for (const site of [
+        ...scan.value.anomalies,
+        ...scan.value.signatures,
+        ...scan.value.staticSites,
+        ...scan.value.structures,
+      ]) {
+        for (const field of [site.fields.typeID, site.fields.entryObjectTypeID]) {
+          if (typeof field === "number" && Number.isSafeInteger(field) && field > 0 && !seen.has(field)) {
+            seen.add(field);
+            refs.push({ kind: "type", id: field });
+          }
+        }
+      }
+      requestNames(refs);
+    }
+    if (operations.status === "ready") {
+      const refs: NameRef[] = [];
+      if (operations.value.launcher?.typeID) {
+        refs.push({ kind: "type", id: operations.value.launcher.typeID });
+      }
+      for (const probe of operations.value.probes) {
+        refs.push({ kind: "type", id: probe.typeID });
+      }
+      requestNames(refs);
+    }
+  }
+
+  async function runScannerAction(action: () => Promise<void>): Promise<void> {
+    let mutationError: unknown = null;
+    try {
+      await action();
+    } catch (error) {
+      mutationError = error;
+    }
+    // A write acknowledgement is not scanner state, and a transport error can
+    // be an uncertain outcome. Re-read in both cases before reporting back.
+    await loadScanner();
+    if (mutationError !== null) {
+      throw mutationError;
+    }
+  }
+
+  function launchScannerProbes(): Promise<void> {
+    return runScannerAction(() => api.launchScannerProbes(callOptions));
+  }
+
+  function analyzeScannerSignatures(): Promise<void> {
+    return runScannerAction(() => api.requestScannerAnalysis(callOptions));
+  }
+
+  function recoverScannerProbes(): Promise<void> {
+    return runScannerAction(() => api.recoverScannerProbes(callOptions));
+  }
+
+  function reconnectScannerProbes(): Promise<void> {
+    return runScannerAction(() => api.reconnectScannerProbes(callOptions));
+  }
+
+  // --- Fleet Center -------------------------------------------------------
+
+  const fleetNameID = (value: number | string | null): number | null =>
+    typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null;
+
+  // Fleet mutations commonly emit several frames for one change. Bound fleet
+  // reads deliberately rebind, so they must not overlap: a dirty bit asks the
+  // active read to run one more time, while a microtask coalesces a same-turn
+  // notification burst into one initial read.
+  let fleetRefreshPromise: Promise<void> | null = null;
+  let fleetRefreshDirty = false;
+  let fleetRefreshScheduled = false;
+
+  function scheduleFleetRefresh(): void {
+    if (fleetRefreshPromise !== null) {
+      fleetRefreshDirty = true;
+      return;
+    }
+    if (fleetRefreshScheduled) {
+      return;
+    }
+    fleetRefreshScheduled = true;
+    queueMicrotask(() => {
+      fleetRefreshScheduled = false;
+      void loadFleet().catch(() => undefined);
+    });
+  }
+
+  async function loadFleetSnapshotOnce(): Promise<void> {
+    store.apply({ type: "fleet/loading" });
+    let snapshot: ReturnType<typeof decodeFleetCenter>;
+    let readError: string | null = null;
+    try {
+      snapshot = decodeFleetCenter(await api.loadBoundFleet(callOptions));
+      if (
+        snapshot.availability === "ready" &&
+        [
+          snapshot.fleet.wings,
+          snapshot.fleet.motd,
+          snapshot.fleet.joinRequests,
+          snapshot.fleet.composition,
+        ].some((read) => read.error !== null)
+      ) {
+        readError = "Some fleet details could not be refreshed, but the roster is available.";
+      } else if (snapshot.availability === "unavailable") {
+        readError = "Fleet membership could not be read just now.";
+      }
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+        throw error;
+      }
+      snapshot = decodeFleetCenter(null);
+      readError = `Fleet membership could not be read just now. ${errorWords(error)}`;
+    }
+
+    store.apply({
+      type: "fleet/loaded",
+      ...snapshot,
+      readError,
+      refreshedAtMs: Date.now(),
+    });
+
+    const refs: NameRef[] = [];
+    for (const member of snapshot.fleet.initState.value.members) {
+      const characterID = fleetNameID(member.charID);
+      const stationID = fleetNameID(member.stationID);
+      const systemID = fleetNameID(member.solarSystemID);
+      const shipTypeID = fleetNameID(member.shipTypeID);
+      if (characterID !== null) refs.push({ kind: "character", id: characterID });
+      if (stationID !== null) refs.push({ kind: "station", id: stationID });
+      if (systemID !== null) refs.push({ kind: "system", id: systemID });
+      if (shipTypeID !== null) refs.push({ kind: "type", id: shipTypeID });
+    }
+    for (const request of snapshot.fleet.joinRequests.value) {
+      const characterID = fleetNameID(request.charID);
+      const corporationID = fleetNameID(request.corpID);
+      const allianceID = fleetNameID(request.allianceID);
+      const factionID = fleetNameID(request.warFactionID);
+      if (characterID !== null) refs.push({ kind: "character", id: characterID });
+      if (corporationID !== null) refs.push({ kind: "corporation", id: corporationID });
+      if (allianceID !== null) refs.push({ kind: "alliance", id: allianceID });
+      if (factionID !== null) refs.push({ kind: "faction", id: factionID });
+    }
+    requestNames(refs);
+  }
+
+  async function drainFleetRefreshes(): Promise<void> {
+    try {
+      while (fleetRefreshDirty) {
+        fleetRefreshDirty = false;
+        await loadFleetSnapshotOnce();
+      }
+    } finally {
+      // No callback can interleave between the loop condition and this reset,
+      // so a later notification either dirtied the loop or starts a new worker.
+      fleetRefreshPromise = null;
+    }
+  }
+
+  function loadFleet(): Promise<void> {
+    if (fleetRefreshPromise !== null) {
+      return fleetRefreshPromise;
+    }
+    fleetRefreshDirty = true;
+    fleetRefreshPromise = drainFleetRefreshes();
+    return fleetRefreshPromise;
+  }
+
+  function fleetActionFailure(action: FleetAction): string {
+    switch (action) {
+      case "form":
+        return "The new fleet could not be confirmed by the follow-up roster read.";
+      case "accept":
+        return "Joining the fleet could not be confirmed by the follow-up roster read.";
+      case "leave":
+        return "Leaving the fleet could not be confirmed by the follow-up membership read.";
+      case "invite":
+        return "The fleet could not be re-read after the invitation was sent.";
+    }
+  }
+
+  async function runFleetAction(
+    action: FleetAction,
+    mutate: () => Promise<void>,
+    expected: "ready" | "not-in-fleet",
+  ): Promise<void> {
+    store.apply({ type: "fleet/action-started", action });
+    let failure: string | null = null;
+    try {
+      await mutate();
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+        store.apply({ type: "fleet/action-finished", error: null });
+        throw error;
+      }
+      failure = `The fleet action was refused. ${errorWords(error)}`;
+    }
+
+    try {
+      // The write acknowledgement is not treated as world state. Always read
+      // the session's own bound fleet again, even after a refusal.
+      await loadFleet();
+      if (failure === null && store.fleet.get().availability !== expected) {
+        failure = fleetActionFailure(action);
+      }
+    } finally {
+      store.apply({ type: "fleet/action-finished", error: failure });
+    }
+  }
+
+  async function formFleet(): Promise<void> {
+    await runFleetAction("form", () => api.createFleet(callOptions), "ready");
+  }
+
+  async function inviteFleetMember(characterID: number): Promise<void> {
+    if (!Number.isSafeInteger(characterID) || characterID <= 0) {
+      store.apply({ type: "fleet/action-started", action: "invite" });
+      store.apply({
+        type: "fleet/action-finished",
+        error: "Enter a valid character ID before sending an invitation.",
+      });
+      return;
+    }
+    await runFleetAction(
+      "invite",
+      () => api.inviteToFleet(characterID, callOptions),
+      "ready",
+    );
+  }
+
+  async function acceptFleetInvite(): Promise<void> {
+    const invite = store.fleet.get().pendingInvite;
+    if (invite === null) {
+      store.apply({ type: "fleet/action-started", action: "accept" });
+      store.apply({
+        type: "fleet/action-finished",
+        error: "No pending fleet invitation has arrived for this session.",
+      });
+      return;
+    }
+    await runFleetAction(
+      "accept",
+      () => api.acceptFleetInvite(invite.fleetID, callOptions),
+      "ready",
+    );
+  }
+
+  async function leaveFleet(): Promise<void> {
+    await runFleetAction("leave", () => api.leaveFleet(callOptions), "not-in-fleet");
+  }
+
+  // --- R17 Mail -------------------------------------------------------------
+
+  async function loadMail(): Promise<void> {
+    let inbox: Awaited<ReturnType<typeof api.loadMail>>;
+    try {
+      inbox = await api.loadMail(callOptions);
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+      }
+      throw error;
+    }
+    // ⚠ The sync's two header arms plus any backfill ARE the whole mailbox:
+    // the BFF cold-started the delta, so there is no window and no paging.
+    const { messages, statuses } = decodeMailbox(inbox.sync, inbox.backfill);
+    store.apply({
+      type: "mail/loaded",
+      messages,
+      statuses,
+      unreadCount: inbox.unreadCount,
+      inboxError: null,
+    });
+
+    // Every person the panel will show, resolved to a NAME (R7d): who sent each
+    // message, and who each one went to. A corporation/alliance recipient is
+    // named too, so a corp-wide message reads as "to <corp>" rather than a
+    // number.
+    const refs: NameRef[] = [];
+    for (const header of messages) {
+      refs.push({ kind: "character", id: header.senderID });
+      for (const recipientID of header.toCharacterIDs) {
+        refs.push({ kind: "character", id: recipientID });
+      }
+      if (header.toCorpOrAllianceID !== null) {
+        refs.push({ kind: "corporation", id: header.toCorpOrAllianceID });
+      }
+    }
+    requestNames(refs);
+  }
+
+  /**
+   * Open one message.
+   *
+   * ⚠ `markRead` makes this a WRITE — it clears the unread bit and pushes
+   * OnMailUpdatedByExternal to the character's other sessions. The BFF re-reads
+   * the mailbox afterwards, so `markedRead` is what the server actually holds;
+   * when that re-read failed it is null and NO claim is made. On a successful
+   * mark-read the inbox is reloaded so the unread count and the list row agree.
+   */
+  async function openMail(messageID: number, markRead: boolean): Promise<void> {
+    let result: Awaited<ReturnType<typeof api.loadMailBody>>;
+    try {
+      result = await api.loadMailBody(messageID, markRead, callOptions);
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+        throw error;
+      }
+      store.apply({ type: "mail/action-error", message: mailRefusalMessage(error) });
+      return;
+    }
+    if (markRead && result.markedRead === true) {
+      // Reload BEFORE recording the open: mail/loaded clears the action error
+      // and the list must agree with the count.
+      await loadMail();
+    }
+    store.apply({
+      type: "mail/opened",
+      open: {
+        messageID: result.messageID,
+        body: result.body,
+        unreadable: result.unreadable,
+        markedRead: result.markedRead,
+      },
+    });
+  }
+
+  function closeMail(): void {
+    store.apply({ type: "mail/opened", open: null });
+  }
+
+  // --- R17 Contracts --------------------------------------------------------
+
+  async function loadContracts(page: number): Promise<void> {
+    let reads: Awaited<ReturnType<typeof api.loadContracts>>;
+    try {
+      reads = await api.loadContracts(page, callOptions);
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+      }
+      throw error;
+    }
+    const browse = decodeContractSearch(reads.browse.result);
+    const outstanding = decodeContractList(reads.outstanding.result);
+    const accepted = decodeContractList(reads.accepted.result);
+    const expired = decodeContractList(reads.expired.result);
+
+    store.apply({
+      type: "contracts/loaded",
+      browse: browse.contracts,
+      numFound: browse.numFound,
+      page: reads.page,
+      pageSize: reads.pageSize,
+      outstanding,
+      accepted,
+      expired,
+      summary: reads.summary.error ? null : decodeContractSummary(reads.summary.result),
+      browseError: reads.browse.error,
+      // The player's own contracts come from three reads; any one failing
+      // means the "yours" view is incomplete.
+      mineError: reads.outstanding.error || reads.accepted.error || reads.expired.error,
+      worldHasNoContracts: reads.worldHasNoContracts,
+    });
+
+    // Every ID the panel will show, resolved to a NAME (R7d). A contract is
+    // issued by someone, runs between two stations in two systems, and may be
+    // reserved for or taken by someone.
+    const refs: NameRef[] = [];
+    for (const row of [...browse.contracts, ...outstanding, ...accepted, ...expired]) {
+      refs.push({ kind: "character", id: row.issuerID });
+      refs.push({ kind: "corporation", id: row.issuerCorpID });
+      refs.push({ kind: "station", id: row.startStationID });
+      refs.push({ kind: "station", id: row.endStationID });
+      refs.push({ kind: "system", id: row.startSolarSystemID });
+      refs.push({ kind: "system", id: row.endSolarSystemID });
+      if (row.assigneeID !== null) {
+        refs.push({ kind: "owner", id: row.assigneeID });
+      }
+      if (row.acceptorID !== null) {
+        refs.push({ kind: "owner", id: row.acceptorID });
+      }
+    }
+    requestNames(refs);
+  }
+
+  async function openContract(contractID: number): Promise<void> {
+    let raw: Awaited<ReturnType<typeof api.loadContractDetail>>;
+    try {
+      raw = await api.loadContractDetail(contractID, callOptions);
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+        throw error;
+      }
+      store.apply({ type: "contracts/detail-error", message: contractRefusalMessage(error) });
+      return;
+    }
+    const detail = decodeContractDetail(raw);
+    store.apply({ type: "contracts/detail", detail });
+    if (detail) {
+      // The item types and the route endpoints all render as NAMES.
+      const refs: NameRef[] = [
+        { kind: "station", id: detail.contract.startStationID },
+        { kind: "station", id: detail.contract.endStationID },
+        { kind: "system", id: detail.startSolarSystemID },
+        { kind: "system", id: detail.endSolarSystemID },
+        { kind: "character", id: detail.contract.issuerID },
+      ];
+      for (const item of detail.items) {
+        refs.push({ kind: "type", id: item.typeID });
+      }
+      requestNames(refs);
+    }
+  }
+
+  function closeContract(): void {
+    store.apply({ type: "contracts/detail", detail: null });
+  }
+
+  // --- R37 Personal Assets --------------------------------------------------
+
+  async function loadPersonalAssets(): Promise<void> {
+    let read: Awaited<ReturnType<typeof api.loadAssetStations>>;
+    try {
+      read = await api.loadAssetStations(callOptions);
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+      }
+      throw error;
+    }
+    // ⚠ A FAILED READ MUST NOT DECODE TO AN EMPTY LIST AND LOOK LIKE "you own
+    // nothing". The BFF reports the failure as `error` with `ownsNothing`
+    // false; the decode is skipped entirely so the panel has nothing to
+    // mistake for a successful empty answer.
+    const stations = read.error ? [] : decodeAssetStations(read.stations);
+    store.apply({
+      type: "assets/loaded",
+      stations,
+      error: read.error,
+      ownsNothing: read.ownsNothing,
+    });
+
+    // R7d: a station is its NAME, and so is the system it sits in.
+    const refs: NameRef[] = [];
+    for (const row of stations) {
+      refs.push({ kind: "station", id: row.stationID });
+      refs.push({ kind: "system", id: row.solarSystemID });
+      if (row.typeID !== null) {
+        refs.push({ kind: "type", id: row.typeID });
+      }
+    }
+    requestNames(refs);
+  }
+
+  /**
+   * Expand one station and read what is there. Collapsing passes null and
+   * touches no server.
+   *
+   * A failed read is kept AS a failure against that station, never thrown: one
+   * station the server would not talk about must not blank the whole page.
+   */
+  async function openAssetStation(stationID: number | null): Promise<void> {
+    store.apply({ type: "assets/expanded", stationID });
+    if (stationID === null || stationID <= 0) {
+      return;
+    }
+    let read: Awaited<ReturnType<typeof api.loadAssetStationItems>>;
+    try {
+      read = await api.loadAssetStationItems(stationID, callOptions);
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+        throw error;
+      }
+      store.apply({
+        type: "assets/station-items",
+        stationID,
+        items: [],
+        hasNoItems: false,
+        error: assetRefusalMessage(error),
+      });
+      return;
+    }
+    const items = read.error ? [] : decodeAssetItems(read.items, read.volumes);
+    store.apply({
+      type: "assets/station-items",
+      stationID,
+      items,
+      hasNoItems: read.hasNoItems,
+      error: read.error,
+    });
+    // Every stack renders as a type NAME and a type ICON (R7d / R27).
+    requestNames(items.map((item) => ({ kind: "type", id: item.typeID }) as NameRef));
+  }
+
+  /**
+   * Fly to where your stuff is.
+   *
+   * ⚠ THIS BUILDS NO NAVIGATION. `startRoute` already accepts a stationID,
+   * resolves it, solves the route against the cached map graph and hands the
+   * plan to the one shared autopilot controller — the same call Travel,
+   * Overview, the agent finder and the mission bot all make. Setting a
+   * destination from an asset location is that call with a station the player
+   * picked from this list instead of from a search box.
+   */
+  async function setDestinationToAssetStation(stationID: number): Promise<void> {
+    await startRoute(stationID);
+  }
+
+  /**
+   * Send a message, then reload the inbox so the panel shows the server's own
+   * picture, and record what ACTUALLY happened.
+   *
+   * Same three outcomes as a market write: a thrown refusal becomes a sentence
+   * without inventing a cause; a SILENT decline (SendMail's bare null, which
+   * carries no reason at all) is reported as exactly that; and a success is
+   * confirmed by the BFF's re-read of the sender's own copy, not by the 200.
+   */
+  async function sendMail(request: api.MailSendRequest): Promise<void> {
+    let outcome: Awaited<ReturnType<typeof api.sendMail>>;
+    try {
+      outcome = await api.sendMail(request, callOptions);
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+        throw error;
+      }
+      store.apply({ type: "mail/action-error", message: mailRefusalMessage(error) });
+      return;
+    }
+    await loadMail();
+    store.apply({
+      type: "mail/outcome",
+      outcome: {
+        kind: "send",
+        applied: outcome.applied,
+        declinedSilently: outcome.declinedSilently,
+        recipientCount: outcome.recipientCount,
+        message: outcome.message,
+      },
+    });
+  }
+
+  // --- R4 Agents & Missions ------------------------------------------------
+
+  async function loadJournal(): Promise<void> {
+    const result = await api.loadJournal(callOptions);
+    store.apply({ type: "agents/journal", journal: decodeJournal(result) });
+  }
+
+  async function loadBriefing(agentID: number): Promise<void> {
+    const reads = await api.loadBriefing(agentID, callOptions);
+    store.apply({
+      type: "agents/briefing",
+      briefing: decodeBriefing(reads.briefing, reads.objective),
+    });
+  }
+
+  // R6 — the post-completion reward readout (Step 12): wallet / LP / standings.
+  // The three reads are independent on the BFF (Promise.allSettled); a per-read
+  // error rides in the `error` field rather than blanking the whole panel. The
+  // journal (the fourth Step-12 read) is refreshed separately via loadJournal.
+  async function loadRewards(): Promise<void> {
+    const reads = await api.loadRewards(callOptions);
+    const errors = [
+      reads.errors.cash ? `wallet: ${reads.errors.cash}` : null,
+      reads.errors.lp ? `LP: ${reads.errors.lp}` : null,
+      reads.errors.standings ? `standings: ${reads.errors.standings}` : null,
+    ].filter((entry): entry is string => entry !== null);
+    store.apply({
+      type: "rewards/loaded",
+      cashBalance: decodeCashBalance(reads.cash),
+      lpBalances: decodeLpBalances(reads.lp),
+      standings: decodeCharStandings(reads.standings),
+      error: errors.length ? errors.join("; ") : null,
+    });
+  }
+
+  // R50 — the Wallet + Corp Wallet tabs. One pull carries the personal balance
+  // and the corp division balances; the two halves are independent on the BFF
+  // (Promise.allSettled) and keep their own errors here.
+  //
+  // ⚠ empty vs failed. A FAILED corp read leaves `corpDivisions` NULL and puts
+  // the reason in `corpError`. A SUCCESSFUL corp read decodes to a list — which
+  // may be empty, and an empty list is the real "this corporation has no wallet
+  // divisions" answer. The two must not collapse into one another.
+  async function loadWallet(): Promise<void> {
+    const reads = await api.loadWallet(callOptions);
+    const corpFailed = reads.errors.divisions !== null;
+    const corpError = [
+      reads.errors.divisions ? `corp wallet: ${reads.errors.divisions}` : null,
+      // A missing division NAME is cosmetic (the panel falls back to
+      // "Division N"), so a failed name read is not treated as a wallet error.
+    ]
+      .filter((entry): entry is string => entry !== null)
+      .join("; ");
+    // R54 ledger. A FAILED journal/transactions read leaves that list NULL (with
+    // its own error); a SUCCESSFUL read decodes to a list that may be []. The
+    // entry-types map is cosmetic — if it fails, rows label "Other", never a raw
+    // code, so a failed entryTypes read is NOT a ledger error.
+    const labels = decodeWalletEntryTypeLabels(reads.entryTypes);
+    const journalFailed = reads.errors.journal !== null;
+    const transactionsFailed = reads.errors.transactions !== null;
+    store.apply({
+      type: "wallet/loaded",
+      cashBalance: decodeWalletCash(reads.cash),
+      cashError: reads.errors.cash,
+      corpDivisions: corpFailed
+        ? null
+        : decodeCorpDivisions(reads.divisions, normalizeDivisionNames(reads.divisionNames)),
+      corpError: corpError === "" ? null : corpError,
+      journal: journalFailed ? null : decodeWalletJournal(reads.journal, labels),
+      journalError: reads.errors.journal ? `journal: ${reads.errors.journal}` : null,
+      transactions: transactionsFailed
+        ? null
+        : decodeWalletTransactions(reads.transactions, labels),
+      transactionsError: reads.errors.transactions
+        ? `transactions: ${reads.errors.transactions}`
+        : null,
+    });
+  }
+
+  // R55 — the Standings page. One pull carries the character's own standings and
+  // the corporation's; each half is independent on the BFF (Promise.allSettled)
+  // and keeps its own error here, so a failed corp read never blanks the
+  // character's own standings.
+  //
+  // ⚠ R7d is the point of this page: a standing's `fromID` is an entity id (NPC
+  // faction / NPC corporation / agent). Every id is classified by its EVE id
+  // range (classifyStandingKind — the same split the retail idCheckers uses) and
+  // resolved to a name through /api/names. The `agent` kind is asked for
+  // explicitly: the generic `owner` kind does not resolve agents.
+  async function loadStandings(): Promise<void> {
+    const reads = await api.loadStandings(null, callOptions);
+    const charFailed = reads.errors.char !== null;
+    const corpFailed = reads.errors.corp !== null;
+    const char = charFailed ? null : decodeCharStandings(reads.char);
+    const corp = corpFailed ? null : decodeCharStandings(reads.corp);
+    store.apply({
+      type: "standings/loaded",
+      char,
+      charError: reads.errors.char ? `your standings: ${reads.errors.char}` : null,
+      corp,
+      corpError: reads.errors.corp ? `corp standings: ${reads.errors.corp}` : null,
+    });
+    // Resolve every entity id to a name, each by its classified kind (R7d).
+    const refs: NameRef[] = [];
+    for (const row of [...(char ?? []), ...(corp ?? [])]) {
+      const kind = classifyStandingKind(row.fromID);
+      if (kind !== null) {
+        refs.push({ kind, id: row.fromID });
+      }
+    }
+    requestNames(refs);
+  }
+
+  // R55 — the drill-down for one selected entity. A char row shows its standing
+  // HISTORY (GetStandingTransactions); a corp row shows the per-member breakdown
+  // (GetStandingCompositions). The BFF issues both for the fromID; the panel
+  // reads the one matching `scope`. A composition's ownerID is a corp member, so
+  // it is resolved as a name too (R7d), degrading to "Unknown entity".
+  async function loadStandingDetail(
+    fromID: number,
+    scope: "char" | "corp",
+  ): Promise<void> {
+    if (!(fromID > 0)) {
+      return;
+    }
+    let reads: Awaited<ReturnType<typeof api.loadStandings>>;
+    try {
+      reads = await api.loadStandings(fromID, callOptions);
+    } catch (error) {
+      if (isSessionLost(error)) {
+        throw error;
+      }
+      store.apply({
+        type: "standings/detail-error",
+        fromID,
+        scope,
+        message: errorWords(error),
+      });
+      return;
+    }
+    const failed =
+      scope === "char" ? reads.errors.transactions : reads.errors.compositions;
+    if (failed !== null) {
+      store.apply({ type: "standings/detail-error", fromID, scope, message: failed });
+      return;
+    }
+    const compositions =
+      scope === "corp" ? decodeStandingCompositions(reads.compositions) : null;
+    store.apply({
+      type: "standings/detail",
+      fromID,
+      scope,
+      transactions:
+        scope === "char" ? decodeStandingTransactions(reads.transactions) : null,
+      compositions,
+    });
+    // Name a composition's corp-member owners (R7d): they are player characters,
+    // so `character` is the kind, and an unresolved one degrades to a fallback.
+    if (compositions && compositions.length > 0) {
+      requestNames(
+        compositions.map((row) => ({ kind: "character", id: row.ownerID }) as NameRef),
+      );
+    }
+  }
+
+  function closeStandingDetail(): void {
+    store.apply({ type: "standings/detail-cleared" });
+  }
+
+  // R56 — the Character Sheet page. One pull carries four independent charMgr
+  // reads (public info, description, home station, clone info); each half is
+  // independent on the BFF (Promise.allSettled) and keeps its own error here, so
+  // a failed clone read never blanks the identity, and vice versa.
+  //
+  // ⚠ R7d: every id is resolved to a name. corporationID / allianceID (from the
+  // public info), the home stationID and every implant typeID are asked for
+  // through /api/names. An id static data cannot name (a PLAYER corp resolves to
+  // null) degrades to "Unknown …" in the page — never the number. bloodline /
+  // race / ancestry carry no name path and are not decoded at all.
+  async function loadCharacterSheet(): Promise<void> {
+    const reads = await api.loadCharacterSheet(callOptions);
+    const identity = reads.errors.publicInfo
+      ? null
+      : decodeCharacterIdentity(reads.publicInfo);
+    const description = reads.errors.description
+      ? null
+      : decodeCharacterDescription(reads.description);
+    const homeStationID = reads.errors.homeStation
+      ? null
+      : decodeHomeStationID(reads.homeStation);
+    const clone = reads.errors.cloneInfo ? null : decodeCloneSummary(reads.cloneInfo);
+    store.apply({
+      type: "character-sheet/loaded",
+      identity,
+      identityError: reads.errors.publicInfo
+        ? `your character info: ${reads.errors.publicInfo}`
+        : null,
+      description,
+      descriptionError: reads.errors.description
+        ? `your bio: ${reads.errors.description}`
+        : null,
+      homeStationID,
+      homeStationError: reads.errors.homeStation
+        ? `your home station: ${reads.errors.homeStation}`
+        : null,
+      clone,
+      cloneError: reads.errors.cloneInfo ? `your clone: ${reads.errors.cloneInfo}` : null,
+    });
+    // Resolve every id to a name (R7d). An id the batch cannot resolve is cached
+    // as a definitive unknown by the store, and the page shows a fallback.
+    const refs: NameRef[] = [];
+    if (identity) {
+      if (identity.corporationID > 0) {
+        refs.push({ kind: "corporation", id: identity.corporationID });
+      }
+      if (identity.allianceID !== null) {
+        refs.push({ kind: "alliance", id: identity.allianceID });
+      }
+    }
+    if (homeStationID !== null) {
+      refs.push({ kind: "station", id: homeStationID });
+    }
+    if (clone) {
+      for (const implant of clone.implants) {
+        refs.push({ kind: "type", id: implant.typeID });
+      }
+    }
+    requestNames(refs);
+  }
+
+  // R7 — read a chat channel's roster + backlog and push it to the store. The
+  // panel polls this while open (READ is a backlog poll). A lost session unwinds
+  // to offline; any other failure surfaces through the chat slice so the panel
+  // stays put and shows the reason.
+  async function loadChat(channel: ChatChannel): Promise<void> {
+    try {
+      const raw = await api.readChat(channel, callOptions);
+      store.apply({
+        type: "chat/loaded",
+        channel: decodeChatChannelName(raw, channel),
+        channelState: decodeChatChannel(raw),
+      });
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+        throw error;
+      }
+      store.apply({ type: "chat/error", message: errorWords(error) });
+    }
+  }
+
+  async function sendChatMessage(channel: ChatChannel, message: string): Promise<void> {
+    const trimmed = message.trim();
+    if (!trimmed) {
+      return;
+    }
+    try {
+      await api.sendChat(channel, trimmed, callOptions);
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+        throw error;
+      }
+      store.apply({ type: "chat/error", message: errorWords(error) });
+      return;
+    }
+    // Reflect the sent message immediately by re-reading the channel backlog
+    // (loadChat clears the error on success).
+    await loadChat(channel);
+  }
+
+  // Load the docked station's agent roster (agentMgr.GetAgents, filtered to the
+  // held session's station by the BFF). Standalone so both the tab (onMount /
+  // Refresh) and the R6b docked-station-change refresh can call it.
+  async function loadAgents(): Promise<void> {
+    await runAgentAction(async () => {
+      const list = await api.loadAgents(callOptions);
+      store.apply({ type: "agents/list", stationID: list.stationID, agents: list.agents });
+    });
+  }
+
+  // Run an agent read/action, unwinding to offline on a lost session and
+  // surfacing any other failure through the store (the page stays put and shows
+  // the reason) rather than throwing into the UI handler.
+  async function runAgentAction(action: () => Promise<void>): Promise<void> {
+    try {
+      await action();
+      store.apply({ type: "agents/action-error", message: null });
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+        throw error;
+      }
+      store.apply({ type: "agents/action-error", message: errorWords(error) });
+    }
+  }
+
+  // --- R5a Flight (manually-stepped space movement) ------------------------
+
+  // A movement refusal (CALL_REFUSED, 409) carries the handler's OWN
+  // user-facing text as the message (scrambled, invalid target,
+  // docking-approach, lost control, ship destroyed). Surface it so the operator
+  // sees the real reason, not just the code — "pause on unsafe" must show why.
+  //
+  // ⚠ THIS IS THE RAW TEXT AND MUST STAY RAW. It is what the autopilot and the
+  // mining bot CLASSIFY on — `classifyJumpRefusal` reads it for
+  // `NotWithingMaxJumpDist` to decide approach-and-retry versus pause, and
+  // `isRangeRefusal` reads it to decide whether to close in. Translating here
+  // would silently break both, because a plain sentence does not match a regex
+  // written for the server's vocabulary. Player-facing text comes from
+  // `flightRefusalWords` (R31); the two are deliberately separate.
+  function flightErrorReason(error: unknown): string {
+    if (error instanceof BridgeCallError) {
+      return error.message && error.message !== error.code
+        ? `${error.code}: ${error.message}`
+        : error.code;
+    }
+    return readErrorReason(error);
+  }
+
+  /**
+   * R31 — a movement refusal in words a player reads.
+   *
+   * The player never sees `101,UI/Menusvc/MenuHints/NotWithingMaxJumpDist`
+   * again; they read "That gate is too far away to jump through. Get closer to
+   * it first." The refusal is still a refusal — every caller of this still
+   * renders a failure, at the control that caused it (R30 slice C).
+   */
+  function flightRefusalWords(error: unknown): string {
+    return sayRefusal(flightErrorReason(error));
+  }
+
+  // --- R6b docked-station-change refresh -----------------------------------
+
+  // Re-run the station-scoped reads for a newly-docked station. The Station
+  // panel identity is re-pointed immediately (so the header/finder-origin track
+  // the new station before the async reads land), then the docked reads refresh:
+  // the station panel always (it IS the docked context), and agents/inventory
+  // only if their tab has already loaded (an unopened tab re-fetches on open via
+  // its own onMount). A lost session inside any read unwinds to character select
+  // (rethrown); any other per-read failure rides that read's own slice.
+  async function relocateStationContext(
+    stationID: number,
+    solarSystemID: number | null,
+  ): Promise<void> {
+    let station: StationStatic | null = null;
+    try {
+      station = await api.loadStationStatic(stationID, callOptions);
+    } catch {
+      // Static identity is a display nicety; fall back to ID-only rather than
+      // fail the whole relocate if the read hiccups.
+      station = null;
+    }
+    store.apply({ type: "station/relocated", stationID, solarSystemID, station });
+
+    await refreshStationPanel();
+    if (store.agents.get().loaded) {
+      await loadAgents();
+    }
+    if (store.inventory.get().loaded) {
+      try {
+        await loadInventory();
+      } catch (error) {
+        if (isSessionLost(error)) {
+          throw error;
+        }
+        store.apply({ type: "inventory/action-error", message: errorWords(error) });
+      }
+    }
+  }
+
+  // Observe a flight-status snapshot: when it reveals the character docked at a
+  // station DIFFERENT from the one the panels are synced to, refresh the
+  // station-scoped context (autopilot arrival, manual dock). Guarded so the
+  // autopilot loop's per-tick reads relocate exactly once per change, and so an
+  // in-flight relocate is never re-entered. Never rejects: a lost session has
+  // already flipped the store offline inside the reads, so the swallowed
+  // rejection is safe to `void` from an autopilot tick or to await from a step.
+  async function syncDockedStation(status: FlightStatus): Promise<void> {
+    // Only a docked, online character has a station context to reconcile; skip
+    // otherwise (in space, or a flight read taken before a character is online).
+    if (store.station.get().online === null) {
+      return;
+    }
+    const stationID = status.docked ? dockedLocationID(status) : null;
+    if (stationID === null || stationID === syncedStationID || relocating) {
+      return;
+    }
+    syncedStationID = stationID;
+    relocating = true;
+    try {
+      await relocateStationContext(stationID, status.solarSystemID);
+    } catch {
+      // Session-loss already unwound to offline; nothing more to do here.
+    } finally {
+      relocating = false;
+    }
+  }
+
+  // R7a — resolve location IDs to names for the Flight readout, cached so the
+  // status doesn't refetch every poll. The cache holds a resolved name, or null
+  // for a definitive static "unknown" (e.g. a player structure not in the static
+  // tables) so those are not refetched either; a transient network failure is
+  // NOT cached (it can retry). Names resolve through the existing read-only
+  // /api/map/resolve route — no new gateway/bridge call.
+  const locationNames = new Map<number, string | null>();
+
+  async function cachedLocationName(id: number): Promise<string | null> {
+    if (locationNames.has(id)) {
+      return locationNames.get(id) ?? null;
+    }
+    let resolved: Awaited<ReturnType<typeof api.resolveDestination>>;
+    try {
+      resolved = await api.resolveDestination(id, callOptions);
+    } catch {
+      // Best-effort: leave the UI on the raw-ID fallback and allow a later retry.
+      return null;
+    }
+    // R38 — a player structure resolves like a station (it is a dockable place
+    // and the route answers its name in stationName too), so the flight readout
+    // and Travel name it without knowing it is runtime data.
+    const name =
+      resolved.kind === "station" || resolved.kind === "structure"
+        ? resolved.stationName
+        : resolved.kind === "system"
+          ? resolved.systemName
+          : null;
+    // ⚠ Only a DEFINITE outcome is cached. `lookupFailed` means the structure
+    // read could not be completed, not that the place is nameless; caching that
+    // would pin the readout to its fallback for the whole session even once the
+    // lookup could succeed. Same rule the batch name cache follows for
+    // `unresolved`. A plain static miss is still cached, as it always was.
+    if (!resolved.lookupFailed) {
+      locationNames.set(id, name);
+    }
+    return name;
+  }
+
+  // Resolve the current status's system / station / structure names (from the
+  // cache or a one-off static read) and push them to the flight slice, tagged
+  // with the IDs they were resolved for so a stale resolve can't mislabel a newer
+  // location. Fire-and-forget from observeFlightStatus (never blocks the loop).
+  async function resolveFlightLocation(status: FlightStatus): Promise<void> {
+    const [solarSystemName, stationName, structureName] = await Promise.all([
+      status.solarSystemID !== null ? cachedLocationName(status.solarSystemID) : Promise.resolve(null),
+      status.stationID !== null ? cachedLocationName(status.stationID) : Promise.resolve(null),
+      status.structureID !== null ? cachedLocationName(status.structureID) : Promise.resolve(null),
+    ]);
+    store.apply({
+      type: "flight/location",
+      forSolarSystemID: status.solarSystemID,
+      forStationID: status.stationID,
+      forStructureID: status.structureID,
+      solarSystemName,
+      stationName,
+      structureName,
+    });
+  }
+
+  // The single choke point for a decoded flight-status snapshot: push it to the
+  // flight slice, resolve its location names (cached), then reconcile the
+  // docked-station context. Every flight read (manual step, autopilot tick,
+  // route-origin read) flows through here. Returns the reconcile promise so a
+  // manual step can await the refresh; the autopilot tick voids it (the loop must
+  // not block on a panel refresh). Name resolution is always fire-and-forget.
+  function observeFlightStatus(status: FlightStatus): Promise<void> {
+    const previousSystemID = store.flight.get().status?.solarSystemID ?? null;
+    const scannerBefore = store.scanner.get();
+    const flightSystemChanged =
+      previousSystemID !== null &&
+      status.solarSystemID !== null &&
+      previousSystemID !== status.solarSystemID;
+    const scannerSystemChanged =
+      scannerBefore.solarSystemID !== null &&
+      status.solarSystemID !== null &&
+      scannerBefore.solarSystemID !== status.solarSystemID;
+    const refreshScanner =
+      (flightSystemChanged || scannerSystemChanged) &&
+      (scannerBefore.loaded || scannerBefore.loading);
+    if (flightSystemChanged || scannerSystemChanged) {
+      // Supersede any old-system request before the reducer clears its rows.
+      scannerLoadGeneration += 1;
+    }
+    store.apply({ type: "flight/status", status });
+    if (refreshScanner) {
+      void loadScanner().catch(() => undefined);
+    }
+    // R30 slice B — the ship is back in space, so a viewer that kept its claim
+    // through the dock gets its feed back. This is the single funnel EVERY
+    // flight status flows through (manual undock, autopilot tick, panel read),
+    // which is exactly why the re-arm belongs here and nowhere else.
+    if (status.inSpace) {
+      resumeSpacePolling();
+    }
+    // Once the ship is NOT docked, forget which station the panels are synced to,
+    // so the NEXT dock reconciles the docked context even if it is the SAME
+    // station we left. Without this, a bot that undocks, mines, and returns home
+    // re-docks at `syncedStationID` and `syncDockedStation` skips the refresh —
+    // leaving the docked panel stale/empty after the round trip.
+    if (!status.docked) {
+      syncedStationID = null;
+    }
+    void resolveFlightLocation(status);
+    return syncDockedStation(status);
+  }
+
+  // Push a step's decoded flight snapshot into the store (+ docked-context sync).
+  function applyFlight(step: FlightStepResult): Promise<void> {
+    return observeFlightStatus(decodeFlightStatus(step.flight));
+  }
+
+  async function loadFlightStatus(): Promise<void> {
+    try {
+      await applyFlight(await api.getFlightStatus(callOptions));
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Docking is not instant — the dock command returns while the ship is still
+   * "landing", so its immediate flight status is usually NOT docked yet. If
+   * nothing is ambiently polling (e.g. no space panel is mounted, or a bot that
+   * had been reading status has stopped), the store never learns the ship
+   * actually docked and the UI stays on the space shell. So after a dock we
+   * re-read a few times until the docked state lands, applying each read (which
+   * flips the shell through the normal funnel). Bounded and best-effort.
+   */
+  async function settleUntilDocked(): Promise<void> {
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      let status: FlightStatus | null = null;
+      try {
+        status = decodeFlightStatus((await api.getFlightStatus(callOptions)).flight);
+      } catch (error) {
+        if (isSessionLost(error)) {
+          stopLiveStream();
+          store.apply({ type: "character/offline" });
+          return;
+        }
+      }
+      if (status !== null) {
+        void observeFlightStatus(status);
+        if (status.docked) {
+          return;
+        }
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+    }
+  }
+
+  // --- R11 Space overview + ship HUD ---------------------------------------
+
+  // R30 slice A — the gate links that ride WITH each snapshot.
+  //
+  // The route graph is fetched once and cached (`loadRouteGraph`), but that read
+  // is asynchronous while a snapshot arrives every second. So this is written to
+  // be answerable SYNCHRONOUSLY or not at all: if the graph is already in hand,
+  // the links come back with the snapshot; if it is not, this returns undefined
+  // (meaning "no answer this time", which the store treats as "keep what you
+  // had") and kicks off the one-time load in the background so the next beat can
+  // answer. Nothing here ever blocks a snapshot on a map read.
+  let gateMapLoading = false;
+  let gateMapFailed = false;
+  function gateLinksForSnapshot(
+    snapshot: { readonly solarSystemID: number | null; readonly inSpace: boolean },
+  ): readonly GateLink[] | undefined {
+    if (!snapshot.inSpace || snapshot.solarSystemID === null) {
+      return undefined;
+    }
+    if (routeGraph) {
+      return buildGateLinks(routeGraph, snapshot.solarSystemID);
+    }
+    if (!gateMapLoading && !gateMapFailed) {
+      gateMapLoading = true;
+      void loadRouteGraph()
+        .catch(() => {
+          // Said once, not once per second: a map that cannot be read is a
+          // standing condition, and re-reporting it every beat would bury the
+          // rest of the panel's errors.
+          gateMapFailed = true;
+          store.apply({
+            type: "space/gate-map-error",
+            message: "Could not read the star map, so jumps are not offered here.",
+          });
+        })
+        .finally(() => {
+          gateMapLoading = false;
+        });
+    }
+    return undefined;
+  }
+
+  // Read what the ship can currently see (plus its own shield/armor/hull/cap)
+  // and push it to the space slice. A failed read is surfaced as a non-fatal
+  // panel error rather than thrown at the poller — except a lost session, which
+  // unwinds to character select like every other held-session read.
+  //
+  // Docked is not an error: the gateway answers a docked session with an empty
+  // overview, and the slice is cleared so the panel shows the docked message
+  // instead of a stale grid.
+  async function loadSpaceSnapshot(): Promise<void> {
+    let result;
+    try {
+      result = await api.getSpaceSnapshot({ ...callOptions, priority: "poll" });
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+        throw error;
+      }
+      store.apply({
+        type: "space/error",
+        message: `The view around the ship could not be read: ${flightRefusalWords(error)}`,
+      });
+      return;
+    }
+    const snapshot = decodeSpaceSnapshot(result.space);
+    store.apply({
+      type: "space/snapshot",
+      snapshot,
+      gateLinks: gateLinksForSnapshot(snapshot),
+    });
+    // Keep the flight readout honest too: a snapshot that says the ship is no
+    // longer in space means the poll is about to stop, and the panel should not
+    // keep showing the last grid it saw.
+    if (!snapshot.inSpace) {
+      store.apply({ type: "space/cleared" });
+    }
+  }
+
+  // The ~1s overview poll. It runs while SOMETHING is watching space AND the
+  // ship is in space AND the page is actually on screen, and it skips a beat
+  // rather than queueing when a read is slow, so it never piles work behind the
+  // autopilot's own flight-status cadence.
+  //
+  // R30 slice B — WHY THIS IS A COUNT AND NOT A BOOLEAN.
+  //
+  // It used to be `spacePanelOpen: boolean`, and the Overview panel was its only
+  // caller. Tabs unmount their panel (App.svelte renders `{#if page === …}`), so
+  // leaving "Around your ship" called stopSpacePolling and FROZE the cockpit:
+  // the snapshot, the lock list, the gauges, the distances and the hostile list
+  // all stopped updating. Switching to Travel to set a destination actively
+  // stopped the data feed for the ship you were flying. The app punished the
+  // very tab switch it forced on you.
+  //
+  // So the flag becomes a claim count and every panel that shows live space
+  // data claims on mount and releases on unmount. Two claims and one release
+  // must keep polling — that is the whole point, and it is what the test pins.
+  //
+  // ⚠ DO NOT "simplify" this into a global `isInSpace()` test. That was the
+  // obvious-looking alternative and it is wrong twice: it would poll the ship
+  // continuously while the player sits in Market or Mail reading nothing about
+  // space, and it would make startSpacePolling/stopSpacePolling lying no-ops —
+  // named as if they controlled something they no longer controlled.
+  let spaceViewers = 0;
+
+  // A backgrounded tab is not a viewer. `document` is absent under the test
+  // runner and the server generator, where "not visible" would wrongly disable
+  // every poll — so absence means visible.
+  const pageIsVisible = (): boolean =>
+    typeof document === "undefined" || document.visibilityState === "visible";
+  /** When the locked-target list was last read. See targetsReadIsDue. */
+  let lastTargetsReadAtMs: number | null = null;
+  const spacePoller: SpacePoller = createSpacePoller({
+    // R23: the locked-target list rides the SAME ~1s beat as the snapshot.
+    // Locking is asynchronous — the server acquires a lock over a duration — so
+    // without a poll the page would show "Locking…" forever. The targets read
+    // is best-effort: it must never make a snapshot read look like a failure.
+    refresh: async () => {
+      await loadSpaceSnapshot();
+      // Skip the targets read while the custom bot is running: its own tick already
+      // reads the locks and pushes them to the store, so polling them again here
+      // only doubles the gateway load — the contention that was timing this read
+      // out. The overview's lock list stays fresh from the bot's push. (The poller
+      // stays armed either way, so it resumes reading targets the moment the bot
+      // stops — no re-arm needed.)
+      // ⚠ AND IT KEEPS ITS OWN CADENCE (R92). This read used to ride the
+      // snapshot beat, so raising the overview's refresh rate tripled it too —
+      // six owner calls a second per pilot where there had been two, against a
+      // gateway that serialises them. Locks change on human timescales; the
+      // grid's smoothness is not a reason to ask about them more often.
+      if (
+        store.space.get().snapshot?.inSpace === true &&
+        store.customBot.get().status !== "running" &&
+        targetsReadIsDue(lastTargetsReadAtMs, Date.now())
+      ) {
+        lastTargetsReadAtMs = Date.now();
+        await loadTargets().catch(() => {});
+      }
+    },
+    shouldPoll: () => {
+      if (quiesced) {
+        return false;
+      }
+      if (spaceViewers <= 0) {
+        return false;
+      }
+      if (!pageIsVisible()) {
+        return false;
+      }
+      const flight = store.flight.get().status;
+      const space = store.space.get().snapshot;
+      // Trust either source: the flight slice is authoritative for in-space, and
+      // a fresh snapshot that says "not in space" stops the poll immediately.
+      if (space && !space.inSpace) {
+        return false;
+      }
+      return flight === null || flight.inSpace;
+    },
+  });
+
+  // The poller DISARMS ITSELF whenever a beat finds shouldPoll() false — that is
+  // deliberate (a docked player and a hidden tab must cost nothing), but it also
+  // means nothing re-arms it when the reason goes away. With a boolean that was
+  // masked by the panel remounting on every tab switch; with a claim that
+  // survives docking, it would be a poll that stops at the station and never
+  // comes back. So both "the reason went away" edges call this.
+  const resumeSpacePolling = (): void => {
+    if (spaceViewers > 0 && !spacePoller.running()) {
+      spacePoller.start();
+    }
+  };
+
+  // The tab came back to the foreground. Registered once for the life of the
+  // flow (which is the life of the page), and guarded for the test runner and
+  // the server generator, where there is no document.
+  if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
+    document.addEventListener("visibilitychange", () => {
+      if (pageIsVisible()) {
+        resumeSpacePolling();
+      }
+    });
+  }
+
+  /** Claim the space feed (a panel showing live space data has mounted). */
+  const startSpacePolling = (): void => {
+    spaceViewers += 1;
+    // Not `if (spaceViewers === 1)`: the poller may have disarmed itself on a
+    // dock while other viewers still held claims, and a newly-mounted panel is
+    // exactly the moment to try again.
+    spacePoller.start();
+  };
+  /** Release the claim. The feed stops only when the LAST viewer lets go. */
+  const stopSpacePolling = (): void => {
+    spaceViewers = Math.max(0, spaceViewers - 1);
+    if (spaceViewers === 0) {
+      spacePoller.stop();
+    }
+  };
+
+  // --- R23 slice A: targeting + module activation --------------------------
+  //
+  // THE GENERIC IN-SPACE ACTION LAYER. Nothing below names mining, combat,
+  // salvaging or ewar, and nothing should: lockTarget/unlockTarget take a ball,
+  // activateModule/deactivateModule take a module and an OPTIONAL effect name.
+  // Slice B drives a mining laser through these four; a later combat goal
+  // drives a turret through the same four unchanged.
+  //
+  // Every one of them obeys the same two rules:
+  //   1. A REFUSAL carries the server's own reason verbatim (targeting/action-error).
+  //   2. A 200 IS NOT PROOF — the BFF re-reads the authoritative state after
+  //      every mutation, and when that re-read shows nothing changed AND the
+  //      server gave no reason, that is reported as a SILENT DECLINE
+  //      (targeting/silent-decline), a different thing from a refusal. The page
+  //      never invents a cause for it.
+
+  /** Read the locked-target list. Also used by the overview poll. */
+  async function loadTargets(): Promise<void> {
+    let result;
+    try {
+      result = await api.getTargets(callOptions);
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+        throw error;
+      }
+      // BEST-EFFORT, and it must STAY quiet on a transient failure. Every caller is
+      // a background beat (the ~1s overview poll, the panel's mount) wrapped in its
+      // own `.catch`, so a one-off gateway timeout here is not news to the player —
+      // and the targeting slice has no self-clearing read-error slot, so surfacing
+      // it would leave a banner stuck on screen long after the very next beat
+      // succeeded. The last-known lock list stays; a real gateway outage still shows
+      // through the snapshot read, which owns the "are we connected" story. So we
+      // swallow it (a console note for diagnosis) rather than alarm over it.
+      if (typeof console !== "undefined") {
+        console.warn("loadTargets: locked-target read failed (transient, ignored)", error);
+      }
+      return;
+    }
+    store.apply({ type: "targeting/targets", targetIDs: decodeTargetIDs(result.targetIDs) });
+  }
+
+  /**
+   * Run one targeting/activation action: record it, surface a refusal verbatim,
+   * and land the server's own re-read. `verify` decides whether the action
+   * actually took effect; false with no thrown refusal is a SILENT DECLINE.
+   */
+  async function runTargetingAction<T>(
+    label: string,
+    step: () => Promise<T>,
+    apply: (result: T) => void | Promise<void>,
+    verify: (result: T) => boolean,
+    declineMessage: string,
+  ): Promise<void> {
+    let result: T;
+    try {
+      result = await step();
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+        throw error;
+      }
+      store.apply({
+        type: "targeting/action-error",
+        message: `${label} refused: ${flightRefusalWords(error)}`,
+      });
+      return;
+    }
+    store.apply({ type: "targeting/action", action: label });
+    await apply(result);
+    if (!verify(result)) {
+      store.apply({ type: "targeting/silent-decline", message: declineMessage });
+    }
+  }
+
+  async function lockTarget(targetID: number): Promise<void> {
+    await runTargetingAction(
+      "Lock",
+      () => api.lockTarget(targetID, callOptions),
+      (result) => {
+        store.apply({ type: "targeting/targets", targetIDs: decodeTargetIDs(result.targetIDs) });
+        if (result.acquiring) {
+          store.apply({ type: "targeting/acquiring", targetID });
+        }
+      },
+      // Accepted-and-acquiring is a SUCCESS: a lock takes time, and reporting
+      // "nothing happened" while the server is mid-acquisition would be wrong.
+      (result) => result.locked || result.acquiring,
+      "The server accepted that lock and then did not lock anything, and gave no reason.",
+    );
+  }
+
+  async function unlockTarget(targetID: number): Promise<void> {
+    await runTargetingAction(
+      "Unlock",
+      () => api.unlockTarget(targetID, callOptions),
+      (result) =>
+        store.apply({ type: "targeting/targets", targetIDs: decodeTargetIDs(result.targetIDs) }),
+      (result) => result.released,
+      "The server did not release that lock, and gave no reason.",
+    );
+  }
+
+  async function activateModule(
+    itemID: number,
+    opts: { effect?: string; targetID?: number | null; repeat?: -1 | 0 } = {},
+  ): Promise<void> {
+    await runTargetingAction(
+      "Switch on",
+      () => api.activateModule(itemID, opts, callOptions),
+      // Refresh the snapshot NOW rather than waiting for the next poll tick, so
+      // the button state the player sees after the click is the server's answer
+      // to THIS action. Best-effort: a failed refresh must not turn a
+      // successful activation into an error.
+      () => loadSpaceSnapshot().catch(() => {}),
+      // null means the verification read could not answer. That is NOT a silent
+      // decline — we simply do not know — so it is not reported as one.
+      (result) => result.active !== false,
+      "The server accepted that module and then did not run it, and gave no reason.",
+    );
+  }
+
+  // --- R23 slice B: the mining loop ----------------------------------------
+  //
+  // mine -> haul -> refine -> sell. There is deliberately NO mining loop
+  // controller here: mining a rock is lockTarget + activateModule above, and the
+  // browser never simulates a cycle, predicts a yield or decides when a hold is
+  // full. It reads the server and shows the answer.
+
+  /** Read the ship's mining holds (ore / gas / ice, falling back to cargo). */
+  async function loadMiningHolds(): Promise<void> {
+    let result;
+    try {
+      result = await api.getMiningHolds(callOptions);
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+        throw error;
+      }
+      store.apply({
+        type: "mining/holds-error",
+        message: `Your holds could not be read: ${flightRefusalWords(error)}`,
+      });
+      return;
+    }
+    store.apply({ type: "mining/holds", holds: decodeMiningHolds(result.holds) });
+  }
+
+  /** Run the survey scanner and land what it saw. */
+  async function runSurveyScan(): Promise<void> {
+    let result;
+    try {
+      result = await api.runSurveyScan(callOptions);
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+        throw error;
+      }
+      store.apply({
+        type: "mining/survey-error",
+        message: `The survey scan failed: ${flightRefusalWords(error)}`,
+      });
+      return;
+    }
+    store.apply({
+      type: "mining/survey",
+      survey: decodeSurveyResults(result.results),
+      atMs: Date.now(),
+    });
+  }
+
+  /** Ask the refinery what these stacks would yield — and what the tax is. */
+  async function loadReprocessingQuote(itemIDs: readonly number[]): Promise<void> {
+    if (itemIDs.length === 0) {
+      store.apply({ type: "mining/quotes", quotes: [], taxRate: null, quotesFor: [] });
+      return;
+    }
+    let result;
+    try {
+      result = await api.getReprocessingQuote(itemIDs, callOptions);
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+        throw error;
+      }
+      store.apply({
+        type: "mining/quotes-error",
+        message: `The refinery could not quote that: ${flightRefusalWords(error)}`,
+      });
+      return;
+    }
+    store.apply({
+      type: "mining/quotes",
+      quotes: decodeReprocessingQuotes(result.quotes),
+      taxRate: decodeTaxRate(result.taxRate),
+      quotesFor: [...itemIDs],
+    });
+  }
+
+  /**
+   * Run one mining action and report what it ACTUALLY did.
+   *
+   * Both actions here move or consume real items, so neither trusts its own
+   * 200: the BFF re-reads and answers which stacks really moved. `moved: null`
+   * means the verification read itself failed — that is reported as "could not
+   * check", never as success and never as a decline.
+   */
+  async function runMiningAction(
+    label: string,
+    step: () => Promise<{
+      readonly requested: readonly number[];
+      readonly moved: readonly number[] | null;
+    }>,
+    partial: (moved: number, total: number) => string,
+    none: string,
+    unverified: string,
+  ): Promise<void> {
+    let result;
+    try {
+      result = await step();
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+        throw error;
+      }
+      store.apply({
+        type: "mining/action-error",
+        message: `${label} refused: ${flightRefusalWords(error)}`,
+      });
+      return;
+    }
+    store.apply({ type: "mining/action", action: label });
+    // Whatever happened, the holds are the ground truth now.
+    await loadMiningHolds().catch(() => {});
+    if (result.moved === null) {
+      store.apply({ type: "mining/silent-decline", message: unverified });
+      return;
+    }
+    if (result.moved.length === 0) {
+      store.apply({ type: "mining/silent-decline", message: none });
+      return;
+    }
+    if (result.moved.length < result.requested.length) {
+      store.apply({
+        type: "mining/silent-decline",
+        message: partial(result.moved.length, result.requested.length),
+      });
+    }
+  }
+
+  // --- R25 slice A: drones ---------------------------------------------------
+
+  /** Read the bay, what is in space, and the limits — one BFF round trip. */
+  async function loadDrones(): Promise<void> {
+    let result;
+    try {
+      result = await api.getDrones(callOptions);
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+        throw error;
+      }
+      store.apply({
+        type: "drones/error",
+        message: `Your drones could not be read: ${flightRefusalWords(error)}`,
+      });
+      return;
+    }
+    store.apply({
+      type: "drones/loaded",
+      // null survives all the way to the panel: a failed read is "not known",
+      // never an empty bay and never "no drones in space".
+      bay: decodeDroneBay(result.bay),
+      inSpace: decodeDronesInSpace(result.inSpace),
+      limits: decodeDroneLimits(result.shipInfo),
+    });
+  }
+
+  /**
+   * Run one drone action and report what it ACTUALLY did.
+   *
+   * The shape is the same for all four: issue the call, land the fresh
+   * in-space list the BFF re-read, and then decide whether anything happened.
+   * `changed` is the per-action test — for a launch it is "did any new drone
+   * appear", for an order it is "does the server still report these drones".
+   * A null in-space list means the re-read failed, which is reported as
+   * "could not check" and never as success.
+   */
+  /**
+   * R34 — the server's per-drone reasons, turned into reports the panel can
+   * render, with every droneID resolved to a NAME on the way through.
+   *
+   * ⚠ THE ID DIES HERE (R7d). The result dict is keyed by droneID and that key
+   * is the only thing tying a sentence to a drone; it is spent on the lookup
+   * and never stored. A report carries a label or nothing — there is no id
+   * field for the panel to accidentally print.
+   *
+   * ⚠ AND THE SENTENCE IS NOT REWORDED. It goes through `sayRefusal`
+   * (R31's one seam), which passes prose straight through — that is what makes
+   * an UNKNOWN fourteenth sentence survive intact instead of being swallowed,
+   * while a code or identifier still falls back to R31's generic wording rather
+   * than being shown raw. Matching the thirteen against a table here would be
+   * us talking over a server that already said it better.
+   *
+   * The name is looked for in the FRESH list first and the previous one second:
+   * a drone that has just left space still has a name in the list we held a
+   * moment ago, and "one of your drones" is a worse answer than the truth when
+   * the truth is still sitting in the store.
+   */
+  function droneOrderReports(
+    result: JsonValue,
+    inSpace: readonly DroneInSpace[] | null,
+  ): readonly DroneOrderReport[] {
+    const refusals = decodeDroneOrderRefusals(result);
+    if (refusals.length === 0) {
+      return [];
+    }
+    const named = new Map<number, string>();
+    for (const drone of store.get().drones.inSpace ?? []) {
+      if (drone.name) {
+        named.set(drone.itemID, drone.name);
+      }
+    }
+    for (const drone of inSpace ?? []) {
+      if (drone.name) {
+        named.set(drone.itemID, drone.name);
+      }
+    }
+    // No dedupe, no merge, no collapse: one report per refusal, in the order
+    // the server gave them (R30 — two drones that share a name are still two
+    // drones, and hiding the second is the bug this pattern exists to stop).
+    return refusals.map((refusal) => ({
+      label: named.get(refusal.droneID) ?? null,
+      text: sayRefusal(refusal.raw),
+    }));
+  }
+
+  async function runDroneAction(
+    label: string,
+    step: () => Promise<{
+      readonly inSpace: JsonValue;
+      readonly launched: JsonValue;
+      readonly result: JsonValue;
+    }>,
+    verify: (
+      inSpace: readonly DroneInSpace[] | null,
+      launched: readonly DroneInSpace[] | null,
+      /**
+       * What the SERVER already said, per drone. A verifier that would end
+       * "and gave no reason" must check this first: the reports render
+       * alongside the decline, and claiming silence next to the server's own
+       * sentence is simply false.
+       */
+      reports: readonly { readonly label: string | null; readonly text: string }[],
+    ) => string | null,
+  ): Promise<void> {
+    let result;
+    try {
+      result = await step();
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+        throw error;
+      }
+      store.apply({
+        type: "drones/action-error",
+        message: `${label} refused: ${flightRefusalWords(error)}`,
+      });
+      return;
+    }
+    const inSpace = decodeDronesInSpace(result.inSpace);
+    store.apply({ type: "drones/action", action: label });
+    store.apply({ type: "drones/in-space", inSpace });
+    // R34 — what the SERVER said, per drone, before this client judges anything.
+    // It is applied AFTER `drones/action` (which clears the previous order's
+    // reports) and independently of the verifier below, so a refusal the server
+    // explained can never be displaced by our own guess about the same call.
+    const reports = droneOrderReports(result.result, inSpace);
+    store.apply({ type: "drones/order-reports", reports });
+    const complaint = verify(inSpace, decodeDronesInSpace(result.launched), reports);
+    if (complaint !== null) {
+      store.apply({ type: "drones/silent-decline", message: complaint });
+    }
+    // The bay changed too (drones left it, or came back into it).
+    await loadDrones().catch(() => {});
+  }
+
+  async function launchDrones(itemIDs: readonly number[]): Promise<void> {
+    await runDroneAction(
+      "Launch",
+      () => api.launchDrones(itemIDs.map((itemID) => ({ itemID })), callOptions),
+      (inSpace, launched) => {
+        if (inSpace === null || launched === null) {
+          return "The launch was accepted, but space could not be re-read, so what launched is unknown.";
+        }
+        if (launched.length === 0) {
+          // The refusal case the server does not report: bandwidth, the active
+          // drone cap, a stack that moved. All of them answer an empty dict.
+          return "No drones launched. Check your bandwidth and how many are already out.";
+        }
+        if (launched.length < itemIDs.length) {
+          return `Only ${launched.length} of ${itemIDs.length} drones launched — the rest did not fit in your bandwidth or drone limit.`;
+        }
+        return null;
+      },
+    );
+  }
+
+  /** The three in-space orders share one verification: did we still see them? */
+  function orderVerifier(
+    droneIDs: readonly number[],
+    unverified: string,
+  ): (inSpace: readonly DroneInSpace[] | null) => string | null {
+    return (inSpace) => {
+      if (inSpace === null) {
+        return unverified;
+      }
+      const known = new Set(inSpace.map((drone) => drone.itemID));
+      const missing = droneIDs.filter((itemID) => !known.has(itemID));
+      // ⚠ A drone that is GONE from space is not a failure for a recall — it is
+      // the recall finishing. Only the orders that expect the drone to still be
+      // flying treat a disappearance as worth mentioning, which is why the
+      // recall path below does not use this verifier.
+      return missing.length === droneIDs.length
+        ? "The order was accepted, but none of those drones are in space any more."
+        : null;
+    };
+  }
+
+  async function engageDrones(droneIDs: readonly number[], targetID: number): Promise<void> {
+    await runDroneAction(
+      "Engage",
+      () => api.engageDrones(droneIDs, targetID, callOptions),
+      orderVerifier(droneIDs, "The order was accepted, but space could not be re-read."),
+    );
+  }
+
+  async function mineWithDrones(droneIDs: readonly number[], targetID: number): Promise<void> {
+    await runDroneAction(
+      "Mine",
+      () => api.mineWithDrones(droneIDs, targetID, callOptions),
+      orderVerifier(droneIDs, "The order was accepted, but space could not be re-read."),
+    );
+  }
+
+  async function recallDrones(droneIDs: readonly number[]): Promise<void> {
+    await runDroneAction(
+      "Recall",
+      () => api.recallDrones(droneIDs, callOptions),
+      (inSpace) =>
+        inSpace === null
+          ? "The recall was accepted, but space could not be re-read."
+          : // A recalled drone stays visibly in space, flying home, until the
+            // runtime scoops it inside 2500 m. So there is nothing to complain
+            // about either way: still-there is in progress, gone is done.
+            null,
+    );
+  }
+
+  /**
+   * Take control of orphaned drones (entity.CmdReconnectToDrones).
+   *
+   * Success is the drone becoming CONTROLLED, which the re-read answers
+   * directly — not its presence in space, which was never in doubt.
+   */
+  async function reconnectDrones(droneIDs: readonly number[]): Promise<void> {
+    await runDroneAction(
+      "Reconnect",
+      () => api.reconnectDrones(droneIDs, callOptions),
+      (inSpace, _launched, reports) => {
+        if (inSpace === null) {
+          return "The reconnect was accepted, but space could not be re-read.";
+        }
+        const asked = new Set(droneIDs);
+        const stillLoose = inSpace.filter((drone) => asked.has(drone.itemID) && !drone.controlled);
+        if (stillLoose.length === 0 || reports.length > 0) {
+          // Either it worked, or the server already explained itself per drone
+          // and those sentences are on screen — adding "gave no reason" beside
+          // them would be a lie.
+          return null;
+        }
+        return stillLoose.length === droneIDs.length
+          ? "The server accepted that and none of them answered, and gave no reason."
+          : `${stillLoose.length} of ${droneIDs.length} did not answer, and the server gave no reason.`;
+      },
+    );
+  }
+
+  /**
+   * Scoop drones into the bay (ship.ScoopDrone).
+   *
+   * Success is the drone LEAVING space. A drone still out there was not
+   * scooped — unlike a recall, there is no in-flight middle state to allow for.
+   */
+  async function scoopDrones(droneIDs: readonly number[]): Promise<void> {
+    await runDroneAction(
+      "Scoop",
+      () => api.scoopDrones(droneIDs, callOptions),
+      (inSpace, _launched, reports) => {
+        if (inSpace === null) {
+          return "The scoop was accepted, but space could not be re-read.";
+        }
+        const stillOut = inSpace.filter((drone) => droneIDs.includes(drone.itemID)).length;
+        if (stillOut === 0 || reports.length > 0) {
+          // Measured live: a scoop the server declines answers with a per-drone
+          // CustomNotify ("That drone cannot currently be scooped into the drone
+          // bay"), which the reports already carry. Saying "gave no reason"
+          // underneath the server's own sentence is simply false.
+          return null;
+        }
+        return stillOut === droneIDs.length
+          ? "Nothing was scooped, and the server gave no reason."
+          : `${stillOut} of ${droneIDs.length} stayed in space, and the server gave no reason.`;
+      },
+    );
+  }
+
+  /**
+   * ⚠⚠ DEV-ONLY. Run a GM chat command, then re-read what it could have changed.
+   *
+   * A GM command does not belong to one panel: /giveitem lands in the hangar,
+   * /gmships fits a hull, /giveskill rewrites the sheet. So rather than guess
+   * which panel to refresh, the ones that are cheap and already loaded are all
+   * re-read, and every one of them is allowed to fail quietly — a refresh that
+   * did not work must not swallow the server's reply, which is the whole point
+   * of the call.
+   */
+  async function runGmCommand(command: string): Promise<string> {
+    const reply = await api.runGmCommand(command, callOptions);
+    await Promise.allSettled([
+      loadInventory().catch(() => {}),
+      loadFitting().catch(() => {}),
+      loadDrones().catch(() => {}),
+      loadSpaceSnapshot().catch(() => {}),
+    ]);
+    return reply;
+  }
+
+  async function unloadMiningHolds(itemIDs: readonly number[]): Promise<void> {
+    await runMiningAction(
+      "Unload",
+      () => api.unloadMiningHolds(itemIDs, callOptions),
+      (moved, total) =>
+        `Only ${moved} of ${total} stacks moved to your hangar. The server did not say why the rest stayed.`,
+      "Nothing moved to your hangar, and the server gave no reason.",
+      "The unload was accepted, but your holds could not be re-read, so what moved is unknown.",
+    );
+  }
+
+  /**
+   * ⚠ REPROCESS. This consumes the ore and charges the station's ISK tax. The
+   * panel confirms first (showing the quote AND the tax); the BFF confirms
+   * again. This method is unconditional by design — the gates are on either
+   * side of it, as with destroyRig.
+   */
+  async function reprocessItems(itemIDs: readonly number[]): Promise<void> {
+    await runMiningAction(
+      "Reprocess",
+      () => api.reprocessItems(itemIDs, callOptions),
+      (moved, total) =>
+        `Only ${moved} of ${total} stacks were reprocessed. The server did not say why the rest were left.`,
+      "Nothing was reprocessed, and the server gave no reason.",
+      "The refinery accepted that, but your hangar could not be re-read, so what was reprocessed is unknown.",
+    );
+    // The previous quote described stacks that may no longer exist.
+    store.apply({ type: "mining/quotes", quotes: [], taxRate: null, quotesFor: [] });
+  }
+
+  /**
+   * Switch a module off.
+   *
+   * ⚠ STILL RUNNING IS NOT A REFUSAL. Retail stops a module at the END OF ITS
+   * CURRENT CYCLE, so `stopped:false` immediately after an ACCEPTED Deactivate
+   * is the normal case, not a silent decline — this used to report "The server
+   * did not stop that module, and gave no reason", which is alarming and wrong.
+   * Measured live on a 1MN Civilian Afterburner: Deactivate accepted with
+   * stopped:false and the module still in activeModuleIDs; ~12s later a repeat
+   * Deactivate refused with "is not active" — it had stopped on its own.
+   *
+   * The same reasoning `lockTarget` already applies to a lock the server is
+   * still acquiring: accepted-and-in-progress is a SUCCESS, and the panel says
+   * what is true right now ("finishing its cycle") rather than predicting.
+   * A genuine refusal still throws and lands in actionError, untouched.
+   */
+  /**
+   * Start or stop overloading a module.
+   *
+   * ⚠ VERIFIED AGAINST THE SNAPSHOT, not the 200. Overloading is a state the
+   * server owns and ends on its own, and this server has a habit of answering
+   * success for writes that did nothing (LoadAmmo, Deactivate, ApplyFreeSkill
+   * Points all do). So the snapshot's own overloaded list is the authority —
+   * and a `null` list is "we could not tell", which is NOT a decline.
+   */
+  async function setModuleOverload(itemID: number, overloaded: boolean): Promise<void> {
+    await runTargetingAction(
+      overloaded ? "Overload" : "Stop overloading",
+      () =>
+        overloaded
+          ? api.overloadModule(itemID, callOptions)
+          : api.stopOverloadModule(itemID, callOptions),
+      () => loadSpaceSnapshot().catch(() => {}),
+      () => {
+        const list = store.space.get().snapshot?.ship?.overloadedModuleIDs ?? null;
+        if (list === null) {
+          return true; // Unknown is not a decline.
+        }
+        return list.includes(itemID) === overloaded;
+      },
+      overloaded
+        ? "The server accepted that and the module is not overloaded, and gave no reason."
+        : "The server accepted that and the module is still overloaded, and gave no reason.",
+    );
+  }
+
+  /**
+   * Start repairing a damaged module with nanite paste.
+   *
+   * ⚠ VERIFIED AGAINST THE DAMAGE READING, not the 200 — this server has a
+   * documented habit of answering success for writes that did nothing. Repair
+   * takes TIME, though, so the test is that damage went DOWN, not that it
+   * reached zero: a repair in progress is a success, and saying otherwise would
+   * repeat the cycle-end mistake.
+   */
+  async function repairModule(itemID: number): Promise<void> {
+    const before = store.space.get().snapshot?.ship?.moduleDamage?.[itemID] ?? null;
+    await runTargetingAction(
+      "Repair",
+      () => api.repairModule(itemID, callOptions),
+      () => loadSpaceSnapshot().catch(() => {}),
+      () => {
+        const after = store.space.get().snapshot?.ship?.moduleDamage?.[itemID] ?? null;
+        // Unknown either side is not a decline; a repair that has started but
+        // not yet ticked is not one either, so only a HIGHER reading fails.
+        if (before === null || after === null) {
+          return true;
+        }
+        return after <= before;
+      },
+      "The server accepted that and the module is no better, and gave no reason.",
+    );
+  }
+
+  /**
+   * Bank or unbank every weapon on the ship.
+   *
+   * ⚠ VERIFIED AGAINST THE SNAPSHOT'S OWN BANK MAP, not the 200 — the fourth
+   * write on this server checked that way. Banking is refused outright when the
+   * hull has nothing bankable (one gun, or none), and that refusal reaches the
+   * player in the server's words.
+   */
+  async function setWeaponBanks(linked: boolean): Promise<void> {
+    await runTargetingAction(
+      linked ? "Link weapons" : "Unlink weapons",
+      () => (linked ? api.linkAllWeapons(callOptions) : api.unlinkAllWeapons(callOptions)),
+      () => loadSpaceSnapshot().catch(() => {}),
+      () => {
+        const banks = store.space.get().snapshot?.ship?.weaponBanks ?? null;
+        if (banks === null) {
+          return true; // Unknown is not a decline.
+        }
+        return linked ? Object.keys(banks).length > 0 : Object.keys(banks).length === 0;
+      },
+      linked
+        ? "The server accepted that and banked nothing, and gave no reason."
+        : "The server accepted that and the banks are still there, and gave no reason.",
+    );
+  }
+
+  async function deactivateModule(itemID: number, opts: { effect?: string; typeID?: number } = {}): Promise<void> {
+    await runTargetingAction(
+      "Switch off",
+      () => api.deactivateModule(itemID, opts, callOptions),
+      async (result) => {
+        await loadSpaceSnapshot().catch(() => {});
+        if (result.stopped === false) {
+          // Refine the label the action step just recorded, so whatever shows
+          // the last action says WHY the module is still lit.
+          store.apply({ type: "targeting/action", action: "Switch off — finishing its cycle" });
+        }
+      },
+      // Never a decline. The only two answers this can give — stopped, or still
+      // cycling — are both the server doing as it was told, so there is no
+      // "quietly did nothing" case left for this verb to report.
+      () => true,
+      "",
+    );
+  }
+
+  // Run one movement step, record it as the last action, and refresh the flight
+  // snapshot the step returned. A lost session unwinds to the character list; a
+  // movement refusal (scrambled, invalid target, docking-approach, lost control,
+  // ship destroyed) is surfaced through the store as a visible reason — never a
+  // silent no-op or a fake success. On refusal the flight snapshot is still
+  // refreshed so the readout reflects the real (unchanged) state.
+  async function runFlightStep(
+    label: string,
+    step: () => Promise<FlightStepResult>,
+  ): Promise<void> {
+    let result: FlightStepResult;
+    try {
+      result = await step();
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+        throw error;
+      }
+      store.apply({ type: "flight/action-error", message: `${label} refused: ${flightRefusalWords(error)}` });
+      // Re-read the true state so the page shows where the ship actually is,
+      // not a stale optimistic guess (best-effort; ignore a follow-up failure).
+      try {
+        await applyFlight(await api.getFlightStatus(callOptions));
+      } catch {
+        // The refusal reason is already surfaced; a failed re-read changes nothing.
+      }
+      return;
+    }
+    store.apply({ type: "flight/action", action: label });
+    // Await the docked-context reconcile so a step that changes the docked
+    // station (dock) doesn't resolve before the new station's panels refresh.
+    await applyFlight(result);
+  }
+
+  // --- R28: skills ----------------------------------------------------------
+  //
+  // The sheet is a plain read; the queue is a plain write. What makes this
+  // careful rather than trivial is the third thing: NOTHING is believed until
+  // the sheet has been re-read. The BFF does that re-read, and both functions
+  // below land the SAME decoded sheet, so the panel's queue and the panel's
+  // skill levels always came from one instant on the server's clock.
+
+  /** Land a decoded sheet, or say the read failed without inventing a sheet. */
+  function applySkillSheet(raw: JsonValue): void {
+    const sheet = decodeSkillSheet(raw, Date.now());
+    store.apply({
+      type: "skills/loaded",
+      characterName: sheet.characterName,
+      totalSkillPoints: sheet.totalSkillPoints,
+      freeSkillPoints: sheet.freeSkillPoints,
+      skills: sheet.skills,
+      queue: sheet.queue,
+      clockOffsetMs: sheet.clockOffsetMs,
+    });
+  }
+
+  async function loadSkills(): Promise<void> {
+    let result;
+    try {
+      result = await api.getSkills(callOptions);
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+        throw error;
+      }
+      store.apply({
+        type: "skills/error",
+        message: `Your skills could not be read: ${errorWords(error)}`,
+      });
+      return;
+    }
+    applySkillSheet(result.skills);
+  }
+
+  async function saveSkillQueue(
+    entries: readonly { readonly typeID: number; readonly toLevel: number }[],
+    label: string,
+    context = "that skill",
+  ): Promise<void> {
+    let result;
+    try {
+      result = await api.saveSkillQueue(entries, callOptions);
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+        throw error;
+      }
+      // ⚠ THE REFUSAL IS THE FEATURE. All eleven of the server's public codes
+      // are things a player hits in ordinary play, and every one of them says
+      // what to do next instead of showing its name.
+      store.apply({
+        type: "skills/action-error",
+        message: error instanceof BridgeCallError
+          ? skillQueueRefusal(error.code, error.message, context)
+          : `That change could not be saved: ${errorWords(error)}`,
+      });
+      // The queue is unchanged on the server, but the panel may have been
+      // showing an optimistic order — re-read so what is on screen is the
+      // server's, not ours.
+      await loadSkills().catch(() => {});
+      return;
+    }
+    // The BFF's re-read IS the confirmation. Landing the sheet first means the
+    // "saved" message can never be on screen next to a stale queue.
+    applySkillSheet(result.skills);
+    store.apply({ type: "skills/action", action: label });
+  }
+
+  /**
+   * Spend unallocated skill points into one skill.
+   *
+   * ⚠ THE NEW FREE-SP TOTAL IS THE ONLY HONEST RECEIPT. The server caps the
+   * amount at what the skill is missing and at what is actually held, so what
+   * was asked for and what was spent need not match — the message reports the
+   * DIFFERENCE between the totals, never the request. A total that did not move
+   * means nothing was spent, and says so rather than claiming success.
+   */
+  async function applyFreeSkillPoints(skillTypeID: number, points: number): Promise<void> {
+    const before = store.skills.get().freeSkillPoints ?? 0;
+    let remaining: number | null;
+    try {
+      remaining = await api.applyFreeSkillPoints(skillTypeID, points, callOptions);
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+        throw error;
+      }
+      store.apply({
+        type: "skills/action-error",
+        message: error instanceof BridgeCallError
+          ? skillQueueRefusal(error.code, error.message, "that skill")
+          : `Those points could not be applied: ${errorWords(error)}`,
+      });
+      await loadSkills().catch(() => {});
+      return;
+    }
+    // Re-read first, so the message can never sit beside a stale sheet.
+    await loadSkills().catch(() => {});
+    const after = remaining ?? store.skills.get().freeSkillPoints ?? before;
+    const spent = before - after;
+    if (spent <= 0) {
+      store.apply({
+        type: "skills/action-error",
+        message: "The server accepted that and spent no points, and gave no reason.",
+      });
+      return;
+    }
+    store.apply({
+      type: "skills/action",
+      action: `Applied ${spent.toLocaleString()} skill points`,
+    });
+  }
+
+  // --- R41: planetary colonies ---------------------------------------------
+  //
+  // One read, no write. The BFF answers it from the gateway's owner-scoped
+  // snapshot, so this panel costs the call allowlist nothing.
+  //
+  // ⚠ `coloniesReadable` is carried through UNTOUCHED. It is the difference
+  // between "you have built nothing" and "we could not see whether you have",
+  // and the panel words those two differently.
+
+  async function loadPlanets(): Promise<void> {
+    let result;
+    try {
+      result = await api.getPlanets(callOptions);
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+        throw error;
+      }
+      store.apply({
+        type: "planets/error",
+        message: `Your colonies could not be read: ${errorWords(error)}`,
+      });
+      return;
+    }
+    const report = decodeColonyReport(result.planets, Date.now());
+    store.apply({
+      type: "planets/loaded",
+      colonies: report.colonies,
+      coloniesReadable: report.coloniesReadable,
+      clockOffsetMs: report.clockOffsetMs,
+    });
+  }
+
+  function selectColony(planetID: number | null): void {
+    store.apply({ type: "planets/selected", planetID });
+  }
+
+  // --- R5b Travel (browser autopilot decide-loop) --------------------------
+
+  // The client-side route solver's graph (fetched once, then cached) and the
+  // single autopilot controller instance. The loop runs in the browser; closing
+  // the tab kills this JS and the loop simply stops issuing (no "stop" sent) —
+  // the ship completes its last server-side command and sits (roadmap §7).
+  let routeGraph: SystemGraph | null = null;
+  let autopilot: AutopilotController | null = null;
+
+  async function loadRouteGraph(): Promise<SystemGraph> {
+    if (routeGraph) {
+      return routeGraph;
+    }
+    const data = await api.loadSystemGraph(callOptions);
+    routeGraph = buildSystemGraph(data);
+    return routeGraph;
+  }
+
+  // Wire the framework-agnostic controller to the BFF calls and the store. The
+  // loop reads flight-status each cycle (pushed to the flight slice too, so the
+  // Flight readout stays in sync) and pushes its progress into the travel slice.
+  function makeAutopilotDeps(): AutopilotDeps {
+    return {
+      getStatus: async () => {
+        const step = await api.getFlightStatus(callOptions);
+        const status = decodeFlightStatus(step.flight);
+        // Reconcile the docked station in the background — the tick must not
+        // block on a panel refresh (the loop owns its own cadence).
+        void observeFlightStatus(status);
+        return status;
+      },
+      // R13 — the measurement the decide-loop runs retail's distance ladder on.
+      // A READ (it starts nothing); the decoded snapshot is pushed into the
+      // space slice too, so the Overview stays fresh while the autopilot flies
+      // even if the panel's own poll is not running. A failure returns null and
+      // the loop falls back to mode + refusals for that cycle.
+      getSpaceSnapshot: async () => {
+        try {
+          const result = await api.getSpaceSnapshot(callOptions);
+          const snapshot = decodeSpaceSnapshot(result.space);
+          store.apply({
+      type: "space/snapshot",
+      snapshot,
+      gateLinks: gateLinksForSnapshot(snapshot),
+    });
+          return snapshot;
+        } catch (error) {
+          if (isSessionLost(error)) {
+            throw error;
+          }
+          return null;
+        }
+      },
+      undock: async () => {
+        await api.undock(callOptions);
+      },
+      warp: async (destinationID) => {
+        // R24 slice A — retail's `WarpToItem(warpRange=0)`, NOT the autopilot
+        // call. Passing a range routes to `CmdWarpToStuff("item", id,
+        // minRange=0)`, which reaches the identical `warpToEntity` as
+        // `CmdWarpToStuffAutopilot` but WITHOUT the 10 km that handler hardcodes
+        // (beyonceService.js:2983). That 10 km was added to the warp's stop
+        // distance, pushing the server's silent refusal 10 km further out than
+        // the distance the loop was measuring against — the dead band.
+        await api.warpTo(destinationID, AUTOPILOT_WARP_MIN_RANGE_M, callOptions);
+      },
+      approach: async (destinationID) => {
+        // The autopilot's close-the-gap approach is retail's 0.0, not the
+        // right-click menu's 50 m.
+        await api.approach(destinationID, 0, callOptions);
+      },
+      jump: async (fromGateID, toGateID) => {
+        await api.jump(fromGateID, toGateID, callOptions);
+      },
+      dock: async (stationID) => {
+        await api.dock(stationID, callOptions);
+      },
+      sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+      now: () => Date.now(),
+      onProgress: (progress) => {
+        const nameFor = (systemID: number | null): string | null =>
+          systemID !== null && routeGraph ? routeGraph.systemName(systemID) : null;
+        store.apply({
+          type: "travel/progress",
+          status: progress.status,
+          action: progress.action,
+          phase: progress.phase,
+          currentSystemID: progress.currentSystemID,
+          currentSystemName: nameFor(progress.currentSystemID),
+          nextSystemID: progress.nextSystemID,
+          nextSystemName: nameFor(progress.nextSystemID),
+          remainingJumps: progress.remainingJumps,
+          totalJumps: progress.totalJumps,
+          failureReason: progress.failureReason,
+        });
+        // A lost session inside the loop unwinds to character select, like every
+        // other held-session flow (R3-R5a).
+        if (progress.status === "error") {
+          stopLiveStream();
+        store.apply({ type: "character/offline" });
+        }
+      },
+      isSessionLost,
+      refusalReason: (error) => flightErrorReason(error),
+    };
+  }
+
+  async function startRoute(destinationID: number): Promise<RouteStartOutcome> {
+    store.apply({ type: "travel/plan-error", message: null });
+
+    // Every plan failure BOTH writes the travel slice (the Travel panel's
+    // surface) AND returns `started: false` — see RouteStartOutcome.
+    function planFailed(reason: string, cause?: unknown): RouteStartOutcome {
+      store.apply({ type: "travel/plan-error", message: reason });
+      return { started: false, reason, cause };
+    }
+
+    // 1. The client-side route graph (retail's clientPathfinderService is local;
+    //    this is read-only static reference data, not a gateway/route call).
+    let graph: SystemGraph;
+    try {
+      graph = await loadRouteGraph();
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+        throw error;
+      }
+      return planFailed(`Could not load the map graph: ${errorWords(error)}`, error);
+    }
+
+    // 2. The current location is the route origin (also validates the session).
+    let originSystem: number | null;
+    try {
+      const step = await api.getFlightStatus(callOptions);
+      const status = decodeFlightStatus(step.flight);
+      void observeFlightStatus(status);
+      originSystem = status.solarSystemID;
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+        throw error;
+      }
+      return planFailed(`Could not read your location: ${errorWords(error)}`, error);
+    }
+    if (originSystem === null) {
+      return planFailed("Your current solar system is unknown.");
+    }
+
+    // 3. Resolve the destination (a courier destination is a station; the solver
+    //    routes systems) from static reference data.
+    let destination: Awaited<ReturnType<typeof api.resolveDestination>>;
+    try {
+      destination = await api.resolveDestination(destinationID, callOptions);
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+        throw error;
+      }
+      return planFailed(`Could not resolve the destination: ${errorWords(error)}`, error);
+    }
+    if (destination.kind === "unknown" || destination.solarSystemID === null) {
+      return planFailed(`Unknown destination ${destinationID}.`);
+    }
+
+    // 4. Solve the route (fewest jumps).
+    const route = solveRoute(graph, originSystem, destination.solarSystemID);
+    if (!route.reachable) {
+      return planFailed(
+        `No gate route from ${graph.systemName(originSystem) ?? originSystem} to ${destination.systemName ?? destination.solarSystemID}.`,
+      );
+    }
+
+    // Stations and Upwell structures are both dock destinations (R38 resolve
+    // echoes the structure id/name into stationID/stationName). A bare system
+    // remains "arrive in space" with no dock target.
+    const destinationStationID =
+      destination.kind === "station" || destination.kind === "structure"
+        ? destination.stationID
+        : null;
+    const destinationName =
+      destination.kind === "station" || destination.kind === "structure"
+        ? destination.stationName
+        : destination.systemName;
+    const plan: RoutePlan = {
+      destinationSystemID: destination.solarSystemID,
+      destinationStationID,
+      destinationName,
+      hops: route.hops,
+    };
+
+    store.apply({
+      type: "travel/planned",
+      destinationSystemID: destination.solarSystemID,
+      destinationStationID,
+      destinationName,
+      route: route.hops.map((hop) => ({
+        fromSystemID: hop.fromSystemID,
+        toSystemID: hop.toSystemID,
+        gateToWarpID: hop.gateToWarpID,
+        jumpToGateID: hop.jumpToGateID,
+        fromSystemName: graph.systemName(hop.fromSystemID),
+        toSystemName: graph.systemName(hop.toSystemID),
+      })),
+      totalJumps: route.hops.length,
+      startedAt: Date.now(),
+    });
+
+    // 5. Run the decide-loop in the browser.
+    if (!autopilot) {
+      autopilot = createAutopilot(makeAutopilotDeps());
+    }
+    autopilot.start(plan);
+    void autopilot.run();
+    return { started: true };
+  }
+
+  // --- R24 slice B: the smart Dock command ---------------------------------
+  //
+  // Retail sequences docking CLIENT-side and there is exactly one server call in
+  // it. `menusvc.py:2981 Dock` -> `DockStation` ->
+  // `GetCloseAndTryCommand(itemID, RealDock, interactionRange=2500)` ->
+  // `autopilot.py:503 __NavigateSystemTo`, re-armed every 2000 ms, evaluating:
+  // in warp -> do nothing; within the docking radius -> fire Dock and stop;
+  // too far to close under sublight -> warp; otherwise -> approach; and if none
+  // of that can make progress, give up with a reason.
+  //
+  // That IS the decide-loop this app already runs. So Dock does not get its own
+  // autopilot: it gets a zero-hop plan handed to the SAME controller, at the
+  // same 2000 ms cadence, with the same measurement, the same settle windows and
+  // the same bounds — including R24 slice A's warp floor and warp counter. The
+  // ladder's dock rung now tests the server's real 2,500 m surface radius
+  // (STATION_DOCKING_RADIUS_M), so Dock is asked once, when it will work,
+  // instead of being fired at 50 km to be refused.
+  //
+  // ⚠ A 200 IS NOT PROOF, twice over here:
+  //   * out of range `Handle_CmdDock` (beyonceService.js:2994) starts an
+  //     approach AND refuses with `DockingApproach` (:3013-3025) — nothing
+  //     auto-docks on arrival, the client must come back;
+  //   * and it can return 200/null WITHOUT docking (:3031-3042) —
+  //     `WARP_LANDING_PENDING`, `STATION_NOT_FOUND`, `SHIP_IMMOBILE` and
+  //     `DOCKING_APPROACH_REQUIRED` all reach the browser as `ok:true`.
+  // So nothing here reads the Dock response to decide it worked. The loop's
+  // arrival test is `isAtDestination`, which is `docked === true` AND the
+  // station id matching, both read back from `flight-status`.
+  async function dockAt(stationID: number): Promise<void> {
+    store.apply({ type: "travel/plan-error", message: null });
+    if (!(stationID > 0)) {
+      store.apply({ type: "travel/plan-error", message: "That is not a station to dock at." });
+      return;
+    }
+
+    // Where are we? Also the session check, and the origin system for the plan.
+    let status: FlightStatus;
+    try {
+      const step = await api.getFlightStatus(callOptions);
+      status = decodeFlightStatus(step.flight);
+      void observeFlightStatus(status);
+    } catch (error) {
+      if (isSessionLost(error)) {
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+        throw error;
+      }
+      store.apply({
+        type: "travel/plan-error",
+        message: `Could not read your location: ${errorWords(error)}`,
+      });
+      return;
+    }
+
+    if (status.docked && dockedLocationID(status) === stationID) {
+      // Already there. Say so rather than starting a loop that would only
+      // discover it on its first tick.
+      store.apply({ type: "travel/plan-error", message: "You are already docked here." });
+      return;
+    }
+    if (status.solarSystemID === null) {
+      store.apply({ type: "travel/plan-error", message: "Your current solar system is unknown." });
+      return;
+    }
+
+    // The station's NAME, for the readout (R7d: the panel must never show the
+    // id). Static reference data, best-effort — an unnamed station still docks.
+    let destinationName: string | null = null;
+    try {
+      const resolved = await api.resolveDestination(stationID, callOptions);
+      destinationName =
+        resolved.kind === "station" || resolved.kind === "structure"
+          ? resolved.stationName
+          : resolved.systemName;
+    } catch {
+      destinationName = null;
+    }
+
+    // A plan with NO hops: same system, one station to reach. Everything else
+    // about the loop is unchanged.
+    const plan: RoutePlan = {
+      destinationSystemID: status.solarSystemID,
+      destinationStationID: stationID,
+      destinationName,
+      hops: [],
+    };
+
+    store.apply({
+      type: "travel/planned",
+      destinationSystemID: status.solarSystemID,
+      destinationStationID: stationID,
+      destinationName,
+      route: [],
+      totalJumps: 0,
+      startedAt: Date.now(),
+    });
+
+    if (!autopilot) {
+      autopilot = createAutopilot(makeAutopilotDeps());
+    }
+    autopilot.start(plan);
+    void autopilot.run();
+  }
+
+  // --- R26: the mining bot (a second browser decide-loop) ------------------
+  //
+  // Wired exactly as the autopilot is: a framework-agnostic controller whose
+  // every dependency is a BFF call, driven from the browser at its own cadence.
+  // It is deliberately a SEPARATE controller from the travel autopilot but
+  // never a simultaneous one — starting the bot aborts the autopilot first,
+  // because two loops steering one ship is the bug neither of them can see.
+  //
+  // Note what these deps are NOT wired to: the flow's own lockTarget /
+  // activateModule / launchDrones wrappers, which swallow a refusal into the
+  // store and return normally. The bot has to SEE the refusal to decide on it,
+  // so it goes straight to the api layer, like makeAutopilotDeps does.
+  let miningBot: MiningBotController | null = null;
+
+  function makeMiningBotDeps(): MiningBotDeps {
+    return {
+      getStatus: async () => {
+        const step = await api.getFlightStatus(callOptions);
+        const status = decodeFlightStatus(step.flight);
+        void observeFlightStatus(status);
+        return status;
+      },
+      getSpaceSnapshot: async () => {
+        const result = await api.getSpaceSnapshot(callOptions);
+        const snapshot = decodeSpaceSnapshot(result.space);
+        // Push it to the space slice too, so the Overview stays live while the
+        // bot works even if the panel's own poll is not running.
+        store.apply({
+      type: "space/snapshot",
+      snapshot,
+      gateLinks: gateLinksForSnapshot(snapshot),
+    });
+        return snapshot;
+      },
+      // THE LOCK AUTHORITY. A failed read must return null, never [] — an empty
+      // list would read as "nothing is locked" and re-lock a rock already being
+      // mined.
+      getLockedTargetIDs: async () => {
+        const result = await api.getTargets(callOptions);
+        const ids = decodeTargetIDs(result.targetIDs);
+        store.apply({ type: "targeting/targets", targetIDs: ids });
+        return ids;
+      },
+      // THE ORE AUTHORITY, and the same rule: a hold nobody could read is not
+      // an empty hold.
+      getHolds: async () => {
+        const result = await api.getMiningHolds(callOptions);
+        const holds = decodeMiningHolds(result.holds);
+        store.apply({ type: "mining/holds", holds });
+        return holds;
+      },
+      getDroneBayItemIDs: async () => {
+        const result = await api.getDrones(callOptions);
+        const bay = decodeDroneBay(result.bay);
+        return bay === null ? null : bay.map((stack) => stack.itemID);
+      },
+      undock: async () => {
+        await api.undock(callOptions);
+      },
+      // R24 slice A — retail's `WarpToItem(warpRange=0)`, not the autopilot
+      // call's hardcoded 10 km. Same correction, same reason.
+      warp: async (destinationID) => {
+        await api.warpTo(destinationID, AUTOPILOT_WARP_MIN_RANGE_M, callOptions);
+      },
+      approach: async (destinationID) => {
+        await api.approach(destinationID, 0, callOptions);
+      },
+      dock: async (stationID) => {
+        await api.dock(stationID, callOptions);
+      },
+      lockTarget: async (targetID) => {
+        await api.lockTarget(targetID, callOptions);
+      },
+      // No `effect` is passed: the SERVER resolves the module's own default
+      // activation effect from its type. The browser never guesses which effect
+      // a module runs — that rule is R23's and it holds here.
+      activateModule: async (moduleID, targetID) => {
+        await api.activateModule(moduleID, { targetID, repeat: -1 }, callOptions);
+      },
+      launchDrones: async (itemIDs) => {
+        await api.launchDrones(
+          itemIDs.map((itemID) => ({ itemID, quantity: 1 })),
+          callOptions,
+        );
+      },
+      unloadHolds: async (itemIDs) => {
+        await api.unloadMiningHolds(itemIDs, callOptions);
+      },
+      sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+      onProgress: (progress) => {
+        store.apply({
+          type: "bot/progress",
+          status: progress.status,
+          phase: progress.phase,
+          action: progress.action,
+          why: progress.why,
+          rung: progress.rung,
+          step: progress.step,
+          rockName: progress.rockName,
+          cyclesCompleted: progress.cyclesCompleted,
+          oreUnitsMined: progress.oreUnitsMined,
+          holdUsed: progress.holdUsed,
+          holdCapacity: progress.holdCapacity,
+          failureReason: progress.failureReason,
+        });
+        // A lost session inside the loop unwinds to character select, like
+        // every other held-session flow.
+        if (progress.status === "error") {
+          stopLiveStream();
+          store.apply({ type: "character/offline" });
+        }
+      },
+      isSessionLost,
+      refusalReason: (error) => flightErrorReason(error),
+    };
+  }
+
+  // --- R36: the mission bot (a THIRD browser decide-loop) ------------------
+  //
+  // Wired exactly as the mining bot is, with one deliberate difference: it does
+  // NOT own a flight ladder. A courier route is multi-system, which is precisely
+  // what the R5b autopilot already solves, sequences and bounds — so `startTravel`
+  // hands the destination to the SAME `autopilot` controller the Travel panel
+  // drives, and `getTravel` reads that controller's own snapshot back. One
+  // flight ladder, one set of bounds.
+  //
+  // As with the mining bot, these deps go STRAIGHT to the api layer rather than
+  // through the flow's own agent wrappers: `runAgentAction` swallows a refusal
+  // into the store and returns normally, and the bot has to SEE the refusal to
+  // decide on it.
+  let missionBot: MissionBotController | null = null;
+
+  function makeMissionBotDeps(): MissionBotDeps {
+    return {
+      getStatus: async () => {
+        const step = await api.getFlightStatus(callOptions);
+        const status = decodeFlightStatus(step.flight);
+        void observeFlightStatus(status);
+        return status;
+      },
+      // Opening the conversation is how the tokens are re-minted. It is called
+      // fresh on every tick that could press something — never cached.
+      openConversation: async (agentID) => {
+        const result = await api.agentAction(agentID, null, callOptions);
+        const conversation = decodeConversation(result);
+        store.apply({ type: "agents/conversation", agentID, conversation });
+        return conversation;
+      },
+      // ⚠ THIS RETURNS THE CONVERSATION RATHER THAN A BOOLEAN, deliberately.
+      // `doAgentAction` answers `success: true` on every branch it has, so the
+      // caller must be able to read `lastActionInfo.missionCompleted` itself —
+      // and the loop tests it with `=== true`, because a refusal carries null.
+      doAgentAction: async (agentID, actionID) => {
+        const result = await api.agentAction(agentID, actionID, callOptions);
+        const conversation = decodeConversation(result);
+        store.apply({ type: "agents/conversation", agentID, conversation });
+        return conversation;
+      },
+      getBriefing: async (agentID) => {
+        const reads = await api.loadBriefing(agentID, callOptions);
+        const briefing = decodeBriefing(reads.briefing, reads.objective);
+        store.apply({ type: "agents/briefing", briefing });
+        return briefing;
+      },
+      getJournal: async () => {
+        const journal = decodeJournal(await api.loadJournal(callOptions));
+        store.apply({ type: "agents/journal", journal });
+        return journal;
+      },
+      getCargo: async () => {
+        const panel = await api.loadInventory(callOptions);
+        return {
+          rows: decodeInventoryRows(panel.cargo.list),
+          capacity: decodeCapacity(panel.cargo.capacity),
+        };
+      },
+      getHangar: async () => decodeInventoryRows((await api.loadInventory(callOptions)).hangar.list),
+      // ⚠ THE FIRST STACK OF THE RIGHT TYPE IS NOT THE PACKAGE, and a 200 is not
+      // a loaded one. This is the same discipline as `loadPackageIntoShip`
+      // above: match on type AND quantity, then go through the VERIFYING
+      // /transfer (which re-reads and judges by the source giving something up)
+      // and raise when nothing actually moved. The bot's own bound counts the
+      // retries; its ladder re-reads the cargo to confirm.
+      loadPackage: async (typeID, quantity) => {
+        const panel = await api.loadInventory(callOptions);
+        const candidates = decodeInventoryRows(panel.hangar.list).filter(
+          (row) => row.typeID === typeID,
+        );
+        const item =
+          candidates.find((row) => row.quantity === quantity) ??
+          candidates.find((row) => row.quantity > quantity);
+        if (!item) {
+          throw new Error(`The mission package is not in the station hangar (${quantity} needed).`);
+        }
+        const outcome = await api.transferItems(
+          [item.itemID],
+          { kind: "hangar" },
+          { kind: "cargo" },
+          quantity,
+          callOptions,
+        );
+        if (!outcome.applied) {
+          throw new Error(
+            outcome.declinedSilently
+              ? "The station refused to load the mission package and gave no reason. It did not move."
+              : "The mission package did not move into the ship.",
+          );
+        }
+      },
+      unloadPackage: async (itemIDs, quantity) => {
+        const outcome = await api.transferItems(
+          [...itemIDs],
+          { kind: "cargo" },
+          { kind: "hangar" },
+          quantity,
+          callOptions,
+        );
+        if (!outcome.applied) {
+          throw new Error(
+            outcome.declinedSilently
+              ? "The station refused to take the cargo and gave no reason. It did not move."
+              : "The cargo did not move into the hangar.",
+          );
+        }
+      },
+      // THE SHARED AUTOPILOT. Not a second flight ladder — the same controller,
+      // the same route solver, the same R24 bounds.
+      startTravel: async (stationID) => {
+        const outcome = await startRoute(stationID);
+        if (!outcome.started) {
+          // The plan never reached the autopilot. A bot that books this as a
+          // running flight spins "Flying to…" forever against a stale
+          // snapshot, so the failure must THROW here — the underlying error
+          // when there is one (its code drives the loop's transport-transient
+          // retry), otherwise the plan reason in the player's words.
+          if (outcome.cause !== undefined) {
+            throw outcome.cause;
+          }
+          throw new Error(outcome.reason);
+        }
+      },
+      getTravel: () => {
+        if (!autopilot) {
+          return null;
+        }
+        const progress = autopilot.snapshot();
+        return {
+          status: progress.status,
+          destinationStationID: store.travel.get().destinationStationID,
+          remainingJumps: progress.remainingJumps,
+          failureReason: progress.failureReason,
+        };
+      },
+      stopTravel: () => {
+        autopilot?.abort();
+      },
+      // The jump gate's number, from the SAME client-side graph the autopilot
+      // routes on — so the number the bot refuses on is the number it would
+      // have had to fly.
+      getJumps: async (fromSystemID, toSystemID) => {
+        if (fromSystemID === toSystemID) {
+          return 0;
+        }
+        const graph = await loadRouteGraph();
+        return distancesFrom(graph, fromSystemID).get(toSystemID) ?? null;
+      },
+      // ⚠ THE PAYOUT IS A BALANCE DIFFERENCE, NOT A FIELD. R35 watched
+      // `lastActionInfo.loyaltyPoints` read 0 on a completion that paid 213 LP,
+      // so the bot reads the ACCOUNTS either side of the Complete instead.
+      getBalances: async () => {
+        const reads = await api.loadRewards(callOptions);
+        const lp = decodeLpBalances(reads.lp);
+        store.apply({
+          type: "rewards/loaded",
+          cashBalance: decodeCashBalance(reads.cash),
+          lpBalances: lp,
+          standings: decodeCharStandings(reads.standings),
+          error: null,
+        });
+        // LP is per issuing corp; the run's total is what the player watches go
+        // up, and summing is bigint-safe because LP is kept as a string.
+        const total = lp.reduce((sum, row) => {
+          try {
+            return sum + BigInt(row.loyaltyPoints);
+          } catch {
+            return sum;
+          }
+        }, 0n);
+        return { isk: decodeCashBalance(reads.cash), lp: total.toString() };
+      },
+      sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+      onProgress: (progress) => {
+        store.apply({
+          type: "mission-bot/progress",
+          status: progress.status,
+          phase: progress.phase,
+          action: progress.action,
+          why: progress.why,
+          agentName: progress.agentName,
+          missionName: progress.missionName,
+          cargoText: progress.cargoText,
+          destinationName: progress.destinationName,
+          jumpsRemaining: progress.jumpsRemaining,
+          missionsCompleted: progress.missionsCompleted,
+          iskEarned: progress.iskEarned,
+          lpEarned: progress.lpEarned,
+          caution: progress.caution,
+          failureReason: progress.failureReason,
+        });
+        if (progress.status === "error") {
+          stopLiveStream();
+          store.apply({ type: "character/offline" });
+        }
+      },
+      isSessionLost,
+      refusalReason: (error) => flightErrorReason(error),
+    };
+  }
+
+  // --- R43: one ship, one bot, and a preflight against fresh authority -------
+  //
+  // ⚠ THE CLAIM IS THE ONLY PLACE A BOT IS STOPPED FOR ANOTHER BOT. It walks
+  // every OTHER registered bot; the record it is built from is exhaustive over
+  // `BotID`, so a fourth bot cannot compile without its stopper and inherits
+  // exclusion from all three existing ones for free. This replaces the two
+  // asymmetric hand-written lines that let the mining bot start on top of a
+  // running mission bot.
+  function stopMiningController(): void {
+    miningBot?.stop();
+  }
+
+  function stopMissionController(): void {
+    missionBot?.stop();
+    // Mission travel rides the shared autopilot. Stopping only its outer loop
+    // leaves that inner controller flying after another bot takes the ship.
+    autopilot?.abort();
+  }
+
+  function stopCustomController(): void {
+    customBotGeneration += 1;
+    scriptRunner?.stop();
+    // Custom travel blocks use the same shared autopilot as missions.
+    autopilot?.abort();
+  }
+
+  const claimShip = createShipClaim({
+    mining: stopMiningController,
+    mission: stopMissionController,
+    custom: stopCustomController,
+  });
+
+  /**
+   * Resolve names and WAIT for them, unlike the fire-and-forget `requestNames`.
+   *
+   * The preflight has to know whether a powered-up module is a mining laser,
+   * and that is a question about its NAME. Reading the cache without waiting
+   * would report "no miner fitted" on a ship whose Strip Miners simply had not
+   * been looked up yet — a guess dressed as a fact. Anything still unresolved
+   * afterwards stays unresolved and becomes a cannot-tell, never a "no".
+   */
+  async function resolveNamesNow(refs: readonly NameRef[]): Promise<void> {
+    requestNames(refs);
+    if (nameFlushScheduled) {
+      nameFlushScheduled = false;
+      await flushNameQueue();
+    }
+  }
+
+  /**
+   * What the mining bot's requirements are checked against — read NOW.
+   *
+   * ⚠ FRESH, NOT WHATEVER THE STORE WAS HOLDING. The panel evaluates the same
+   * requirements against the store so a player can see the checklist, but that
+   * copy can be minutes old: a ship that has since docked, a laser since
+   * unfitted. Only these reads decide, and they are taken immediately before
+   * the first call the loop would make. Every read is independent and a failure
+   * lands as `null` — which the requirement turns into cannot-tell, and
+   * cannot-tell does not pass.
+   */
+  async function miningBotReads(request: MiningBotRequest): Promise<MiningBotReads> {
+    let inSpace: boolean | null = null;
+    try {
+      const step = await api.getFlightStatus(callOptions);
+      const status = decodeFlightStatus(step.flight);
+      void observeFlightStatus(status);
+      inSpace = !status.docked;
+    } catch {
+      inSpace = null;
+    }
+
+    let minersFitted: number | null = null;
+    let minersOnline: number | null = null;
+    try {
+      await loadFitting();
+      const fit = store.fitting.get();
+      if (fit.slotsError === null) {
+        // Ask for every fitted module's name AND its GROUP and WAIT, then look
+        // at the HIGH SLOTS — where every mining module lives. The GROUP is the
+        // game's own answer to "is this a laser" (space/rowActions.ts, R47).
+        await resolveNamesNow(
+          fit.slots
+            .filter((slot) => slot.module !== null)
+            .flatMap((slot) => [
+              { kind: "type" as const, id: slot.module!.typeID },
+              { kind: "typeGroup" as const, id: slot.module!.typeID },
+            ]),
+        );
+        const resolved = store.names.get().resolved;
+        const nameOf = (typeID: number): string | null =>
+          resolved[nameKey("type", typeID)] ?? null;
+        const groupOf = (typeID: number): string | null =>
+          resolved[nameKey("typeGroup", typeID)] ?? null;
+        // A high-slot module whose GROUP nobody could resolve might BE a Strip
+        // Miner, so an ungrouped one poisons BOTH counts rather than being read
+        // as "not a miner". Only a fit we could read end to end produces numbers.
+        if (ungroupedHighSlotModules(fit.slots, nameOf, groupOf).length === 0) {
+          const miners = highSlotMiningModules(fit.slots, nameOf, groupOf);
+          minersFitted = miners.length;
+          minersOnline = miners.filter((row) => row.online).length;
+        }
+      }
+    } catch {
+      minersFitted = null;
+      minersOnline = null;
+    }
+
+    let holdHasRoom: boolean | null = null;
+    try {
+      const result = await api.getMiningHolds(callOptions);
+      const holds = decodeMiningHolds(result.holds);
+      store.apply({ type: "mining/holds", holds });
+      // The loop's OWN pair: the hold it will actually fill, and its own 0.9
+      // headroom. "Should haul already" is exactly "has no room left".
+      const shouldHaul = holdShouldHaul(destinationHold(holds));
+      holdHasRoom = shouldHaul === null ? null : !shouldHaul;
+    } catch {
+      holdHasRoom = null;
+    }
+
+    return {
+      inSpace,
+      minersFitted,
+      minersOnline,
+      beltChosen: request.beltID > 0,
+      stationChosen: request.stationID > 0,
+      holdHasRoom,
+    };
+  }
+
+  /**
+   * The mission bot's reads. Only "where is the ship" needs the server — the
+   * agent and its station come from the request the player just made, so they
+   * are knowable rather than readable and can never be cannot-tell.
+   */
+  async function missionBotReads(request: MissionBotRequest): Promise<MissionBotReads> {
+    let docked: boolean | null = null;
+    try {
+      const step = await api.getFlightStatus(callOptions);
+      const status = decodeFlightStatus(step.flight);
+      void observeFlightStatus(status);
+      docked = status.docked;
+    } catch {
+      docked = null;
+    }
+    return {
+      docked,
+      agentChosen: request.agentID > 0,
+      agentStationKnown: request.agentStationID > 0,
+    };
+  }
+
+  async function startMissionBot(request: MissionBotRequest): Promise<void> {
+    store.apply({ type: "mission-bot/start-error", message: null });
+
+    // ⚠ THE CLAIM COMES FIRST, BEFORE THE PREFLIGHT CAN REFUSE. The player has
+    // said which bot they want; whether or not this one turns out to be able to
+    // start, the other must not be left flying the ship out from under a
+    // decision that has already been made. A refusal that leaves the previous
+    // bot running would be the old two-loops bug wearing an error message.
+    autopilot?.abort();
+    claimShip("mission");
+
+    const preflight = evaluateRequirements(MISSION_BOT_REQUIREMENTS, await missionBotReads(request));
+    if (!preflight.canStart) {
+      store.apply({ type: "mission-bot/start-error", message: preflight.blockedBy });
+      return;
+    }
+
+    const plan: MissionPlan = {
+      agentID: request.agentID,
+      agentName: request.agentName,
+      agentStationID: request.agentStationID,
+      agentStationName: request.agentStationName,
+      maxJumps: request.maxJumps,
+      maxMissions: request.maxMissions,
+    };
+
+    store.apply({
+      type: "mission-bot/started",
+      agentName: request.agentName,
+      stationName: request.agentStationName,
+      startedAt: Date.now(),
+    });
+
+    if (!missionBot) {
+      missionBot = createMissionBot(makeMissionBotDeps());
+    }
+    missionBot.start(plan);
+    void missionBot.run();
+  }
+
+  async function startMiningBot(request: MiningBotRequest): Promise<void> {
+    store.apply({ type: "bot/start-error", message: null });
+
+    // Taking the ship is the first semantic act of every start, even one whose
+    // own preflight later refuses. Otherwise an invalid mining click can leave a
+    // custom/mission controller flying after the player chose to replace it.
+    autopilot?.abort();
+    claimShip("mining");
+
+    if (request.miningModuleIDs.length === 0) {
+      store.apply({
+        type: "bot/start-error",
+        message: "Pick at least one piece of mining equipment for the bot to run.",
+      });
+      return;
+    }
+
+    // Two loops must never steer one ship. Retail's own Stop switches the
+    // autopilot off for the same reason; so does this. The travel autopilot is
+    // NOT a peer bot — the mission bot drives it rather than competing with it
+    // — so it is aborted here and does not go through the ship claim.
+    // ⚠ AND THIS IS THE LINE THAT WAS MISSING. `startMiningBot` aborted the
+    // autopilot and stopped nothing else, so a running mission bot kept
+    // ticking. It is now the same declarative claim the mission bot takes,
+    // before the preflight, for the same reason.
+
+    const preflight = evaluateRequirements(MINING_BOT_REQUIREMENTS, await miningBotReads(request));
+    if (!preflight.canStart) {
+      store.apply({ type: "bot/start-error", message: preflight.blockedBy });
+      return;
+    }
+
+    const plan: MiningPlan = {
+      beltID: request.beltID,
+      beltName: request.beltName,
+      stationID: request.stationID,
+      stationName: request.stationName,
+      miningModuleIDs: [...request.miningModuleIDs],
+      healthFloor: request.healthFloor,
+      useDrones: request.useDrones,
+      myCharacterID: store.character.get().selectedCharacterID,
+    };
+
+    store.apply({
+      type: "bot/started",
+      beltName: request.beltName,
+      stationName: request.stationName,
+      startedAt: Date.now(),
+    });
+
+    if (!miningBot) {
+      miningBot = createMiningBot(makeMiningBotDeps());
+    }
+    miningBot.start(plan);
+    void miningBot.run();
+  }
+
+  // --- Player Bot Builder runner --------------------------------------------
+  // The fourth decide-loop. It composes the SAME calls the mining/mission bots
+  // fire; the player's blocks choose which, in which order.
+  let scriptRunner: ScriptRunnerController | null = null;
+  // Bumped on every start/stop/panic. `startCustomBot` awaits a fitting read
+  // before it creates the runner; without this a second Start (or a Stop) during
+  // that gap would leave the FIRST run() loop orphaned and unstoppable — two
+  // loops driving one hull. Whoever bumps last wins; a superseded start bails.
+  let customBotGeneration = 0;
+
+  /**
+   * The ship's fitted mining-module item ids, resolved at start and whenever the
+   * active hull / fit changes (the same high-slot + resolved-group rule the
+   * mining bot's preflight uses). Empty when the fit could not be read.
+   */
+  async function resolveMiningModuleIDs(): Promise<readonly number[]> {
+    try {
+      await loadFitting();
+      const fit = store.fitting.get();
+      if (fit.slotsError !== null) {
+        return [];
+      }
+      await resolveNamesNow(
+        fit.slots
+          .filter((slot) => slot.module !== null)
+          .flatMap((slot) => [
+            { kind: "type" as const, id: slot.module!.typeID },
+            { kind: "typeGroup" as const, id: slot.module!.typeID },
+          ]),
+      );
+      const resolved = store.names.get().resolved;
+      const nameOf = (typeID: number): string | null => resolved[nameKey("type", typeID)] ?? null;
+      const groupOf = (typeID: number): string | null => resolved[nameKey("typeGroup", typeID)] ?? null;
+      return highSlotMiningModules(fit.slots, nameOf, groupOf).map((row) => row.itemID);
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * The fitted SALVAGERS, by the game's own group name ("Salvager") — the same
+   * resolve-then-judge pass the miner resolution makes. Runs after
+   * resolveMiningModuleIDs, so the names are already in the cache.
+   */
+  /**
+   * The fitted DEFENSE modules by the game's own group names, for the repair
+   * watch and the hardeners block. Same resolve-then-judge pass as the miners;
+   * runs after resolveMiningModuleIDs so the names are already cached. Reps live
+   * in mids/lows, so every family is scanned (not just high slots).
+   */
+  function resolveDefenseModuleIDs(): {
+    readonly shield: readonly number[];
+    readonly armor: readonly number[];
+    readonly hull: readonly number[];
+    readonly hardeners: readonly number[];
+    readonly weapons: readonly number[];
+    readonly tackle: readonly number[];
+    readonly webs: readonly number[];
+    readonly tractors: readonly number[];
+    readonly commandBursts: readonly number[];
+    readonly industrialCores: readonly number[];
+  } {
+    const fit = store.fitting.get();
+    const shield: number[] = [];
+    const armor: number[] = [];
+    const hull: number[] = [];
+    const hardeners: number[] = [];
+    const weapons: number[] = [];
+    const tackle: number[] = [];
+    const webs: number[] = [];
+    const tractors: number[] = [];
+    const commandBursts: number[] = [];
+    const industrialCores: number[] = [];
+    if (fit.slotsError === null) {
+      const resolved = store.names.get().resolved;
+      for (const slot of fit.slots) {
+        if (slot.module === null || !slot.module.online || slot.family === "rig" || slot.family === "subsystem") {
+          continue;
+        }
+        const group = resolved[nameKey("typeGroup", slot.module.typeID)] ?? null;
+        const typeName = resolved[nameKey("type", slot.module.typeID)] ?? null;
+        if (group === null) {
+          continue; // cannot tell what it is — never run a mystery module
+        }
+        // Anchored: "Shield Booster" / "Ancillary Shield Booster" only.
+        // A loose /shield boost/i also matched "Remote Shield Booster" (fleet
+        // module — wrong list) and "Shield Boost Amplifier" (passive mid the
+        // repair watch must never try to Activate). Same footgun the tackle
+        // branch documents below.
+        if (/shield booster$/i.test(group) && !/remote/i.test(group)) {
+          shield.push(slot.module.itemID);
+        } else if (/armor repair/i.test(group) && !/remote/i.test(group)) {
+          armor.push(slot.module.itemID);
+        } else if (/hull repair/i.test(group) && !/remote/i.test(group)) {
+          hull.push(slot.module.itemID);
+        } else if (/hardener|damage control|resistance/i.test(group)) {
+          hardeners.push(slot.module.itemID);
+        } else if (/^warp scrambler$/i.test(group)) {
+          // ⚠ ANCHORED ON PURPOSE, and verified against the SDE
+          // (`_local/sde/.../groups.jsonl`): group 52 is named "Warp Scrambler"
+          // and holds EVERY Warp Disruptor **and** Warp Scrambler (63 types), so
+          // one group covers both point and scram. The anchors matter — a loose
+          // /warp/i would also catch "Warp Core Stabilizer" (a low-slot module
+          // that stops nobody) and "Structure Warp Scrambler", and the
+          // Remote-Shield-Booster-read-as-a-local-rep bug two branches up is
+          // exactly what an unanchored group regex costs.
+          tackle.push(slot.module.itemID);
+        } else if (/^stasis web$/i.test(group)) {
+          // Group 65 "Stasis Web" — the webifiers (22 types). Deliberately NOT
+          // group 899 "Warp Disrupt Field Generator": that is an AREA bubble, not
+          // a module you activate on one target, so it does not belong in a
+          // lock-then-activate ladder.
+          webs.push(slot.module.itemID);
+        } else if (/tractor beam/i.test(group)) {
+          // "Tractor Beam" / variants — pull jetcans without deploying an MTU.
+          tractors.push(slot.module.itemID);
+        } else if (/^command burst$/i.test(group)) {
+          // SDE group "Command Burst" — Shield/Armor/Info/Skirmish/Mining Foreman.
+          // Anchored so "Burst Jammer" / similar names never match.
+          commandBursts.push(slot.module.itemID);
+        } else if (
+          /^siege module$/i.test(group) &&
+          typeName !== null &&
+          /industrial core/i.test(typeName)
+        ) {
+          // Siege Module also holds dread Siege / Triage — type name gates
+          // Medium/Large/Capital Industrial Core only (Porpoise/Orca/Rorqual).
+          industrialCores.push(slot.module.itemID);
+        } else if (slot.family === "high" && /weapon|launcher|turret/i.test(group)) {
+          // "Projectile Weapon", "Hybrid Weapon", "Energy Weapon", "Missile
+          // Launcher …" — the game's own turret/launcher groups, high slots only.
+          weapons.push(slot.module.itemID);
+        }
+      }
+    }
+    return { shield, armor, hull, hardeners, weapons, tackle, webs, tractors, commandBursts, industrialCores };
+  }
+
+  /**
+   * The fitted REMOTE repairers (they repair ANOTHER ship), by the game's own
+   * group names — the fleet-support blocks run these. Same resolve-then-judge pass
+   * as the local reps; the "remote" prefix in the group name is what separates a
+   * Remote Shield Booster from a self shield booster.
+   */
+  function resolveRemoteRepModuleIDs(): RemoteRepModuleIDs {
+    const fit = store.fitting.get();
+    const shield: number[] = [];
+    const armor: number[] = [];
+    const hull: number[] = [];
+    const cap: number[] = [];
+    if (fit.slotsError === null) {
+      const resolved = store.names.get().resolved;
+      for (const slot of fit.slots) {
+        if (slot.module === null || !slot.module.online || slot.family === "rig" || slot.family === "subsystem") {
+          continue;
+        }
+        const group = resolved[nameKey("typeGroup", slot.module.typeID)] ?? null;
+        if (group === null) {
+          continue; // cannot tell what it is — never run a mystery module
+        }
+        if (/remote shield/i.test(group)) {
+          shield.push(slot.module.itemID);
+        } else if (/remote armor/i.test(group)) {
+          armor.push(slot.module.itemID);
+        } else if (/remote (hull|structure)/i.test(group)) {
+          hull.push(slot.module.itemID);
+        } else if (/^remote capacitor transmitter$/i.test(group)) {
+          // SDE group 67, verified in `_local/sde/.../groups.jsonl`. Anchored so it
+          // cannot catch the other five "Capacitor …" module groups (Recharger,
+          // Battery, Booster, Power Relay, Flux Coil) — every one of those is a
+          // SELF module, and running one on a fleet-mate is not a thing.
+          cap.push(slot.module.itemID);
+        }
+      }
+    }
+    return { shield, armor, hull, cap };
+  }
+
+  function resolveSalvageModuleIDs(): readonly number[] {
+    const fit = store.fitting.get();
+    if (fit.slotsError !== null) {
+      return [];
+    }
+    const resolved = store.names.get().resolved;
+    const ids: number[] = [];
+    for (const slot of fit.slots) {
+      if (slot.family !== "high" || slot.module === null || !slot.module.online) {
+        continue;
+      }
+      const group = resolved[nameKey("typeGroup", slot.module.typeID)] ?? null;
+      if (group !== null && /salvager/i.test(group)) {
+        ids.push(slot.module.itemID);
+      }
+    }
+    return ids;
+  }
+
+  // Which mission blocks need which extra reads — so a mining bot's tick never
+  // pays for an agent-conversation read (the observe HINT gates them).
+  const MISSION_MACROS = new Set([
+    "find-distribution-agent",
+    "request-mission",
+    "accept-mission",
+    "load-mission-cargo",
+    "travel-to-dropoff",
+    "turn-in-mission",
+    "return-to-agent",
+    "find-combat-agent",
+    "fly-to-mission-site",
+  ]);
+  const CONVO_MACROS = new Set(["request-mission", "accept-mission", "turn-in-mission"]);
+  const CARGO_MACROS = new Set(["accept-mission", "load-mission-cargo", "turn-in-mission", "unload-cargo", "refine-ore", "refit-ship", "move-items", "repair-ship", "sell-item", "jettison-cargo", "deploy-mtu-and-loot"]);
+  const FLEET_MANAGEMENT_MACROS = new Set(["create-fleet", "invite-to-fleet", "join-fleet", "join-fleet-from-advert", "standing-fleet-boss", "fleet-warp-to-me", "fleet-warp-to-broadcast"]);
+  const FLEET_SUPPORT_MACROS = new Set(["remote-rep", "orbit-and-boost", "remote-cap", "fleet-warp-to-broadcast"]);
+  const SCANNER_MACROS = new Set([
+    "launch-scan-probes",
+    "analyze-signatures",
+    "recover-scan-probes",
+  ]);
+
+  interface DefenseModuleIDs {
+    readonly shield: readonly number[];
+    readonly armor: readonly number[];
+    readonly hull: readonly number[];
+    readonly hardeners: readonly number[];
+    readonly weapons: readonly number[];
+    /** Warp disruptors + scramblers (SDE group 52) — the PvP blocks' point. */
+    readonly tackle: readonly number[];
+    /** Stasis webifiers (SDE group 65). */
+    readonly webs: readonly number[];
+    /** Tractor beams (group name /tractor beam/i) — jetcan pull. */
+    readonly tractors: readonly number[];
+    /** Command Burst group (incl. Mining Foreman Burst). */
+    readonly commandBursts: readonly number[];
+    /** Industrial Core modules (Siege Module + type name /industrial core/i). */
+    readonly industrialCores: readonly number[];
+  }
+  interface RemoteRepModuleIDs {
+    readonly shield: readonly number[];
+    readonly armor: readonly number[];
+    readonly hull: readonly number[];
+    /** Remote CAPACITOR transmitters (SDE group 67) — the cap-chain block. */
+    readonly cap: readonly number[];
+  }
+  interface ScriptModuleCapabilities {
+    readonly shipID: number | null;
+    readonly mining: readonly number[];
+    readonly salvage: readonly number[];
+    readonly defense: DefenseModuleIDs;
+    readonly remoteReps: RemoteRepModuleIDs;
+  }
+
+  /** A stable fit identity: active hull + every module fact used by classifiers. */
+  function fittingCapabilitySignature(): string {
+    const fit = store.fitting.get();
+    return [
+      String(fit.activeShipID ?? "none"),
+      ...fit.slots.map((slot) =>
+        slot.module === null
+          ? `${slot.family}:${slot.index}:empty`
+          : [
+              slot.family,
+              slot.index,
+              slot.module.itemID,
+              slot.module.typeID,
+              slot.module.online ? 1 : 0,
+            ].join(":"),
+      ),
+    ].join("|");
+  }
+
+  function capabilityScope(shipID: number | null): CapabilityScope {
+    return { shipID, fittingSignature: fittingCapabilitySignature() };
+  }
+
+  /** Re-read the fit, wait for its group names, then classify every bot module. */
+  async function resolveScriptModuleCapabilities(): Promise<ScriptModuleCapabilities> {
+    const mining = await resolveMiningModuleIDs();
+    const fit = store.fitting.get();
+    return {
+      shipID: fit.activeShipID,
+      mining,
+      salvage: resolveSalvageModuleIDs(),
+      defense: resolveDefenseModuleIDs(),
+      remoteReps: resolveRemoteRepModuleIDs(),
+    };
+  }
+  // Market orders a bot places rest the retail maximum, so a resting order does
+  // not quietly expire under a long-running bot.
+  const BOT_ORDER_DURATION_DAYS = 90;
+
+  /**
+   * Deliver an "alert me" watch: the store ALWAYS, then a browser notification and
+   * a short beep where the surface allows one.
+   *
+   * ⚠ THE STORE PUSH IS THE LOAD-BEARING HALF and it goes first, unconditionally.
+   * This same code runs headless inside the server-bot host (src/botHost.js), where
+   * `window`, `Notification` and `AudioContext` do not exist — and where the alert
+   * matters MOST, because nobody is looking at a tab. The host folds this slice onto
+   * the bot's record, so the alert survives to `/api/bots` and the Server Bots
+   * readout. The two browser flourishes are wrapped individually: a browser that
+   * denied notification permission must still get the beep, and neither may ever
+   * throw into the runner's issue path.
+   */
+  function deliverAlert(message: string): void {
+    store.apply({ type: "custom-bot/alert", message, atMs: Date.now() });
+    // A notification needs permission. Ask ONCE, lazily, and only in reply to a
+    // real alert — never on load, which is how a site gets its prompt dismissed
+    // forever. A denied or pending permission is not an error; it just means the
+    // readout is the channel.
+    try {
+      const N = (globalThis as { Notification?: typeof Notification }).Notification;
+      if (typeof N === "function") {
+        if (N.permission === "granted") {
+          new N("Your EveJS bot", { body: message, tag: "evejs-bot-alert" });
+        } else if (N.permission === "default") {
+          void N.requestPermission()
+            .then((granted) => {
+              if (granted === "granted") {
+                new N("Your EveJS bot", { body: message, tag: "evejs-bot-alert" });
+              }
+            })
+            .catch(() => {});
+        }
+      }
+    } catch {
+      // A notification is a nicety; never let it break the run.
+    }
+    // The sound: two short WebAudio beeps. No asset to ship, no file to 404, and
+    // it works from a page the player has already interacted with (a bot they
+    // started by clicking). A suspended audio context just makes no noise.
+    try {
+      const Ctx = (globalThis as { AudioContext?: typeof AudioContext }).AudioContext;
+      if (typeof Ctx === "function") {
+        const ctx = new Ctx();
+        const beep = (atSecond: number): void => {
+          const osc = ctx.createOscillator();
+          const gain = ctx.createGain();
+          osc.frequency.value = 880;
+          gain.gain.value = 0.08;
+          osc.connect(gain);
+          gain.connect(ctx.destination);
+          osc.start(ctx.currentTime + atSecond);
+          osc.stop(ctx.currentTime + atSecond + 0.12);
+        };
+        beep(0);
+        beep(0.2);
+        // Let the beeps finish, then release the context (a leaked one per alert
+        // would eventually hit the browser's context limit and go silent).
+        setTimeout(() => void ctx.close().catch(() => {}), 800);
+      }
+    } catch {
+      // Same rule: no sound is not a failure.
+    }
+  }
+
+  function unhandledScriptAction(action: never): never {
+    throw new Error(`The custom-bot action dispatcher is missing an action: ${String(action)}`);
+  }
+
+  // Retail's Asteroid category — every ore type lives in it. Same constant
+  // scriptMacros.ts's refine-ore reaches for, kept local here since it is not
+  // exported and this is a different module.
+  const CATEGORY_ORE = 25;
+
+  /**
+   * Move a wreck/can's rows out, ore-category ones to the ore hold and
+   * everything else to cargo — split into two transfers rather than one call
+   * to a single destination. Loot-container and loot-wreck both dumped
+   * EVERYTHING into cargo before this: harmless for a combat ship, but on a
+   * mining/hauling hull the cargo hold is typically tiny next to the ore
+   * hold, so ore-bearing loot trickled in a few units at a time instead of
+   * landing where it actually fits. A ship with no ore hold at all just
+   * declines that half (TransferResult.declinedSilently) — nothing here
+   * throws over it, and the ore stays put in the wreck/can rather than being
+   * lost or wrongly forced into cargo.
+   */
+  async function transferLootedRows(
+    rows: readonly InventoryItemRow[],
+    from: { readonly kind: "container"; readonly itemID: number },
+  ): Promise<void> {
+    const ore = rows.filter((row) => row.categoryID === CATEGORY_ORE);
+    const rest = rows.filter((row) => row.categoryID !== CATEGORY_ORE);
+    if (ore.length > 0) {
+      await api.transferItems(
+        ore.map((row) => row.itemID),
+        from,
+        { kind: "shipBay", bay: "ore" },
+        null,
+        callOptions,
+      );
+    }
+    if (rest.length > 0) {
+      await api.transferItems(
+        rest.map((row) => row.itemID),
+        from,
+        { kind: "cargo" },
+        null,
+        callOptions,
+      );
+    }
+  }
+
+  function makeScriptRunnerDeps(
+    initialCapabilities: ScriptModuleCapabilities,
+    startingStationID: number | null,
+    home: WorldRef,
+    watchedKinds: ReadonlySet<string> = new Set<string>(),
+  ): ScriptRunnerDeps {
+    const walletWatched = watchedKinds.has("wallet-below") || watchedKinds.has("wallet-above");
+    const cargoWatched = watchedKinds.has("cargo-full");
+    const rosterWatched = watchedKinds.has("players-in-system-above");
+    // One finder result per run: the found agent does not change under the bot.
+    let foundAgentCache: NonNullable<ScriptObservation["foundAgent"]> | null = null;
+    // The hunt's jump-distance table, computed once per home system (a full
+    // breadth-first sweep over the gate graph is too much to redo every tick).
+    let huntDistanceAnchor: number | null = null;
+    let huntDistances: Map<number, number> | null = null;
+    const capabilityCache = createCapabilityCache(
+      {
+        value: initialCapabilities,
+        scope: capabilityScope(initialCapabilities.shipID),
+      },
+      async () => {
+        const value = await resolveScriptModuleCapabilities();
+        return { value, scope: capabilityScope(value.shipID) };
+      },
+    );
+    return {
+      observe: async (hint) => {
+        const [flightStep, spaceResult, targetsResult, holdsResult, dronesResult] = await Promise.all([
+          api.getFlightStatus(callOptions),
+          api.getSpaceSnapshot(callOptions),
+          api.getTargets(callOptions),
+          api.getMiningHolds(callOptions),
+          api.getDrones(callOptions),
+        ]);
+        const status = decodeFlightStatus(flightStep.flight);
+        void observeFlightStatus(status);
+        const snapshot = decodeSpaceSnapshot(spaceResult.space);
+        store.apply({
+      type: "space/snapshot",
+      snapshot,
+      gateLinks: gateLinksForSnapshot(snapshot),
+    });
+        const observedShipID = snapshot?.ship?.itemID ?? status.shipID ?? null;
+        const capabilities = await capabilityCache.read(capabilityScope(observedShipID));
+        const lockedTargetIDs = decodeTargetIDs(targetsResult.targetIDs);
+        store.apply({ type: "targeting/targets", targetIDs: lockedTargetIDs });
+        const holds = decodeMiningHolds(holdsResult.holds);
+        store.apply({ type: "mining/holds", holds });
+        const bay = decodeDroneBay(dronesResult.bay);
+        const droneBayItemIDs = bay === null ? null : bay.map((stack) => stack.itemID);
+
+        const ship = snapshot?.ship ?? null;
+        const hold = destinationHold(holds);
+        const capacity = hold?.capacity ?? null;
+        const used = capacity?.used ?? null;
+        const total = capacity?.capacity ?? null;
+        const oreHoldFraction =
+          typeof used === "number" && typeof total === "number" && total > 0 ? used / total : null;
+        const holdEmpty = holds === null ? null : holdItemIDs(holds).length === 0;
+        const origin = ship?.position ?? { x: 0, y: 0, z: 0 };
+        const hostileOnGrid = snapshot === null ? null : hostileRows(snapshot, origin).length > 0;
+        const dronesOut =
+          snapshot === null
+            ? null
+            : snapshot.entities.some((entity) => canMyShipOrderDrone(entity, ship?.itemID ?? null));
+
+        // ── Mission reads, gated by the active block (see MISSION_MACROS). Every
+        // read is best-effort: a failure lands as null (unreadable, never "no").
+        const macro = hint.activeMacro;
+        const boardAgentID =
+          typeof hint.board["agentID"] === "number" ? (hint.board["agentID"] as number) : null;
+        let conversation: ScriptObservation["conversation"] = null;
+        let briefing: ScriptObservation["briefing"] = null;
+        let journal: ScriptObservation["journal"] = null;
+        let cargo: ScriptObservation["cargo"] = null;
+        let stationHangar: ScriptObservation["stationHangar"] = null;
+        let foundAgent: ScriptObservation["foundAgent"] = null;
+        let jumpsToDropoff: ScriptObservation["jumpsToDropoff"] = null;
+        let anomalies: ScriptObservation["anomalies"] = null;
+        let savedFittings: ScriptObservation["savedFittings"] = null;
+        let colonies: ScriptObservation["colonies"] = null;
+        let industryJobs: ScriptObservation["industryJobs"] = null;
+        let damagedItemIDs: ScriptObservation["damagedItemIDs"] = null;
+        let scannerOperations: ScriptObservation["scannerOperations"] = null;
+        if (macro !== null && SCANNER_MACROS.has(macro)) {
+          try {
+            scannerOperations = await api.loadScannerOperations(callOptions);
+          } catch {
+            scannerOperations = null;
+          }
+        }
+        if (macro === "repair-ship" && status.docked) {
+          try {
+            // Quote the ACTIVE SHIP and everything fitted to it; the ids with a
+            // non-empty quote row list are what the shop calls damaged.
+            const shipID = store.inventory.get().activeShipID;
+            const fitted = store.fitting
+              .get()
+              .slots.filter((slot) => slot.module !== null)
+              .map((slot) => slot.module!.itemID);
+            const targets = [...(shipID !== null ? [shipID] : []), ...fitted];
+            if (targets.length > 0) {
+              const raw = await api.getRepairQuotes(targets, callOptions);
+              const dict =
+                raw !== null && typeof raw === "object" && !Array.isArray(raw) && (raw as { type?: unknown }).type === "dict"
+                  ? ((raw as { entries?: unknown }).entries as readonly [unknown, unknown][] | undefined) ?? []
+                  : [];
+              damagedItemIDs = dict
+                .filter(([, rows]) => {
+                  const list = rows as { items?: unknown } | null;
+                  return Array.isArray(list?.items) && list.items.length > 0;
+                })
+                .map(([id]) => Number(id))
+                .filter((id) => Number.isSafeInteger(id) && id > 0);
+            } else {
+              damagedItemIDs = null;
+            }
+          } catch {
+            damagedItemIDs = null;
+          }
+        }
+        if (macro === "restart-extractors") {
+          try {
+            const readAt = Date.now();
+            const report = decodeColonyReport((await api.getPlanets(callOptions)).planets, readAt);
+            // Expiries below are judged against the SERVER clock via the offset.
+            colonies = report.colonies.map((colony) => ({
+              planetID: colony.planetID,
+              planetName: colony.planetName,
+              extractors: colony.pins
+                .filter((pin) => pin.kind === "extractor-control" || pin.kind === "extractor")
+                .map((pin) => ({
+                  pinID: pin.pinID,
+                  resourceTypeID: pin.program?.resourceTypeID ?? null,
+                  expiresAtMs:
+                    pin.program?.expiresAtMs === null || pin.program?.expiresAtMs === undefined
+                      ? null
+                      : pin.program.expiresAtMs - report.clockOffsetMs,
+                })),
+            }));
+          } catch {
+            colonies = null;
+          }
+        }
+        if (macro === "deliver-ready-jobs") {
+          try {
+            // Same live jobs read the Industry panel uses. Status (including
+            // "ready") is the SERVER's derivation - never endDate vs the clock.
+            const reads = await api.loadIndustry(callOptions);
+            industryJobs = decodeJobs(reads.jobs.result).map((job) => ({
+              jobID: job.jobID,
+              status: job.status,
+            }));
+          } catch {
+            industryJobs = null;
+          }
+        }
+        let bookmarks: ScriptObservation["bookmarks"] = null;
+        if (macro === "warp-to-bookmark" || macro === "fly-to-mission-site") {
+          try {
+            const active = decodeActiveBookmarks(await api.loadActiveBookmarks(callOptions));
+            const folderName = new Map(active.folders.map((f) => [f.folderID, f.folderName]));
+            bookmarks = active.bookmarks.map((bm) => ({
+              bookmarkID: bm.bookmarkID,
+              name: bm.memo,
+              solarSystemID: bm.locationID > 0 ? bm.locationID : null,
+              folderName: folderName.get(bm.folderID) ?? null,
+              hasSpot: bm.x !== null && bm.y !== null && bm.z !== null,
+            }));
+          } catch {
+            bookmarks = null;
+          }
+        }
+        let activeShipID: ScriptObservation["activeShipID"] = null;
+        if (macro === "refit-ship") {
+          try {
+            savedFittings = decodeFittings(await api.loadSavedFittings(callOptions));
+          } catch {
+            savedFittings = null;
+          }
+        }
+        if (macro === "warp-to-anomaly") {
+          try {
+            const full = decodeFullState(await api.loadScanFullState(callOptions));
+            anomalies = full.anomalies
+              .map((site) => site.targetID)
+              .filter((label): label is string => label !== null);
+          } catch {
+            anomalies = null;
+          }
+        }
+        // ── Grid awareness, computed from the snapshot already in hand — no extra
+        // call, so these are always available. `targetedByPlayer` reads every
+        // PLAYER ship's own lock target: one pointing at this hull means trouble.
+        // `lowestDroneHealth` is null with no drones out (nothing to judge).
+        const myShipID = snapshot?.ship?.itemID ?? null;
+        const targetedByPlayer =
+          snapshot === null
+            ? null
+            : snapshot.entities.some(
+                (e) =>
+                  e.kind === "ship" &&
+                  e.isNpc === false &&
+                  e.isSelf === false &&
+                  e.characterID !== null &&
+                  myShipID !== null &&
+                  e.targetEntityID === myShipID,
+              );
+        let lowestDroneHealth: number | null = null;
+        if (snapshot !== null) {
+          for (const entity of snapshot.entities) {
+            if (canMyShipOrderDrone(entity, myShipID) !== true) {
+              continue;
+            }
+            const ratios = [entity.shieldRatio, entity.armorRatio, entity.hullRatio].filter(
+              (r): r is number => r !== null,
+            );
+            if (ratios.length === 0) {
+              continue;
+            }
+            const worst = Math.min(...ratios);
+            lowestDroneHealth = lowestDroneHealth === null ? worst : Math.min(lowestDroneHealth, worst);
+          }
+        }
+        // The ordinary CARGO hold's fill level — a gateway read, so gated on a
+        // cargo-full watch actually being set (a mining bot watches its ore hold,
+        // which rides the mining-holds read every tick already).
+        let cargoFraction: ScriptObservation["cargoFraction"] = null;
+        if (cargoWatched) {
+          try {
+            const panel = await api.loadInventory(callOptions);
+            const cap = decodeCapacity(panel.cargo.capacity);
+            cargoFraction =
+              cap !== null && typeof cap.used === "number" && typeof cap.capacity === "number" && cap.capacity > 0
+                ? cap.used / cap.capacity
+                : null;
+          } catch {
+            cargoFraction = null;
+          }
+        }
+        // ── Hunt reads (hunt-player only) — the local roster, a directional
+        // sweep, and the roam map. Each best-effort: a failure lands as null
+        // (unreadable, never an empty sky or an empty system).
+        let localPlayers: ScriptObservation["localPlayers"] = null;
+        let dscanHitIDs: ScriptObservation["dscanHitIDs"] = null;
+        let huntRoam: ScriptObservation["huntRoam"] = null;
+        // The roster is read for the hunt block AND for a players-in-system watch.
+        if (macro === "hunt-player" || rosterWatched) {
+          const selfID = store.station.get().online?.characterID ?? null;
+          try {
+            const roster = decodeChatChannel(await api.readChat("local", callOptions)).roster;
+            localPlayers = roster
+              .filter((m) => selfID === null || m.characterID !== selfID)
+              .map((m) => ({ characterID: m.characterID, name: m.name }));
+          } catch {
+            localPlayers = null;
+          }
+        }
+        if (macro === "hunt-player") {
+          // The sweep is a bound scan write (confirm-gated on the BFF); only
+          // meaningful with the ship in space. The server clamps the range to
+          // the ship's own scanner reach.
+          if (status.inSpace === true) {
+            try {
+              const rangeAU =
+                typeof hint.board["huntRangeAU"] === "number" ? (hint.board["huntRangeAU"] as number) : 14;
+              const raw = await api.coneScan(api.DSCAN_FULL_SWEEP_RADIANS, rangeAU * api.AU_METERS, callOptions);
+              dscanHitIDs = decodeDirectionalScanHitIDs(raw);
+            } catch {
+              dscanHitIDs = null;
+            }
+          }
+          try {
+            const current = status.solarSystemID;
+            if (current !== null) {
+              const anchor =
+                typeof hint.board["huntAnchorSystemID"] === "number"
+                  ? (hint.board["huntAnchorSystemID"] as number)
+                  : current;
+              const graph = await loadRouteGraph();
+              if (huntDistances === null || huntDistanceAnchor !== anchor) {
+                huntDistances = distancesFrom(graph, anchor);
+                huntDistanceAnchor = anchor;
+              }
+              const table = huntDistances;
+              huntRoam = {
+                jumpsFromAnchor: table.get(current) ?? null,
+                neighbors: graph.neighbors(current).map((edge) => ({
+                  systemID: edge.toSystemID,
+                  jumpsFromAnchor: table.get(edge.toSystemID) ?? null,
+                })),
+              };
+            }
+          } catch {
+            huntRoam = null;
+          }
+        }
+        // The travel reading is a synchronous look at the shared autopilot — no
+        // gateway call — so EVERY tick carries it (travel-to-station rides it too).
+        const travel: ScriptObservation["travel"] = autopilot
+          ? {
+              status: autopilot.snapshot().status,
+              destinationStationID: store.travel.get().destinationStationID,
+              destinationSystemID: store.travel.get().destinationSystemID,
+              remainingJumps: autopilot.snapshot().remainingJumps,
+              failureReason: autopilot.snapshot().failureReason,
+            }
+          : null;
+        // Own wallet balance — read only when a wallet watch is set (static for
+        // the run), since that watch is checked every tick. Best-effort: a failed
+        // read stays null (unreadable, never a false "below" that fires a watch).
+        let walletBalance: ScriptObservation["walletBalance"] = null;
+        if (walletWatched) {
+          try {
+            const cash = decodeCashBalance((await api.loadWallet(callOptions)).cash);
+            walletBalance = cash === null ? null : Number(cash);
+          } catch {
+            walletBalance = null;
+          }
+        }
+        // Fleet membership and support authority. Remote reps/cap/orbit may target
+        // ONLY character IDs from this fresh bound-fleet roster. A clean
+        // FleetNotFound is an authoritative empty roster; partial/failed reads stay
+        // null so those blocks wait instead of treating every player hull as a mate.
+        let inFleet: ScriptObservation["inFleet"] = null;
+        let fleetMemberCharacterIDs: ScriptObservation["fleetMemberCharacterIDs"] = null;
+        let fleetAdvertLive: ScriptObservation["fleetAdvertLive"] = null;
+        let fleetAdvert: ScriptObservation["fleetAdvert"] = null;
+        let fleetJoinRequests: ScriptObservation["fleetJoinRequests"] = null;
+        let availableFleetAds: ScriptObservation["availableFleetAds"] = null;
+        let lastFleetBroadcast: ScriptObservation["lastFleetBroadcast"] = null;
+        if (
+          macro !== null &&
+          (FLEET_MANAGEMENT_MACROS.has(macro) || FLEET_SUPPORT_MACROS.has(macro))
+        ) {
+          try {
+            const fleetSnapshot = decodeFleetCenter(await api.loadBoundFleet(callOptions));
+            inFleet =
+              fleetSnapshot.availability === "ready"
+                ? true
+                : fleetSnapshot.availability === "not-in-fleet"
+                  ? false
+                  : null;
+            if (FLEET_SUPPORT_MACROS.has(macro)) {
+              fleetMemberCharacterIDs = authoritativeFleetMemberCharacterIDs(fleetSnapshot);
+            }
+            if (macro === "fleet-warp-to-broadcast") {
+              try {
+                const lb = await api.loadLastFleetBroadcast(callOptions);
+                const lastRaw = lb["lastBroadcast"];
+                const last =
+                  lastRaw && typeof lastRaw === "object" && !Array.isArray(lastRaw)
+                    ? (lastRaw as Record<string, unknown>)
+                    : null;
+                const itemID = last && typeof last["itemID"] === "number" ? last["itemID"] : null;
+                lastFleetBroadcast =
+                  itemID !== null && itemID > 0
+                    ? {
+                        itemID,
+                        typeID: typeof last!["typeID"] === "number" ? (last!["typeID"] as number) : null,
+                        name: String(last!["name"] ?? ""),
+                        scope: last!["scope"] == null ? null : String(last!["scope"]),
+                        atMs: typeof last!["atMs"] === "number" ? (last!["atMs"] as number) : 0,
+                        fleetID: typeof last!["fleetID"] === "number" ? (last!["fleetID"] as number) : 0,
+                      }
+                    : null;
+              } catch {
+                lastFleetBroadcast = null;
+              }
+            }
+            if (macro === "standing-fleet-boss") {
+              const joinRead = fleetSnapshot.fleet.joinRequests;
+              if (joinRead.error === null) {
+                fleetJoinRequests = joinRead.value.map((row) => ({
+                  charID: typeof row.charID === "number" ? row.charID : null,
+                  corpID: typeof row.corpID === "number" ? row.corpID : null,
+                  allianceID: typeof row.allianceID === "number" ? row.allianceID : null,
+                }));
+              } else {
+                fleetJoinRequests = null;
+              }
+              try {
+                const adsRaw = await api.loadFleetAds(callOptions);
+                const mine = decodeMyFleetFinderAdvert(
+                  (adsRaw as { myFleetFinderAdvert?: unknown }).myFleetFinderAdvert as never,
+                );
+                if (mine === null) {
+                  fleetAdvertLive = false;
+                  fleetAdvert = null;
+                } else {
+                  fleetAdvertLive = true;
+                  fleetAdvert = {
+                    fleetName: mine.fleetName,
+                    description: mine.description,
+                    inviteScope: mine.inviteScope,
+                    public_minStanding: mine.public_minStanding,
+                    joinNeedsApproval: mine.joinNeedsApproval,
+                    leaderCorpID: mine.leader.corpID,
+                    leaderAllianceID: mine.leader.allianceID,
+                  };
+                }
+              } catch {
+                fleetAdvertLive = null;
+                fleetAdvert = null;
+              }
+            }
+            if (macro === "join-fleet-from-advert") {
+              try {
+                const adsRaw = await api.loadFleetAds(callOptions);
+                const decoded = decodeAvailableFleetAds(
+                  (adsRaw as { availableFleetAds?: unknown }).availableFleetAds as never,
+                );
+                availableFleetAds = decoded.map((ad) => ({
+                  fleetID: ad.fleetID,
+                  fleetName: ad.fleetName,
+                  description: ad.description,
+                  leaderCorpID: ad.leader.corpID,
+                  leaderAllianceID: ad.leader.allianceID,
+                  joinNeedsApproval: ad.joinNeedsApproval,
+                  numMembers: ad.numMembers,
+                }));
+              } catch {
+                availableFleetAds = null;
+              }
+            }
+          } catch {
+            inFleet = null;
+            fleetMemberCharacterIDs = null;
+            fleetAdvertLive = null;
+            fleetAdvert = null;
+            fleetJoinRequests = null;
+            availableFleetAds = null;
+            lastFleetBroadcast = null;
+          }
+        }
+        if (macro !== null && (MISSION_MACROS.has(macro) || CARGO_MACROS.has(macro))) {
+          if (MISSION_MACROS.has(macro)) {
+            try {
+              journal = decodeJournal(await api.loadJournal(callOptions));
+              store.apply({ type: "agents/journal", journal });
+            } catch {
+              journal = null;
+            }
+          }
+          if (boardAgentID !== null && CONVO_MACROS.has(macro)) {
+            try {
+              // Opening the conversation re-mints the button tokens — read fresh
+              // every tick that could press one, never cached (the R35 rule).
+              const result = await api.agentAction(boardAgentID, null, callOptions);
+              conversation = decodeConversation(result);
+              store.apply({ type: "agents/conversation", agentID: boardAgentID, conversation });
+            } catch {
+              conversation = null;
+            }
+          }
+          if (boardAgentID !== null && macro !== "find-distribution-agent" && macro !== "return-to-agent") {
+            try {
+              const reads = await api.loadBriefing(boardAgentID, callOptions);
+              briefing = decodeBriefing(reads.briefing, reads.objective);
+            } catch {
+              briefing = null;
+            }
+          }
+          if (CARGO_MACROS.has(macro)) {
+            try {
+              const panel = await api.loadInventory(callOptions);
+              cargo = {
+                rows: decodeInventoryRows(panel.cargo.list),
+                capacity: decodeCapacity(panel.cargo.capacity),
+              };
+              stationHangar = status.docked ? decodeInventoryRows(panel.hangar.list) : null;
+              activeShipID = panel.activeShipID;
+            } catch {
+              cargo = null;
+              stationHangar = null;
+            }
+          }
+          if (macro === "accept-mission" && briefing?.destinationSystemID != null) {
+            try {
+              const origin = status.solarSystemID;
+              if (origin !== null) {
+                const graph = await loadRouteGraph();
+                jumpsToDropoff =
+                  origin === briefing.destinationSystemID
+                    ? 0
+                    : (distancesFrom(graph, origin).get(briefing.destinationSystemID) ?? null);
+              }
+            } catch {
+              jumpsToDropoff = null;
+            }
+          }
+          if ((macro === "find-distribution-agent" || macro === "find-combat-agent") && boardAgentID === null) {
+            if (foundAgentCache !== null) {
+              foundAgent = foundAgentCache;
+            } else if (typeof hint.board["findLevel"] === "number") {
+              try {
+                // Distribution missions come from COURIER agents — the same static
+                // finder table the Agent Finder page reads. Filter by corp, rank
+                // by jumps from here, honour the player's ceiling.
+                const found = await api.findAgents(
+                  {
+                    kind: typeof hint.board["findKind"] === "string" ? (hint.board["findKind"] as string) : "courier",
+                    level: hint.board["findLevel"] as number,
+                    limit: 200,
+                  },
+                  callOptions,
+                );
+                const corpID =
+                  typeof hint.board["findCorpID"] === "number" ? (hint.board["findCorpID"] as number) : null;
+                const maxJumps =
+                  typeof hint.board["findMaxJumps"] === "number" ? (hint.board["findMaxJumps"] as number) : null;
+                const origin = status.solarSystemID;
+                const graph = origin !== null ? await loadRouteGraph() : null;
+                const distances = graph !== null && origin !== null ? distancesFrom(graph, origin) : null;
+                let best: { agent: (typeof found.agents)[number]; jumps: number } | null = null;
+                for (const agent of found.agents) {
+                  if (agent.stationID === null || agent.solarSystemID === null) {
+                    continue; // an agent in space cannot be docked with
+                  }
+                  if (corpID !== null && agent.corporationID !== corpID) {
+                    continue;
+                  }
+                  const jumps =
+                    origin !== null && agent.solarSystemID === origin
+                      ? 0
+                      : (distances?.get(agent.solarSystemID) ?? Number.POSITIVE_INFINITY);
+                  if (maxJumps !== null && jumps > maxJumps) {
+                    continue;
+                  }
+                  if (best === null || jumps < best.jumps) {
+                    best = { agent, jumps };
+                  }
+                }
+                if (best !== null && best.agent.stationID !== null) {
+                  foundAgentCache = {
+                    agentID: best.agent.agentID,
+                    stationID: best.agent.stationID,
+                    name: best.agent.name,
+                    stationName: best.agent.stationName,
+                  };
+                  foundAgent = foundAgentCache;
+                }
+              } catch {
+                foundAgent = null;
+              }
+            }
+          }
+        }
+
+        return {
+          conversation,
+          briefing,
+          journal,
+          cargo,
+          stationHangar,
+          travel,
+          foundAgent,
+          jumpsToDropoff,
+          anomalies,
+          scannerOperations,
+          localPlayers,
+          dscanHitIDs,
+          huntRoam,
+          otherPilotsInSystem: localPlayers === null ? null : localPlayers.length,
+          targetedByPlayer,
+          lowestDroneHealth,
+          cargoFraction,
+          savedFittings,
+          activeShipID,
+          bookmarks,
+          colonies,
+          industryJobs,
+          damagedItemIDs,
+          inSpace: status.inSpace,
+          docked: status.docked,
+          inWarp: status.shipMode === null ? null : /warp/i.test(status.shipMode),
+          shieldRatio: ship?.shieldRatio ?? null,
+          armorRatio: ship?.armorRatio ?? null,
+          hullRatio: ship?.hullRatio ?? null,
+          health: lowestHealth(snapshot),
+          oreHoldFraction,
+          holdEmpty,
+          hostileOnGrid,
+          dronesOut,
+          flightStatus: status,
+          snapshot,
+          lockedTargetIDs,
+          holds,
+          droneBayItemIDs,
+          miningModuleIDs: capabilities.mining,
+          salvageModuleIDs: capabilities.salvage,
+          shieldRepairerIDs: capabilities.defense.shield,
+          armorRepairerIDs: capabilities.defense.armor,
+          hullRepairerIDs: capabilities.defense.hull,
+          remoteShieldRepairerIDs: capabilities.remoteReps.shield,
+          remoteArmorRepairerIDs: capabilities.remoteReps.armor,
+          remoteHullRepairerIDs: capabilities.remoteReps.hull,
+          remoteCapModuleIDs: capabilities.remoteReps.cap,
+          inFleet,
+          fleetMemberCharacterIDs,
+          lastFleetBroadcast,
+          fleetAdvertLive,
+          fleetAdvert,
+          fleetJoinRequests,
+          availableFleetAds,
+          hardenerModuleIDs: capabilities.defense.hardeners,
+          weaponModuleIDs: capabilities.defense.weapons,
+          tackleModuleIDs: capabilities.defense.tackle,
+          webModuleIDs: capabilities.defense.webs,
+          tractorModuleIDs: capabilities.defense.tractors,
+          commandBurstModuleIDs: capabilities.defense.commandBursts,
+          industrialCoreModuleIDs: capabilities.defense.industrialCores,
+          capacitorRatio: ship?.capacitorRatio ?? null,
+          walletBalance,
+          startingStationID,
+          homeStationID: resolveStationRef(home, startingStationID, hint.board),
+          myCharacterID: store.station.get().online?.characterID ?? null,
+          myCorporationID: store.station.get().online?.corporationID ?? null,
+        };
+      },
+      issue: async (action) => {
+        switch (action.kind) {
+          case "wait":
+            return;
+          case "undock":
+            await api.undock(callOptions);
+            return;
+          case "warp":
+            await api.warpTo(action.targetID, AUTOPILOT_WARP_MIN_RANGE_M, callOptions);
+            return;
+          case "approach":
+            await api.approach(action.targetID, 0, callOptions);
+            return;
+          case "align":
+            await api.alignTo(action.targetID, callOptions);
+            return;
+          case "orbit":
+            await api.orbit(action.targetID, action.range, callOptions);
+            return;
+          case "dock":
+            await api.dock(action.stationID, callOptions);
+            return;
+          case "jump":
+            await api.jump(action.fromGateID, action.toGateID, callOptions);
+            return;
+          case "lock":
+            await api.lockTarget(action.targetID, callOptions);
+            return;
+          case "unlock":
+            await api.unlockTarget(action.targetID, callOptions);
+            return;
+          case "activate":
+            // targetID 0 = a SELF-targeted module (repairer, hardener) — the
+            // target key is omitted so the server activates it on the ship.
+            await api.activateModule(
+              action.moduleID,
+              action.targetID > 0 ? { targetID: action.targetID, repeat: -1 } : { repeat: -1 },
+              callOptions,
+            );
+            return;
+          case "deactivate":
+            await api.deactivateModule(action.moduleID, {}, callOptions);
+            return;
+          case "launchDrones":
+            if (action.droneItemIDs.length > 0) {
+              await api.launchDrones(
+                action.droneItemIDs.map((itemID) => ({ itemID, quantity: 1 })),
+                callOptions,
+              );
+            }
+            return;
+          case "engageDrones":
+            if (action.droneIDs.length > 0) {
+              await api.engageDrones(action.droneIDs, action.targetID, callOptions);
+            }
+            return;
+          case "recallDrones":
+            if (action.droneIDs.length > 0) {
+              await api.recallDrones(action.droneIDs, callOptions);
+            }
+            return;
+          case "unloadOre":
+            if (action.itemIDs.length > 0) {
+              await api.unloadMiningHolds(action.itemIDs, callOptions);
+            }
+            return;
+          case "agentButton": {
+            // The same call the mission bot presses buttons with; the fresh
+            // conversation it answers with lands in the store for the panel.
+            const result = await api.agentAction(action.agentID, action.actionID, callOptions);
+            store.apply({
+              type: "agents/conversation",
+              agentID: action.agentID,
+              conversation: decodeConversation(result),
+            });
+            return;
+          }
+          case "startRoute":
+            // The SHARED autopilot — same solver, same bounds, multi-system.
+            await startRoute(action.stationID);
+            return;
+          case "loadMissionCargo": {
+            // Match on type AND quantity, then the VERIFYING transfer (it
+            // re-reads and judges by the source giving something up). A miss is
+            // not a crash — the block re-reads and retries within its bound.
+            const panel = await api.loadInventory(callOptions);
+            const candidates = decodeInventoryRows(panel.hangar.list).filter(
+              (row) => row.typeID === action.typeID,
+            );
+            const item =
+              candidates.find((row) => row.quantity === action.quantity) ??
+              candidates.find((row) => row.quantity > action.quantity);
+            if (item !== undefined) {
+              await api.transferItems(
+                [item.itemID],
+                { kind: "hangar" },
+                { kind: "cargo" },
+                action.quantity,
+                callOptions,
+              );
+            }
+            return;
+          }
+          case "unloadMissionCargo":
+            if (action.itemIDs.length > 0) {
+              await api.transferItems(
+                [...action.itemIDs],
+                { kind: "cargo" },
+                { kind: "hangar" },
+                null,
+                callOptions,
+              );
+            }
+            return;
+          case "salvageDrones":
+            if (action.droneIDs.length > 0) {
+              await api.salvageDrones(action.droneIDs, action.targetID, callOptions);
+            }
+            return;
+          case "warpScan":
+            await api.warpToScanSite(action.target, 0, callOptions);
+            return;
+          case "warpBookmark":
+            await api.warpToBookmark(action.bookmarkID, 0, callOptions);
+            return;
+          case "restartExtractor":
+            await api.restartExtractorProgram(action.planetID, action.pinID, action.resourceTypeID, callOptions);
+            return;
+          case "deliverIndustryJob":
+            // Confirmed by the next industry jobs re-read (status leaves "ready").
+            // Delivery only ever gives - no confirm gate (unlike install/cancel).
+            await api.deliverIndustryJob(action.jobID, callOptions);
+            return;
+          case "repairItems":
+            if (action.itemIDs.length > 0) {
+              await api.repairItems(action.itemIDs, callOptions);
+            }
+            return;
+          case "boardShip":
+            await api.boardShip(action.shipID, callOptions);
+            capabilityCache.invalidate();
+            return;
+          case "moveItems": {
+            const asPlace = (place: string): InventoryPlace =>
+              place === "hangar"
+                ? { kind: "hangar" }
+                : place === "cargo"
+                  ? { kind: "cargo" }
+                  : { kind: "shipBay", bay: "ore" };
+            if (action.itemIDs.length > 0) {
+              await api.transferItems(
+                [...action.itemIDs],
+                asPlace(action.from),
+                asPlace(action.to),
+                action.qty,
+                callOptions,
+              );
+            }
+            return;
+          }
+          case "applyFitting": {
+            // Re-read the library at issue time (never a stale module list), then
+            // hand the server the {flag: type} plan; it pulls from this hangar.
+            const library = decodeFittings(await api.loadSavedFittings(callOptions));
+            const fitting = library.find((f) => f.fittingID === action.fittingID);
+            const stationID = store.flight.get().status?.stationID ?? null;
+            const shipID = store.inventory.get().activeShipID;
+            if (fitting !== undefined && stationID !== null && shipID !== null) {
+              const modulesByFlag: Record<number, number> = {};
+              for (const module of fitting.modules) {
+                if (module.flagID > 0 && module.typeID > 0 && modulesByFlag[module.flagID] === undefined) {
+                  modulesByFlag[module.flagID] = module.typeID;
+                }
+              }
+              await api.applySavedFitting(shipID, stationID, modulesByFlag, callOptions);
+              capabilityCache.invalidate();
+              await loadInventory().catch(() => {});
+            }
+            return;
+          }
+          case "reprocessOre":
+            if (action.itemIDs.length > 0) {
+              // The BFF verifies by re-reading the hangar; the block confirms on
+              // its own next-tick read too, so a silent decline just retries
+              // within the block's bound instead of being believed.
+              await api.reprocessItems(action.itemIDs, callOptions);
+            }
+            return;
+          case "lootWreck": {
+            // Read the wreck's contents, then move the lot out — ore to the ore
+            // hold, everything else to cargo (transferLootedRows). The wreck is
+            // addressed as a plain container; the transfer route re-reads and
+            // even absorbs the loot-raises-after-move server quirk.
+            const contents = await api.openContainer(action.wreckID, callOptions);
+            const rows = decodeInventoryRows(contents.list);
+            if (rows.length > 0) {
+              await transferLootedRows(rows, { kind: "container", itemID: action.wreckID });
+            }
+            return;
+          }
+          case "lootContainer": {
+            // Same shape as lootWreck — the server applies no ownership check to
+            // a container, so nothing here needs to either.
+            const contents = await api.openContainer(action.containerID, callOptions);
+            const rows = decodeInventoryRows(contents.list);
+            if (rows.length > 0) {
+              await transferLootedRows(rows, { kind: "container", itemID: action.containerID });
+            }
+            return;
+          }
+          case "placeBuyOrder":
+            // A resting order rests the full 90 days; the API's own confirm gate
+            // is the second lock behind the server's. The block is one-shot, so a
+            // silent decline just means no order — never a double buy.
+            await api.placeMarketBuyOrder(
+              { typeID: action.typeID, price: action.price, quantity: action.quantity, durationDays: BOT_ORDER_DURATION_DAYS },
+              callOptions,
+            );
+            return;
+          case "placeSellOrder":
+            // The listed stack leaves the hangar, which is how the block confirms
+            // next tick — a decline leaves it, and the block retries within bound.
+            await api.placeMarketSellOrder(
+              { itemID: action.itemID, typeID: action.typeID, price: action.price, quantity: action.quantity, durationDays: BOT_ORDER_DURATION_DAYS },
+              callOptions,
+            );
+            return;
+          case "createFleet":
+            // Confirmed by the next bound-fleet read (inFleet flips true).
+            await api.createFleet(callOptions);
+            return;
+          case "postFleetAdvert":
+            await api.addFleetAdvert(action.advertData, callOptions);
+            return;
+          case "inviteToFleet":
+            await api.inviteToFleet(action.charID, callOptions);
+            return;
+          case "acceptFleetInvite":
+            // A missing invite is treated as a refused attempt; the runner re-reads
+            // and retries until inFleet becomes true or the block's wait bound trips.
+            // An invitee is not in the fleet yet, so AcceptInvite must bind the
+            // fleetID carried by the live OnFleetInvite notification; the Fleet
+            // Center slice retains it even when that panel is closed.
+            {
+              const fleetID = store.fleet.get().pendingInvite?.fleetID;
+              if (fleetID === undefined) {
+                throw new Error("No pending fleet invitation is available.");
+              }
+              await api.acceptFleetInvite(fleetID, callOptions);
+            }
+            return;
+          case "fleetBroadcast":
+            // Location ping via fleetObjectHandler.SendBroadcast — not WarpFleet.
+            await api.sendFleetBroadcast(
+              {
+                name: action.name,
+                scope: action.scope,
+                itemID: action.itemID,
+                typeID: action.typeID,
+              },
+              callOptions,
+            );
+            return;
+          case "applyToJoinFleet":
+            // Confirmed by the next bound-fleet read (inFleet flips true), or by
+            // the boss accepting a join-needs-approval application.
+            await api.applyToJoinFleet(action.fleetID, action.autoAccept, callOptions);
+            return;
+          case "startSystemRoute":
+            // The SHARED autopilot again — resolveDestination answers a system id
+            // with kind "system", so the plan carries no final dock and the ride
+            // ends in space at the destination system.
+            await startRoute(action.systemID);
+            return;
+          case "sendChat":
+            // The verified R7 chat send. No readable echo to confirm against —
+            // the block is one-shot by design, so a refusal costs one line.
+            await api.sendChat(action.channel, action.message, callOptions);
+            return;
+          case "alert":
+            deliverAlert(action.message);
+            return;
+          case "jettison":
+            // ⚠ The items leave the ship into a container in space. The BFF route
+            // is confirm-gated; the block confirms by re-reading the hold, so a
+            // refused jettison retries within its bound instead of being believed.
+            if (action.itemIDs.length > 0) {
+              await api.jettisonItems(action.itemIDs, callOptions);
+            }
+            return;
+          case "launchFromShip":
+            // Deployables leave cargo into space (MTU, depot, …). Confirm-gated;
+            // the block confirms by seeing the unit on grid / gone from cargo.
+            if (action.itemIDs.length > 0) {
+              await api.launchFromShip(action.itemIDs, callOptions);
+            }
+            return;
+          case "stackHangar":
+            await api.stackItems("hangar", callOptions);
+            return;
+          case "compressOre":
+            // Confirm-gated on the BFF. The answer is deliberately not trusted:
+            // the block's next hold read is what tells it whether the stack
+            // really changed type, so a refusal costs one attempt on one stack.
+            await api.compressOreInSpace(action.itemID, action.facilityID, callOptions);
+            return;
+          case "scannerLaunch":
+            await api.launchScannerProbes(callOptions);
+            return;
+          case "scannerAnalyze":
+            await api.requestScannerAnalysis(callOptions);
+            return;
+          case "scannerRecover":
+            await api.recoverScannerProbes(callOptions);
+            return;
+        }
+        return unhandledScriptAction(action);
+      },
+      sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+      // The readout goes to the STORE, not a component callback, so it survives
+      // dock/undock and the shell switch (the bug the first cut hit).
+      onProgress: (snapshot) => {
+        store.apply({
+          type: "custom-bot/progress",
+          status: snapshot.status,
+          phase: snapshot.phase,
+          why: snapshot.why,
+          stepPath: snapshot.stepPath,
+          interruptID: snapshot.interruptID,
+          pauseReason: snapshot.pauseReason,
+          note: snapshot.note,
+        });
+        if (snapshot.status === "error") {
+          stopLiveStream();
+          store.apply({ type: "character/offline" });
+        }
+      },
+      isSessionLost,
+      registry: SCRIPT_MACROS,
+      travelHome: scriptTravelHome,
+    };
+  }
+
+  async function startCustomBot(input: BotScript, sourceScriptID: string | null = null): Promise<void> {
+    // Restarting the SAME controller is the one case createShipClaim deliberately
+    // does not stop. Cancel it here, then take the structural claim so mining and
+    // mission are stopped exhaustively from the shared registry.
+    const gen = (customBotGeneration += 1);
+    scriptRunner?.stop();
+    autopilot?.abort();
+    claimShip("custom");
+    // COMPOSITION, resolved once here: a bot that includes other saved bots is
+    // expanded into one flat program BEFORE the runner ever sees it, so the whole
+    // engine keeps reasoning about a single program. A bot that cannot be
+    // included is skipped with a plain reason rather than failing the run.
+    const doc = await expandSavedSubBots(input, sourceScriptID);
+    if (gen !== customBotGeneration) {
+      return; // superseded while the included bots were read
+    }
+    store.apply({ type: "custom-bot/started", name: doc.name });
+    // Seed the fitted-module cache. The runner refreshes it after a refit or
+    // active-hull change; this first read only keeps tick one honest.
+    const initialCapabilities = await resolveScriptModuleCapabilities();
+    if (gen !== customBotGeneration) {
+      return; // a newer start / a stop / a panic superseded us during the read
+    }
+    // Resolve "starting station" from a FRESH flight read. If the bot starts in
+    // space there is no station to bind, and emergency travel will pause with an
+    // honest refusal instead of claiming the exposed ship is safely docked.
+    let startStatus = store.flight.get().status;
+    try {
+      startStatus = decodeFlightStatus((await api.getFlightStatus(callOptions)).flight);
+      void observeFlightStatus(startStatus);
+    } catch {
+      // Keep the last authoritative status if one exists; null stays unknown.
+    }
+    if (gen !== customBotGeneration) {
+      return;
+    }
+    const startingStationID =
+      startStatus !== null && startStatus.docked ? dockedLocationID(startStatus) : null;
+    // Which conditions this doc actually tests — decided ONCE, so observe pays only
+    // for the per-tick reads a bot really needs (the wallet, the local roster, the
+    // cargo hold). See scriptWatchedConditionKinds.
+    const watchedKinds = scriptWatchedConditionKinds(doc);
+    scriptRunner = createScriptRunner(
+      makeScriptRunnerDeps(initialCapabilities, startingStationID, doc.home, watchedKinds),
+    );
+    scriptRunner.start(doc);
+    void scriptRunner.run();
+  }
+
+  /**
+   * Expand "run one of my saved bots" nodes by pulling those bots off the
+   * server and splicing their programs in. Returns the doc unchanged when it
+   * asks for none. Every fetched bot goes through the CODEC first (a stored bot
+   * is untrusted bytes like any other), and anything that cannot be included is
+   * reported on the readout rather than stopping the run.
+   */
+  async function expandSavedSubBots(
+    doc: BotScript,
+    sourceScriptID: string | null = null,
+  ): Promise<BotScript> {
+    if (!hasSubBots(doc)) {
+      return doc;
+    }
+    const byID = new Map<string, BotScript>();
+    const idsByName = new Map<string, string[]>();
+    try {
+      const summaries = await api.listBotScripts(callOptions);
+      for (const summary of summaries) {
+        const key = summary.name.trim().toLowerCase();
+        const ids = idsByName.get(key) ?? [];
+        idsByName.set(key, [...ids, summary.scriptID]);
+      }
+      await Promise.all(
+        summaries.map(async (summary) => {
+          try {
+            const record = await api.getBotScript(summary.scriptID, callOptions);
+            if (record === null) {
+              return;
+            }
+            const decoded = decodeScriptValue(record.doc);
+            if (decoded.ok) {
+              byID.set(summary.scriptID, decoded.doc);
+            }
+          } catch {
+            // One broken/deleted record does not make another exact id ambiguous.
+          }
+        }),
+      );
+    } catch {
+      // Could not read the library — the resolver reports every reference missing.
+    }
+
+    const resolve = (reference: SubBotReference): BotResolution => {
+      if (reference.scriptID !== null) {
+        const exact = byID.get(reference.scriptID);
+        return exact === undefined
+          ? { kind: "missing" }
+          : { kind: "found", identity: `id:${reference.scriptID}`, doc: exact };
+      }
+      const key = reference.name?.trim().toLowerCase() ?? "";
+      const ids = idsByName.get(key) ?? [];
+      if (ids.length > 1) {
+        return { kind: "ambiguous" };
+      }
+      const scriptID = ids[0];
+      if (scriptID === undefined) {
+        return { kind: "missing" };
+      }
+      const matched = byID.get(scriptID);
+      return matched === undefined
+        ? { kind: "missing" }
+        : { kind: "found", identity: `id:${scriptID}`, doc: matched };
+    };
+
+    const result = expandSubBots(
+      doc,
+      resolve,
+      sourceScriptID === null ? null : `id:${sourceScriptID}`,
+    );
+    if (result.problems.length > 0) {
+      store.apply({
+        type: "custom-bot/progress",
+        status: "running",
+        phase: "Starting",
+        why: result.problems.join(" "),
+        stepPath: null,
+        interruptID: null,
+        pauseReason: null,
+        note: null,
+      });
+    }
+    return result.doc;
+  }
+
+  /**
+   * EVERY condition kind the document tests anywhere — interrupts, step and loop
+   * `until`s, and branch forks (including branches inside a loop).
+   *
+   * This is the READ GATE. Several conditions cost a gateway call per tick that no
+   * other bot should pay for: the wallet, the local-chat roster, the inventory. So
+   * the whole doc is walked ONCE at start (it cannot change under a run) and the
+   * observe function reads only what something actually watches. A kind missing
+   * from this set means its reading stays null — and null never fires a watch, which
+   * is the safe direction to be wrong in.
+   */
+  function scriptWatchedConditionKinds(doc: BotScript): ReadonlySet<string> {
+    const kinds = new Set<string>();
+    for (const row of doc.interrupts) {
+      kinds.add(row.when.kind);
+    }
+    const addUntil = (step: { readonly until?: { readonly kind: string } }): void => {
+      if (step.until !== undefined) {
+        kinds.add(step.until.kind);
+      }
+    };
+    for (const node of doc.program) {
+      if (node.kind === "loop") {
+        addUntil(node);
+        for (const element of node.body) {
+          if (element.kind === "branch") {
+            kinds.add(element.when.kind);
+            for (const step of [...element.then, ...element.else]) {
+              addUntil(step);
+            }
+          } else {
+            addUntil(element);
+          }
+        }
+      } else if (node.kind === "branch") {
+        kinds.add(node.when.kind);
+        for (const step of [...node.then, ...node.else]) {
+          addUntil(step);
+        }
+      } else if (node.kind === "macro") {
+        addUntil(node);
+      }
+      // A sub-bot node is already expanded by the time this runs, so it has no
+      // test of its own to check here.
+    }
+    return kinds;
+  }
+
+  /**
+   * The manual escape hatch behind the readout's "Recall drones & dock" button:
+   * stop every loop, bring any controllable drones home, and dock at the nearest
+   * station/structure on grid. A player can always pull the ship to safety by
+   * hand, whatever a bot (or a bug) is doing. Best-effort and bounded — each step
+   * is independent, so a failed recall still attempts the dock.
+   */
+  async function panicRecallAndDock(): Promise<void> {
+    customBotGeneration += 1; // cancel any start still mid-await
+    scriptRunner?.stop();
+    // The player has ended the bot by hand — clear its readout to idle so it
+    // does not linger showing the last thing it was doing ("Mining the rock")
+    // once we are docked. `stop()` alone leaves the slice at status "stopped"
+    // with that stale phase/why still on it.
+    store.apply({ type: "custom-bot/cleared" });
+    autopilot?.abort();
+    miningBot?.stop();
+    missionBot?.stop();
+    await loadSpaceSnapshot().catch(() => {});
+    const snapshot = store.space.get().snapshot;
+    if (snapshot === null) {
+      return;
+    }
+    // Nearest dockable station/structure on grid (centre-to-centre) — where we head.
+    const origin = snapshot.ship?.position ?? null;
+    let best: { readonly itemID: number; readonly d: number } | null = null;
+    for (const entity of snapshot.entities) {
+      if (entity.isSelf || !isDockableKind(entity.kind)) {
+        continue;
+      }
+      const dx = origin ? origin.x - entity.position.x : 0;
+      const dy = origin ? origin.y - entity.position.y : 0;
+      const dz = origin ? origin.z - entity.position.z : 0;
+      const d = dx * dx + dy * dy + dz * dz;
+      if (best === null || d < best.d) {
+        best = { itemID: entity.itemID, d };
+      }
+    }
+
+    // Which drones can this hull still order home, from the freshest snapshot.
+    const dronesStillOut = (): readonly number[] => {
+      const s = store.space.get().snapshot;
+      if (s === null) {
+        return [];
+      }
+      const sid = s.ship?.itemID ?? null;
+      return s.entities.filter((e) => canMyShipOrderDrone(e, sid) === true).map((e) => e.itemID);
+    };
+
+    // The align-out-and-recall move: call the drones home, align toward the exit
+    // so the ship is ready to warp, then HOLD until 0 are left in space before we
+    // let the dock (which warps) proceed — warping with drones out abandons them.
+    // Bounded (~15s) so it can never hang; after that we leave regardless.
+    const out = dronesStillOut();
+    if (out.length > 0) {
+      await recallDrones(out).catch(() => {});
+      if (best !== null) {
+        await api.alignTo(best.itemID, callOptions).catch(() => {});
+      }
+      for (let i = 0; i < 10 && dronesStillOut().length > 0; i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        await loadSpaceSnapshot().catch(() => {});
+      }
+    }
+
+    if (best !== null) {
+      await dockAt(best.itemID);
+    }
+  }
+
+  // R7a — search the static map by name so a player can set a destination
+  // without knowing EVE IDs. The static /api/map/find read (login-gated, no
+  // bridge session) returns systems + stations; we annotate each with jumps from
+  // the current system using the same single BFS the Agent Finder uses (the map
+  // graph is already the route solver's, loaded once). Jumps are best-effort:
+  // if the origin is unknown or the graph can't load, the row simply has no
+  // distance. A hard read failure throws so the caller can surface it.
+  async function searchDestinations(
+    query: string,
+    kind: "system" | "station" | null = null,
+  ): Promise<DestinationMatch[]> {
+    const trimmed = query.trim();
+    if (trimmed.length < 2) {
+      return [];
+    }
+    const result = await api.findMapLocations(trimmed, kind, callOptions);
+
+    // The origin is the live location if known (in space or docked), else the
+    // docked character's system. Distances come from ONE BFS over the map graph.
+    const origin =
+      store.flight.get().status?.solarSystemID ??
+      store.station.get().online?.solarSystemID ??
+      null;
+    let distances: Map<number, number> | null = null;
+    if (origin !== null) {
+      try {
+        distances = distancesFrom(await loadRouteGraph(), origin);
+      } catch {
+        distances = null;
+      }
+    }
+
+    return result.matches.map((match) => ({
+      ...match,
+      jumps:
+        distances !== null && match.solarSystemID !== null
+          ? distances.get(match.solarSystemID) ?? null
+          : null,
+    }));
+  }
+
+  // --- R7c Names everywhere (batch name cache) -----------------------------
+
+  // The generalized R7a location-name cache: every tab asks for names by
+  // (kind, id) and this cache resolves them in ONE batched /api/names round-trip
+  // per microtask, caches each outcome (a name, or null for a definitive
+  // "unknown" so it never refetches), and pushes them into the store's `names`
+  // slice for pure-reader components. A transient network failure is NOT cached
+  // (the pending marks are released so a later request retries). Fire-and-forget:
+  // requestNames never throws and never blocks a UI interaction — the component
+  // shows the raw ID until the name lands. Chunked to the route's server-side cap
+  // so a large list is never silently truncated.
+  const NAMES_REQUEST_CAP = 500;
+  const nameCache = new Map<string, string | null>();
+  const namePending = new Set<string>();
+  let nameQueue: NameRef[] = [];
+  let nameFlushScheduled = false;
+
+  async function flushNameQueue(): Promise<void> {
+    nameFlushScheduled = false;
+    const batch = nameQueue;
+    nameQueue = [];
+    for (let start = 0; start < batch.length; start += NAMES_REQUEST_CAP) {
+      const chunk = batch.slice(start, start + NAMES_REQUEST_CAP);
+      let result: Awaited<ReturnType<typeof api.resolveNames>>;
+      try {
+        result = await api.resolveNames(chunk, callOptions);
+      } catch {
+        // Best-effort: release the pending marks so these refs can be retried
+        // by a later requestNames (a transient failure must not cache "unknown").
+        for (const ref of chunk) {
+          namePending.delete(nameKey(ref.kind, ref.id));
+        }
+        continue;
+      }
+      // R38 — a key the server could not look up at all (a player structure
+      // with no character online, or a gateway error) is released like a
+      // transient network failure: pending mark dropped, NOTHING cached, so a
+      // later requestNames asks again. Caching it would be the client asserting
+      // "this place has no name" on the strength of a question that was never
+      // answered.
+      const unresolved = new Set(result.unresolved);
+      const entries: Record<string, string | null> = {};
+      for (const ref of chunk) {
+        const key = nameKey(ref.kind, ref.id);
+        namePending.delete(key);
+        if (unresolved.has(key)) {
+          continue;
+        }
+        const name = key in result.names ? result.names[key] : null;
+        nameCache.set(key, name ?? null);
+        entries[key] = name ?? null;
+      }
+      store.apply({ type: "names/resolved", entries });
+    }
+  }
+
+  function requestNames(refs: readonly NameRef[]): void {
+    let queued = false;
+    for (const ref of refs) {
+      const id = ref.id;
+      if (!Number.isSafeInteger(id) || id <= 0) {
+        continue;
+      }
+      const key = nameKey(ref.kind, id);
+      if (nameCache.has(key) || namePending.has(key)) {
+        continue;
+      }
+      namePending.add(key);
+      nameQueue.push({ kind: ref.kind, id });
+      queued = true;
+    }
+    if (queued && !nameFlushScheduled) {
+      nameFlushScheduled = true;
+      queueMicrotask(() => {
+        void flushNameQueue();
+      });
+    }
+  }
+
+  // --- R6a Agent Finder ----------------------------------------------------
+
+  // The finder pulls a bounded set from the static reference table and sorts it
+  // by jumps from the current system. We request a limit that fully covers a
+  // single mission-kind level (the largest, courier L1, is ~1531) so choosing a
+  // level yields the complete, correctly-nearest-sorted set; the browser then
+  // renders only a capped page. Bounded well under the ~11k-agent dataset.
+  const FINDER_REQUEST_LIMIT = 2000;
+
+  // Nearest-first; unreachable / unknown-origin agents (jumps === null) sort
+  // last, then by level, then by name for a stable order.
+  function compareFinderRows(a: AgentFinderRow, b: AgentFinderRow): number {
+    if (a.jumps !== b.jumps) {
+      if (a.jumps === null) {
+        return 1;
+      }
+      if (b.jumps === null) {
+        return -1;
+      }
+      return a.jumps - b.jumps;
+    }
+    if ((a.level ?? 0) !== (b.level ?? 0)) {
+      return (a.level ?? 0) - (b.level ?? 0);
+    }
+    return a.name.localeCompare(b.name);
+  }
+
+  async function findAgents(
+    filters: { kind?: string; level?: number | null; limit?: number } = {},
+  ): Promise<void> {
+    const kind = filters.kind ?? "courier";
+    const level = filters.level ?? null;
+
+    let result: Awaited<ReturnType<typeof api.findAgents>>;
+    try {
+      result = await api.findAgents(
+        { kind, level, limit: filters.limit ?? FINDER_REQUEST_LIMIT },
+        callOptions,
+      );
+    } catch (error) {
+      // The finder reads static reference data (web-login only, no bridge
+      // session), so a failure is a plain read error surfaced in the slice.
+      store.apply({ type: "finder/error", message: `Could not find agents: ${errorWords(error)}` });
+      return;
+    }
+
+    // The player's current system is the docked character's system (the finder
+    // is a docked-station tool). Distances come from ONE BFS over the map graph
+    // (client-side, like the route solver) — never a solveRoute per agent.
+    const origin = store.station.get().online?.solarSystemID ?? null;
+    let distances: Map<number, number> | null = null;
+    let distanceNote: string | null = null;
+    if (origin !== null) {
+      try {
+        distances = distancesFrom(await loadRouteGraph(), origin);
+      } catch (error) {
+        // The map graph is the same read-only static data the route solver
+        // uses; if it can't load, still list the agents (jumps null) and note
+        // why rather than failing the whole find.
+        distanceNote = `Agents listed without distances (map graph unavailable: ${errorWords(error)}).`;
+      }
+    }
+
+    const rows: AgentFinderRow[] = result.agents
+      .map((agent) => ({
+        ...agent,
+        jumps:
+          distances !== null && agent.solarSystemID !== null
+            ? distances.get(agent.solarSystemID) ?? null
+            : null,
+      }))
+      .sort(compareFinderRows);
+
+    store.apply({
+      type: "finder/results",
+      kind: result.kind,
+      level: result.level,
+      originSystemID: origin,
+      agents: rows,
+      total: result.total,
+      capped: result.capped,
+    });
+    // finder/results clears the error; re-apply the soft distance note after it
+    // so it survives (a hard find error already returned above).
+    if (distanceNote) {
+      store.apply({ type: "finder/error", message: distanceNote });
+    }
+  }
+
+  async function setDestinationToAgent(agentID: number): Promise<void> {
+    const agent = store.finder.get().agents.find((row) => row.agentID === agentID);
+    if (!agent) {
+      store.apply({ type: "finder/error", message: `Agent ${agentID} is not in the current results.` });
+      return;
+    }
+    if (agent.stationID === null) {
+      store.apply({ type: "finder/error", message: `Agent ${agent.name} has no station to route to.` });
+      return;
+    }
+    // Record who we're flying to (the panel shows the target), then reuse the
+    // R5b route solver + browser autopilot via startRoute(agent.stationID).
+    store.apply({
+      type: "finder/target",
+      target: {
+        agentID: agent.agentID,
+        name: agent.name,
+        level: agent.level,
+        stationID: agent.stationID,
+        stationName: agent.stationName,
+        solarSystemID: agent.solarSystemID,
+        solarSystemName: agent.solarSystemName,
+        jumps: agent.jumps,
+      },
+    });
+    await startRoute(agent.stationID);
+  }
+
+  return {
+    async checkHealth() {
+      // One shot, called at boot (main.ts) — never a poll. Any failure resolves
+      // to offline inside api.getHealth, so this never throws.
+      const { ready } = await api.getHealth(callOptions);
+      store.apply({ type: "health/status", status: ready ? "online" : "offline" });
+    },
+
+    sessionToken() {
+      return callOptions.token ?? null;
+    },
+
+    requestOptions() {
+      return callOptions;
+    },
+
+    async login(username, password) {
+      const result = await api.login(username, password, callOptions);
+      // R107 — in per-session mode capture the token onto our own call options
+      // (api.login deliberately did NOT write the global), so every later call
+      // and the SSE stream authenticate as THIS character. In single-session
+      // mode `token` is not a key on callOptions and api.login already wrote the
+      // global, so this assignment is skipped.
+      if (options.perSessionToken) {
+        callOptions.token = result.sessionToken;
+      }
+      store.apply({
+        type: "session/logged-in",
+        accountID: result.accountID,
+        username: result.username,
+        // R2: carried so the character-select screen can welcome a brand-new
+        // account (which also arrives with zero characters).
+        accountCreated: result.accountCreated,
+      });
+      // The character list comes from the typed retail reference call, not a
+      // bespoke projection (charUnboundMgr.GetCharacterSelectionData).
+      const selection = await getCharacterSelectionData(callOptions);
+      store.apply({ type: "character/list", characters: selection.characters });
+    },
+
+    async createCharacter(request) {
+      const created = await api.createCharacter(request, callOptions);
+      // Re-read the roster through the SAME reference call login uses rather
+      // than splicing a row in locally: the new pilot's name, ship, corp and SP
+      // then come from the server's own view of what it just made, and a create
+      // that somehow produced nothing shows an unchanged list instead of a
+      // phantom character the select would refuse.
+      const selection = await getCharacterSelectionData(callOptions);
+      store.apply({ type: "character/list", characters: selection.characters });
+      return created;
+    },
+
+    async selectCharacter(characterID) {
+      store.apply({ type: "character/selected", characterID });
+      const result = await api.selectCharacter(characterID, callOptions);
+      store.apply({
+        type: "character/online",
+        character: result.character,
+        station: result.station,
+      });
+      // Anchor the docked-station sync to where select landed so the first
+      // flight read at this station doesn't trigger a redundant relocate; a
+      // later dock elsewhere on this session will.
+      syncedStationID = result.character.stationID ?? result.character.structureID;
+      // R10: the session is live, so open the push channel before the docked
+      // reads — anything the reads trigger is then already being observed.
+      startLiveStream();
+      await refreshStationPanel();
+    },
+
+    refreshStationPanel,
+
+    loadInventory,
+
+    async moveItem(itemID, direction, qty = null) {
+      await runMutation(() => api.moveItem(itemID, direction, qty ?? null, callOptions));
+    },
+
+    async stackContainer(target) {
+      await runMutation(() => api.stackItems(target, callOptions));
+    },
+
+    async boardShip(shipID) {
+      await runMutation(() => api.boardShip(shipID, callOptions));
+      await refreshActiveShipViews();
+    },
+
+    async boardCorvette() {
+      await runMutation(() => api.boardCorvette(callOptions));
+      await refreshActiveShipViews();
+    },
+
+    async leaveShip() {
+      // The server resolves the docked swap from the session and ignores the
+      // shipID beyond logging, so a not-yet-loaded inventory (null → 0) is
+      // fine; when the panel has loaded we pass the real active hull, as the
+      // retail client does.
+      const activeShipID = store.get().inventory.activeShipID ?? 0;
+      await runMutation(() => api.leaveShip(activeShipID, callOptions));
+      await refreshActiveShipViews();
+    },
+
+    // --- R14 inventory depth ---
+
+    toggleSelection(itemID) {
+      const selection = store.get().inventory.selection;
+      store.apply({
+        type: "inventory/selection",
+        itemIDs: selection.includes(itemID)
+          ? selection.filter((id) => id !== itemID)
+          : [...selection, itemID],
+      });
+    },
+
+    clearSelection() {
+      store.apply({ type: "inventory/selection", itemIDs: [] });
+    },
+
+    openContainer,
+    openShipBays,
+
+    async transferItems(itemIDs, from, to, qty = null) {
+      await runInventoryAction(async () => {
+        const result = await api.transferItems(itemIDs, from, to, qty ?? null, callOptions);
+        return {
+          applied: result.applied,
+          declinedSilently: result.declinedSilently,
+          message: describeTransfer(result, itemIDs.length, qty ?? null),
+        };
+      });
+    },
+
+    async mergeStacks(sourceItemID, destinationItemID, place) {
+      await runInventoryAction(async () => {
+        const result = await api.mergeStacks(
+          sourceItemID,
+          destinationItemID,
+          place,
+          null,
+          callOptions,
+        );
+        return {
+          applied: result.applied,
+          declinedSilently: result.declinedSilently,
+          message: result.applied
+            ? `Merged ${result.merged} into the stack.`
+            : "The server did not merge those stacks, and gave no reason.",
+        };
+      });
+    },
+
+    async trashItems(itemIDs, place) {
+      await runInventoryAction(async () => {
+        const result = await api.trashItems(itemIDs, place, callOptions);
+        const destroyed = result.destroyed.length;
+        const survived = result.survived.length;
+        let message: string;
+        if (destroyed > 0 && survived === 0) {
+          message = `Destroyed ${destroyed} ${destroyed === 1 ? "item" : "items"}.`;
+        } else if (destroyed > 0) {
+          message = `Destroyed ${destroyed}; the server refused to destroy ${survived}, and gave no reason.`;
+        } else {
+          message = "The server destroyed nothing, and gave no reason.";
+        }
+        return { applied: result.applied, declinedSilently: result.declinedSilently, message };
+      });
+    },
+
+    loadCorpHangar,
+
+    selectCorpDivision(division) {
+      store.apply({ type: "inventory/corp-division", division });
+    },
+
+    loadFitting,
+
+    loadDogma,
+
+    async fitModule(itemID, source, slot) {
+      await runFittingAction(() => api.fitModule(itemID, source, slot, callOptions));
+    },
+
+    async unfitModule(itemID, destination) {
+      await runFittingAction(() => api.unfitModule(itemID, destination, callOptions));
+    },
+
+    async setModuleOnline(itemID, online) {
+      // ⚠ NOT runFittingAction. That helper decides "declined" from the api
+      // verb's `applied` flag, and setModuleOnline returns VOID — so its check
+      // was dead code and an online/offline toggle that quietly did nothing
+      // reported success. The online state IS in the re-read, so use it.
+      const wasOnline = moduleOnlineState(itemID);
+      try {
+        await api.setModuleOnline(itemID, online, callOptions);
+      } catch (error) {
+        if (isSessionLost(error)) {
+          stopLiveStream();
+          store.apply({ type: "character/offline" });
+          throw error;
+        }
+        store.apply({ type: "fitting/action-error", message: errorWords(error) });
+        return;
+      }
+      await loadFitting();
+      const nowOnline = moduleOnlineState(itemID);
+      // Unknown either side is not a decline — only a module we could read
+      // before AND after, that did not move, earns the message.
+      if (wasOnline !== null && nowOnline !== null && nowOnline !== online) {
+        store.apply({
+          type: "fitting/action-error",
+          message: online
+            ? "The server accepted that and the module is still offline, and gave no reason."
+            : "The server accepted that and the module is still online, and gave no reason.",
+        });
+      }
+    },
+
+    async loadAmmo(moduleIDs, chargeItemIDs, source) {
+      await runAmmoAction(
+        moduleIDs,
+        () => api.loadAmmo(moduleIDs, chargeItemIDs, source, callOptions),
+        // Nothing about what the module holds changed, so nothing was loaded.
+        (before, after) => before === after,
+        "The server accepted that and loaded nothing, and gave no reason. " +
+          "A module only takes certain kinds of charge.",
+      );
+    },
+
+    async unloadAmmo(moduleIDs, destination) {
+      await runAmmoAction(
+        moduleIDs,
+        () => api.unloadAmmo(moduleIDs, destination, callOptions),
+        // An unload that worked leaves the modules empty.
+        (_before, after) => after !== "",
+        "The server accepted that and the ammunition is still loaded, and gave no reason.",
+      );
+    },
+
+    async destroyRig(itemID) {
+      await runFittingAction(() => api.destroyRig(itemID, callOptions));
+    },
+
+    loadIndustry,
+
+    async previewIndustryJob(request) {
+      const result = await api.previewIndustryJob(request, callOptions);
+      return result.available;
+    },
+
+    async installIndustryJob(request) {
+      await runIndustryAction(() => api.installIndustryJob(request, callOptions));
+    },
+
+    async deliverIndustryJob(jobID) {
+      await runIndustryAction(() => api.deliverIndustryJob(jobID, callOptions));
+    },
+
+    async cancelIndustryJob(jobID) {
+      await runIndustryAction(() => api.cancelIndustryJob(jobID, callOptions));
+    },
+    loadMarket,
+    findMarketTypes: (q: string) => api.findMarketTypes(q, callOptions),
+    loadMarketGroups: (parentGroupID: number) => api.loadMarketGroups(parentGroupID, callOptions),
+    loadMarketGroupTypes: (marketGroupID: number) =>
+      api.loadMarketGroupTypes(marketGroupID, callOptions),
+    async placeMarketOrder(request) {
+      // Buying names a TYPE; selling names a specific STACK. Two different
+      // retail calls, and the panel chooses between them here rather than the
+      // BFF guessing from the payload.
+      if (request.side === "sell") {
+        const itemID = request.itemID ?? 0;
+        await runMarketAction("sell", () =>
+          api.placeMarketSellOrder(
+            {
+              itemID,
+              typeID: request.typeID,
+              price: request.price,
+              quantity: request.quantity,
+              durationDays: request.durationDays,
+            },
+            callOptions,
+          ));
+        return;
+      }
+      await runMarketAction("buy", () =>
+        api.placeMarketBuyOrder(
+          {
+            typeID: request.typeID,
+            price: request.price,
+            quantity: request.quantity,
+            durationDays: request.durationDays,
+          },
+          callOptions,
+        ));
+    },
+    async cancelMarketOrder(orderID) {
+      await runMarketAction("cancel", () => api.cancelMarketOrder(orderID, callOptions));
+    },
+    async modifyMarketOrder(orderID, price) {
+      await runMarketAction("modify", () => api.modifyMarketOrder(orderID, price, callOptions));
+    },
+    loadActivity,
+    loadScanner,
+    launchScannerProbes,
+    analyzeScannerSignatures,
+    recoverScannerProbes,
+    reconnectScannerProbes,
+    loadFleet,
+    formFleet,
+    inviteFleetMember,
+    acceptFleetInvite,
+    leaveFleet,
+    loadMail,
+    openMail,
+    closeMail,
+    findCharacters: (q: string) => api.findCharacters(q, callOptions),
+    sendMail,
+    loadContracts,
+    openContract,
+    closeContract,
+    loadPersonalAssets,
+    openAssetStation,
+    setDestinationToAssetStation,
+
+    loadAgents,
+
+    async openConversation(agentID) {
+      await runAgentAction(async () => {
+        const result = await api.agentAction(agentID, null, callOptions);
+        store.apply({
+          type: "agents/conversation",
+          agentID,
+          conversation: decodeConversation(result),
+        });
+        // Opening a conversation clears any stale briefing from a prior agent.
+        store.apply({ type: "agents/briefing", briefing: null });
+      });
+    },
+
+    async chooseAction(agentID, action) {
+      await runAgentAction(async () => {
+        const result = await api.agentAction(agentID, action.actionID, callOptions);
+        const decoded = decodeConversation(result);
+        store.apply({
+          type: "agents/conversation",
+          agentID,
+          conversation: decoded,
+        });
+        // Accepting a courier stages the mission: pull its briefing + journal
+        // entry. Completing it pays out: clear the briefing and pull the Step-12
+        // reward reads (wallet / LP / standings) alongside the journal.
+        // Declining clears the briefing; the journal always refreshes so the
+        // offered/accepted/cleared state stays truthful.
+        //
+        // ⚠ PRESSING COMPLETE IS NOT COMPLETING. agentMgr.DoAction answers 200
+        // with a conversation on EVERY branch, refusals included. Measured live
+        // (R35, agent 3008416, Complete pressed docked at the PICKUP station):
+        // HTTP 200, ok:true, an EMPTY available-actions list, and
+        // lastActionInfo.missionCompleted === null — not false. The mission was
+        // still accepted afterwards and not one ISK had moved. So the outcome is
+        // read from lastActionInfo, the one field that only
+        // buildCompletedConversation sets, and `=== true` is deliberate: null
+        // and false are both "it did not complete".
+        //
+        // Nor can the journal stand in for this: completeMission DELETES the
+        // journal row, and quit / decline / expire delete it identically, so a
+        // missing row proves nothing. Only this flag does.
+        const completed = decoded.lastActionInfo.missionCompleted === true;
+        if (action.buttonType === AGENT_BUTTON.ACCEPT || action.buttonType === AGENT_BUTTON.ACCEPT_REMOTELY) {
+          await loadBriefing(agentID);
+        } else if (
+          action.buttonType === AGENT_BUTTON.COMPLETE ||
+          action.buttonType === AGENT_BUTTON.COMPLETE_REMOTELY
+        ) {
+          // Only a mission that actually completed may clear its briefing and
+          // pull the payout reads. A refused Complete leaves the mission exactly
+          // as it was, and the panel must keep showing it that way.
+          if (completed) {
+            store.apply({ type: "agents/briefing", briefing: null });
+            await loadRewards();
+          }
+        } else if (action.buttonType === AGENT_BUTTON.DECLINE) {
+          store.apply({ type: "agents/briefing", briefing: null });
+        }
+        await loadJournal();
+      });
+    },
+
+    loadBriefing,
+
+    loadJournal,
+
+    loadRewards,
+
+    loadWallet,
+
+    loadStandings,
+
+    loadStandingDetail,
+
+    closeStandingDetail,
+
+    loadCharacterSheet,
+
+    async loadPackageIntoShip(cargoTypeID, cargoQuantity) {
+      await runAgentAction(async () => {
+        // Find the accepted courier's package in the station hangar and move it
+        // into the active ship's cargo hold.
+        //
+        // ⚠ THE FIRST STACK OF THE RIGHT TYPE IS NOT THE PACKAGE. Courier cargo
+        // is ordinary tradeable goods — the R35 live run hauled Reports (3814),
+        // which any player may already be holding. Picking the first row whose
+        // typeID matched would load the player's OWN stack, in the wrong
+        // quantity, and leave the actual mission package behind.
+        //
+        // The mission quantity is the discriminator we actually have: accept
+        // stages exactly the mission's quantity as its own stack. So prefer the
+        // stack of that exact size, and otherwise take one large enough and
+        // split precisely the mission quantity off it. (The server never names
+        // the package's itemID anywhere the client can read — not in the
+        // objective, not in the journal, not in the OnMissionsUpdated refusal —
+        // so a player stack of the identical type AND quantity stays genuinely
+        // ambiguous. Nothing available to the browser can resolve that.)
+        const wanted = Number.isFinite(cargoQuantity) && cargoQuantity > 0 ? cargoQuantity : 1;
+        const panel = await api.loadInventory(callOptions);
+        const candidates = decodeInventoryRows(panel.hangar.list).filter(
+          (row) => row.typeID === cargoTypeID,
+        );
+        const item =
+          candidates.find((row) => row.quantity === wanted) ??
+          candidates.find((row) => row.quantity > wanted);
+        if (!item) {
+          // runAgentAction's success path clears the action-error, so signal the
+          // miss by throwing — its catch surfaces the reason through the store.
+          throw new Error(
+            `The mission package is not in the station hangar (${wanted} needed).`,
+          );
+        }
+
+        // ⚠ AND A 200 IS NOT A LOADED PACKAGE. /api/bridge/inventory/move
+        // answers {ok:true} without ever re-reading, so it cannot tell a move
+        // from a silent decline — and invbroker declines silently in several
+        // branches. /transfer does the re-read and judges by the SOURCE giving
+        // something up (the R29 new-itemID lesson: a split keeps the source id
+        // and shrinks it, so destination membership alone reports a completed
+        // move as a failure). Ask it, then believe what it answers.
+        const outcome = await api.transferItems(
+          [item.itemID],
+          { kind: "hangar" },
+          { kind: "cargo" },
+          wanted,
+          callOptions,
+        );
+        if (!outcome.applied) {
+          throw new Error(
+            outcome.declinedSilently
+              ? "The station refused to load the mission package and gave no reason. It did not move."
+              : "The mission package did not move into the ship.",
+          );
+        }
+      });
+    },
+
+    async setAutopilotToDropoff(dropoffStationID) {
+      // Reuse the R5b route solver + browser autopilot: startRoute resolves the
+      // dropoff station -> its solar system and runs the decide-loop.
+      await startRoute(dropoffStationID);
+    },
+
+    loadFlightStatus,
+
+    async undock() {
+      await runFlightStep("Undock", () => api.undock(callOptions));
+    },
+
+    async warpTo(destinationID, minRange = null) {
+      await runFlightStep("Warp", () => api.warpTo(destinationID, minRange, callOptions));
+    },
+
+    async approach(destinationID, range = null) {
+      await runFlightStep("Approach", () => api.approach(destinationID, range, callOptions));
+    },
+
+    async keepAtRange(targetID, range = null) {
+      await runFlightStep("Keep at range", () => api.keepAtRange(targetID, range, callOptions));
+    },
+
+    async orbit(targetID, range = null) {
+      await runFlightStep("Orbit", () => api.orbit(targetID, range, callOptions));
+    },
+
+    async alignTo(targetID) {
+      await runFlightStep("Align", () => api.alignTo(targetID, callOptions));
+    },
+
+    async stopShip() {
+      // Retail's Stop cancels the client-side navigation BEFORE the command and
+      // switches the autopilot off after it. Ours is the same order: abort the
+      // browser decide-loop first so it cannot issue another move into the stop,
+      // then tell the server to cut the engines.
+      autopilot?.abort();
+      await runFlightStep("Stop", () => api.stopShip(callOptions));
+    },
+
+    loadSpaceSnapshot,
+    loadTargets,
+    lockTarget,
+    unlockTarget,
+    activateModule,
+    deactivateModule,
+    setModuleOverload,
+    repairModule,
+    setWeaponBanks,
+    loadMiningHolds,
+    loadDrones,
+    launchDrones,
+    engageDrones,
+    mineWithDrones,
+    recallDrones,
+    reconnectDrones,
+    scoopDrones,
+    runGmCommand,
+    runSurveyScan,
+    loadReprocessingQuote,
+    unloadMiningHolds,
+    reprocessItems,
+    loadSkills,
+    loadPlanets,
+    selectColony,
+    saveSkillQueue,
+    applyFreeSkillPoints,
+
+    startSpacePolling,
+
+    stopSpacePolling,
+
+    async jump(fromGateID, toGateID) {
+      await runFlightStep("Jump", () => api.jump(fromGateID, toGateID, callOptions));
+    },
+
+    // R30 slice A. A pure read over the cached graph — it issues no game call
+    // and starts nothing, so a panel may ask for it on every system change.
+    async nearbyGates(systemID) {
+      if (!(systemID > 0)) {
+        return [];
+      }
+      return buildGateLinks(await loadRouteGraph(), systemID);
+    },
+
+    async dock(stationID) {
+      await runFlightStep("Dock", () => api.dock(stationID, callOptions));
+      // Docking lands a beat later than the command returns; keep reading until
+      // the store sees "docked" so the UI switches back to the station shell.
+      await settleUntilDocked();
+    },
+    dockAt,
+
+    findAgents,
+
+    setDestinationToAgent,
+
+    startRoute,
+
+    searchDestinations,
+
+    startMiningBot,
+
+    pauseMiningBot() {
+      miningBot?.pause();
+    },
+
+    resumeMiningBot() {
+      if (miningBot) {
+        miningBot.resume();
+        void miningBot.run();
+      }
+    },
+
+    stopMiningBot() {
+      stopMiningController();
+    },
+
+    startMissionBot,
+
+    pauseMissionBot() {
+      missionBot?.pause();
+    },
+
+    resumeMissionBot() {
+      if (missionBot) {
+        missionBot.resume();
+        void missionBot.run();
+      }
+    },
+
+    stopMissionBot() {
+      stopMissionController();
+    },
+
+    startCustomBot,
+
+    pauseCustomBot() {
+      scriptRunner?.pause();
+    },
+
+    resumeCustomBot() {
+      if (scriptRunner) {
+        scriptRunner.resume();
+        void scriptRunner.run();
+      }
+    },
+
+    stopCustomBot() {
+      stopCustomController();
+    },
+
+    panicRecallAndDock,
+
+    async listSavedFittings() {
+      return decodeFittings(await api.loadSavedFittings(callOptions));
+    },
+
+    async listBookmarks() {
+      const active = decodeActiveBookmarks(await api.loadActiveBookmarks(callOptions));
+      return active.bookmarks
+        .filter((bm) => bm.memo.length > 0)
+        .map((bm) => ({ bookmarkID: bm.bookmarkID, name: bm.memo }));
+    },
+
+    pauseRoute() {
+      autopilot?.pause();
+    },
+
+    resumeRoute() {
+      if (autopilot) {
+        autopilot.resume();
+        void autopilot.run();
+      }
+    },
+
+    abortRoute() {
+      autopilot?.abort();
+    },
+
+    loadChat,
+
+    sendChatMessage,
+
+    setChatChannel(channel) {
+      store.apply({ type: "chat/active", channel });
+    },
+
+    requestNames,
+
+    /**
+     * R92 multibox — is this the pilot the player is LOOKING at?
+     *
+     * ⚠ A BACKGROUND PILOT IS STILL WORKING, AND THAT IS THE POINT OF MULTIBOX.
+     * Its flow outlives the panel: switch away from a mining pilot and its bot
+     * loop keeps ticking every two seconds, which is exactly what was asked for.
+     * But the browser's ~6 connections per origin do not multiply with the
+     * roster, so a four-pilot tab has four loops drawing on one budget, and the
+     * requests that lose are whichever happen to arrive last — usually the click
+     * that was just made, because that is the one a person is waiting on.
+     *
+     * So a background pilot's calls drop to "poll": they still run, they still
+     * retry, they simply yield to the pilot on screen. Explicitly separate from
+     * `setLivePush` even though App.svelte drives both from the same condition —
+     * one is about holding an EventSource, the other about who wins a lane, and
+     * a later change to either should not silently move the other.
+     */
+    setForeground(active) {
+      callOptions.priority = foregroundCallPriority(active);
+    },
+
+    setQuiesced(next) {
+      if (next === quiesced) {
+        return;
+      }
+      quiesced = next;
+      if (next) {
+        // Pause only bots that were actively ticking — do not un-pause a
+        // player-paused bot when quiesce ends.
+        if (store.bot.get().status === "running") {
+          quiescePausedMining = true;
+          miningBot?.pause();
+        }
+        if (store.missionBot.get().status === "running") {
+          quiescePausedMission = true;
+          missionBot?.pause();
+        }
+        if (store.customBot.get().status === "running") {
+          quiescePausedCustom = true;
+          scriptRunner?.pause();
+        }
+        // Free the EventSource socket for the sibling login/select; App.svelte
+        // also drives setLivePush(false) during add/restore.
+        stopLiveStream();
+        return;
+      }
+      if (quiescePausedMining) {
+        quiescePausedMining = false;
+        if (miningBot) {
+          miningBot.resume();
+          void miningBot.run();
+        }
+      }
+      if (quiescePausedMission) {
+        quiescePausedMission = false;
+        if (missionBot) {
+          missionBot.resume();
+          void missionBot.run();
+        }
+      }
+      if (quiescePausedCustom) {
+        quiescePausedCustom = false;
+        if (scriptRunner) {
+          scriptRunner.resume();
+          void scriptRunner.run();
+        }
+      }
+      if (livePushEnabled && store.station.get().online !== null) {
+        startLiveStream();
+      }
+      resumeSpacePolling();
+    },
+
+    setLivePush(enabled) {
+      if (enabled === livePushEnabled) {
+        return;
+      }
+      livePushEnabled = enabled;
+      if (!enabled) {
+        stopLiveStream();
+        return;
+      }
+      // Becoming the active pilot with a character online: attach now. The
+      // server replays from its cursor when it can; the flow's own
+      // snapshot/resync handling covers the gap when it cannot.
+      if (store.station.get().online !== null) {
+        startLiveStream();
+      }
+    },
+
+    async releaseSession() {
+      // R10: stop consuming the push channel first — the session it belongs to
+      // is about to end.
+      stopLiveStream();
+      try {
+        await api.releaseSession(callOptions);
+      } finally {
+        syncedStationID = null;
+        stopLiveStream();
+        store.apply({ type: "character/offline" });
+        store.apply({ type: "character/selected", characterID: null });
+      }
+    },
+
+    async logout() {
+      stopLiveStream();
+      try {
+        await api.logout(callOptions);
+      } finally {
+        // R107 — this flow is fully signed out, so drop its per-session token
+        // (in single-session mode `token` is not a key here and api.logout
+        // cleared the global instead). releaseSession keeps the token: it only
+        // takes the character offline, the web login stays.
+        if (options.perSessionToken) {
+          callOptions.token = null;
+        }
+        syncedStationID = null;
+        store.apply({ type: "session/logged-out" });
+      }
+    },
+  };
+}

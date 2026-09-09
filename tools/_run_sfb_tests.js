@@ -1,0 +1,1 @@
+﻿const {spawnSync}=require('child_process'); const r=spawnSync(process.execPath,['--test','web/src/nav/standingFleetBoss.test.ts','web/src/nav/standingFleetBoss.macro.test.ts','web/src/bots/macroCatalogView.test.ts'],{cwd:process.cwd(),encoding:'utf8',shell:false}); process.stdout.write(r.stdout||''); process.stderr.write(r.stderr||''); process.exit(r.status??1);

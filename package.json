@@ -1,0 +1,37 @@
+{
+  "name": "evejs-web-companion-fork",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Parallel fork of evejs-web-poc / EveJS web companion for custom macros and UI experiments.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node --env-file-if-exists=.env src/server.js",
+    "dev": "node --watch --env-file-if-exists=.env src/server.js",
+    "dev:web": "vite",
+    "build:web": "tsc -p tsconfig.json && vite build",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "node --test",
+    "webpass": "node scripts/set-web-password.js",
+    "cache-icons": "node scripts/cache-icons.js",
+    "check": "node scripts/check.js",
+    "doctor": "node --env-file-if-exists=.env scripts/doctor.js"
+  },
+  "dependencies": {
+    "@fontsource/barlow-condensed": "^5.3.0",
+    "better-sqlite3": "^12.4.1",
+    "express": "^5.1.0",
+    "ws": "^8.21.1"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^7.2.0",
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/node": "^26.1.1",
+    "svelte": "^5.56.6",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^7.0.2",
+    "vite": "^8.1.5"
+  }
+}

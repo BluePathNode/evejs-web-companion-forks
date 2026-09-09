@@ -1,0 +1,549 @@
+// C3 — the palette's view of the macros: the plain name, a one-line "what it
+// does", a one-line "what it needs", and which picker each parameter uses. Pure
+// UI metadata — the Svelte palette and inspector read it, and a test proves every
+// macro has an entry and that none of this copy carries an id or engineering word
+// (R7d / R9a).
+//
+// The parameters are DERIVED from the shared `macroSpecs.ts`, so the palette can
+// never offer a control for an argument the codec/validator don't know about.
+
+import { MACRO_IDS, type Arg, type MacroID } from "./botScript.ts";
+import { MACRO_SPECS, type MacroArgSpec } from "./macroSpecs.ts";
+import { macroName } from "./scriptText.ts";
+
+/** Which inspector widget fills a parameter — one per Arg kind (kept in step). */
+export type ParamPicker = Arg["kind"];
+
+// ─── Categories ──────────────────────────────────────────────────────────────
+//
+// The play LOOP a block belongs to — a mining bot's author filters to Mining, a
+// ratter to Combat. One primary category per block (a search box catches the
+// cross-overs). The palette shows a chip per category that actually HAS a block,
+// so a category with no shipped block yet (Market, Fleet) simply does not appear
+// until its blocks land.
+
+export type BlockCategory =
+  | "movement"
+  | "combat"
+  | "mining"
+  | "hauling"
+  | "industry"
+  | "market"
+  | "missions"
+  | "ship"
+  | "planets"
+  | "exploration"
+  | "fleet"
+  | "social"
+  | "flow";
+
+/** The chip label for each category (R9a — play language, never a slug). */
+export const CATEGORY_LABEL: Readonly<Record<BlockCategory, string>> = {
+  movement: "Movement",
+  combat: "Combat",
+  mining: "Mining",
+  hauling: "Cargo & Hauling",
+  industry: "Industry",
+  market: "Market",
+  missions: "Missions",
+  ship: "Ship & Fitting",
+  planets: "Planets",
+  exploration: "Exploration",
+  fleet: "Fleet",
+  social: "Chat & Social",
+  flow: "Flow & Timing",
+};
+
+/** The order categories read in the filter — the loops a player thinks in. */
+export const CATEGORY_ORDER: readonly BlockCategory[] = [
+  "movement",
+  "mining",
+  "combat",
+  "hauling",
+  "market",
+  "missions",
+  "industry",
+  "ship",
+  "planets",
+  "exploration",
+  "fleet",
+  "social",
+  "flow",
+];
+
+export interface MacroParamView {
+  readonly key: string;
+  readonly label: string;
+  readonly picker: ParamPicker;
+  readonly required: boolean;
+}
+
+export interface MacroCatalogEntry {
+  readonly id: MacroID;
+  readonly name: string;
+  /** The play loop this block belongs to — drives the palette's category filter. */
+  readonly category: BlockCategory;
+  /** What it does, one line. */
+  readonly does: string;
+  /** What it needs before it can start, one line — or null when it needs nothing. */
+  readonly needs: string | null;
+  readonly params: readonly MacroParamView[];
+  /** Whether an `until` is required (mine-at-belt) — the inspector makes it mandatory. */
+  readonly untilRequired: boolean;
+}
+
+const PARAM_LABEL: Readonly<Record<string, string>> = {
+  belt: "Belt",
+  station: "Station",
+  equipment: "Equipment",
+  agent: "Agent",
+  level: "Agent level",
+  maxJumps: "Longest trip (jumps)",
+  corporation: "Corporation",
+  seconds: "Seconds",
+  fitting: "Saved fitting",
+  item: "Item",
+  from: "From",
+  to: "To",
+  amount: "How many",
+  bookmark: "Saved spot",
+  quantity: "How many",
+  price: "Price each (ISK)",
+  who: "Pilot",
+  only: "Only this pilot",
+  range: "Scanner reach (AU)",
+  channel: "Channel",
+  message: "Message",
+  destination: "Destination",
+  pick: "Which rock first",
+  focus: "Which asteroids",
+  name: "Asteroid name",
+  advertName: "Fleet advert name",
+  advertDescription: "Fleet advert description",
+  acceptBy: "Accept applicants by",
+  minStandings: "Minimum standings (greater than)",
+  greaterThan: "Asteroid count greater than",
+  mode: "Next belt",
+};
+
+function paramView(arg: MacroArgSpec): MacroParamView {
+  return {
+    key: arg.key,
+    label: PARAM_LABEL[arg.key] ?? arg.key,
+    picker: arg.kind,
+    required: arg.required,
+  };
+}
+
+function entry(id: MacroID, category: BlockCategory, does: string, needs: string | null): MacroCatalogEntry {
+  const spec = MACRO_SPECS[id];
+  return {
+    id,
+    name: macroName(id),
+    category,
+    does,
+    needs,
+    params: spec.args.map(paramView),
+    untilRequired: spec.untilRequired,
+  };
+}
+
+/** Exhaustive by the Record type — a new macro cannot compile without an entry. */
+const ENTRIES: Readonly<Record<MacroID, MacroCatalogEntry>> = {
+  undock: entry("undock", "movement", "Undocks your ship.", null),
+  "travel-to-station": entry(
+    "travel-to-station",
+    "movement",
+    "Flies to a station, through gates if it needs to, and docks.",
+    "A station to go to",
+  ),
+  "travel-to-belt": entry(
+    "travel-to-belt",
+    "movement",
+    "Warps to a belt — a pinned one, or whichever is nearest — and stops once you are there. No mining, no locking: just the trip, for a hauler heading to pick up a jetcan a mining loop dropped on a belt it never sat down on itself.",
+    "Being in space, in the belt's system",
+  ),
+  "mine-at-belt": entry(
+    "mine-at-belt",
+    "mining",
+    "Warps to a belt, locks rocks, and runs your mining equipment — moving on when a belt runs dry.",
+    "A belt and mining equipment fitted",
+  ),
+  "deliver-ore": entry(
+    "deliver-ore",
+    "hauling",
+    "Flies to a station and unloads the ore into your hangar.",
+    "A station to unload at",
+  ),
+  "defend-with-drones": entry(
+    "defend-with-drones",
+    "combat",
+    "Launches your combat drones, targets the pirates, and sets them attacking.",
+    "Combat drones in the bay",
+  ),
+  // ── The distribution-mission set. Wire them in order (usually inside a Repeat
+  // loop): find an agent → ask for work → accept → load → deliver → turn in →
+  // fly back. Later blocks use the agent and mission the earlier ones found.
+  "find-distribution-agent": entry(
+    "find-distribution-agent",
+    "missions",
+    "Searches for a delivery (distribution) agent by level, distance and corporation, and remembers the best match for the blocks after it.",
+    null,
+  ),
+  "request-mission": entry(
+    "request-mission",
+    "missions",
+    "Flies to the agent's station, docks, and asks for a mission.",
+    "An agent — picked here, or found by the block before",
+  ),
+  "accept-mission": entry(
+    "accept-mission",
+    "missions",
+    "Checks the offer (trip length, whether the cargo fits your ship) and accepts it — or turns it down and asks again.",
+    null,
+  ),
+  "load-mission-cargo": entry(
+    "load-mission-cargo",
+    "missions",
+    "Moves the mission cargo from the pickup hangar into your ship, and checks it is really aboard.",
+    "An accepted mission",
+  ),
+  "travel-to-dropoff": entry(
+    "travel-to-dropoff",
+    "missions",
+    "Sets the destination to the mission's drop-off station and flies there, gate to gate, and docks.",
+    "An accepted mission with cargo aboard",
+  ),
+  "turn-in-mission": entry(
+    "turn-in-mission",
+    "missions",
+    "Unloads the cargo at the drop-off and tells the agent the job is done.",
+    "Being docked at the drop-off station",
+  ),
+  "return-to-agent": entry(
+    "return-to-agent",
+    "missions",
+    "Flies back to the agent's station and docks, ready to ask for the next mission.",
+    "An agent found or picked earlier in the run",
+  ),
+  wait: entry(
+    "wait",
+    "flow",
+    "Does nothing for a set number of seconds — a breather between blocks. Give it a \"stop when\" to wait for something instead (like shields recovering).",
+    null,
+  ),
+  "unload-cargo": entry(
+    "unload-cargo",
+    "hauling",
+    "Moves everything in your ship's cargo hold into the station hangar, and checks the hold really is empty. Handy before accepting a delivery, so the cargo is sure to fit.",
+    "Being docked",
+  ),
+  "salvage-wrecks": entry(
+    "salvage-wrecks",
+    "hauling",
+    "Works through the wrecks around you: salvage drones sweep on their own, and fitted salvagers are run on each wreck in turn. Finishes when nothing salvageable is left, drones home.",
+    "Salvage drones in the bay, or salvagers fitted",
+  ),
+  "loot-wrecks": entry(
+    "loot-wrecks",
+    "hauling",
+    "Flies to each of YOUR OWN wrecks in turn and takes what's inside. It never touches anyone else's wreck, so it can never get you flagged as a thief.",
+    "Wrecks of yours on the grid",
+  ),
+  "loot-containers": entry(
+    "loot-containers",
+    "hauling",
+    "Flies to each container on the grid in turn — jetcans included — and takes what's inside. Handy for a hauler working a belt behind miners jettisoning ore.",
+    "Containers on the grid",
+  ),
+  "refine-ore": entry(
+    "refine-ore",
+    "industry",
+    "Runs every ore stack in the station hangar through the refinery. The station takes its cut in tax; anything it cannot be sure is ore is left alone.",
+    "Being docked, with ore in the hangar",
+  ),
+  "hardeners-on": entry(
+    "hardeners-on",
+    "combat",
+    "Switches every fitted hardener and damage control on — one block at the top of a fight or a mining trip. Finishes once they are all running.",
+    "Hardeners or a damage control fitted",
+  ),
+  "fight-the-rats": entry(
+    "fight-the-rats",
+    "combat",
+    "Locks the nearest pirate, runs your guns on it and sets the drones on it too, then moves to the next. Finishes when the grid is clear and the drones are back aboard.",
+    "Guns fitted, or combat drones in the bay",
+  ),
+  "warp-to-anomaly": entry(
+    "warp-to-anomaly",
+    "combat",
+    "Reads your ship's scanner and warps to the next pirate den it shows, skipping the ones this run has already visited. Pair it with Fight the rats in a repeat loop.",
+    "Being in space, with a den on the scanner",
+  ),
+  "refit-ship": entry(
+    "refit-ship",
+    "ship",
+    "Boards the right hull from your hangar if you are flying something else, then applies the saved fitting you picked — modules pulled from this station's hangar.",
+    "Being docked, the saved fitting, and its modules in the hangar",
+  ),
+  "move-items": entry(
+    "move-items",
+    "hauling",
+    "Moves an item you pick between the station hangar and your ship's holds — a set amount, or every last one — and checks the move really landed.",
+    "Being docked, with the item where you said it is",
+  ),
+  "warp-to-bookmark": entry(
+    "warp-to-bookmark",
+    "movement",
+    "Warps to one of your saved spots — a mission site, a safe spot, a mining perch. Finishes when the warp lands.",
+    "Being in space, in the saved spot's system",
+  ),
+  "find-combat-agent": entry(
+    "find-combat-agent",
+    "missions",
+    "Searches for a combat (security) agent by level, distance and corporation, and remembers the best match for the blocks after it.",
+    null,
+  ),
+  "fly-to-mission-site": entry(
+    "fly-to-mission-site",
+    "missions",
+    "Warps to the site of the mission you accepted — the spot the agent marked for you. Finishes when the warp lands. Put Fight the rats right after it.",
+    "An accepted mission, in the mission's system",
+  ),
+  "restart-extractors": entry(
+    "restart-extractors",
+    "planets",
+    "Checks every planet colony you own and restarts each extractor whose program has run out, on the same resource it was already pulling. Works from anywhere.",
+    "A planet colony with extractors",
+  ),
+  "deliver-ready-jobs": entry(
+    "deliver-ready-jobs",
+    "industry",
+    "Collects every finished industry job - one delivery per tick - and checks the job list to confirm each one really landed. Works from anywhere; delivery only ever gives.",
+    "A finished industry job ready to deliver",
+  ),
+  "repair-ship": entry(
+    "repair-ship",
+    "ship",
+    "Asks the station's repair shop what is damaged on your ship and its fitted modules, fixes it, and checks the shop agrees there is nothing left to fix. The station charges your wallet.",
+    "Being docked, with money for the shop",
+  ),
+  "buy-item": entry(
+    "buy-item",
+    "market",
+    "Places a buy order at this station's market for the item you pick, at your price per unit or less. Spends ISK and pays the broker fee — the server asks before it goes through.",
+    "Being docked, with money in your wallet",
+  ),
+  "sell-item": entry(
+    "sell-item",
+    "market",
+    "Lists every stack of the item you pick from your hangar onto this station's market, at your price per unit or more. Pays the broker fee on each — the server asks before it goes through.",
+    "Being docked, with the item in your hangar",
+  ),
+  "remote-rep": entry(
+    "remote-rep",
+    "fleet",
+    "Finds the most hurt friendly ship on your grid, locks it, and runs your remote shield or armor repairers on it — moving to the next when one recovers. Finishes once everyone on grid is at full health.",
+    "Being in space, with a remote repairer fitted",
+  ),
+  "orbit-and-boost": entry(
+    "orbit-and-boost",
+    "fleet",
+    "Orbits the nearest friendly ship up close and keeps your remote repairers running on whoever is hurt — the stay-with-the-fleet logistics loop. Keeps going for as long as it is left on; a watch or your own hand stops it.",
+    "Being in space, with a remote repairer fitted",
+  ),
+  "create-fleet": entry(
+    "create-fleet",
+    "fleet",
+    "Forms a new fleet with you as the boss, so you can invite your other pilots into it. Does nothing if you are already in a fleet. The server asks before it goes through.",
+    null,
+  ),
+  "invite-to-fleet": entry(
+    "invite-to-fleet",
+    "fleet",
+    "Invites one of your known pilots into the fleet you are in — the other half of forming up your own characters. You have to be in a fleet already (form one first). The server asks before it goes through.",
+    "Being in a fleet, and a pilot to invite",
+  ),
+  "join-fleet": entry(
+    "join-fleet",
+    "fleet",
+    "Waits for a fleet invitation and accepts it, so your other pilots can pull this one into their fleet. Finishes once you are in a fleet. The server asks before it goes through.",
+    null,
+  ),
+  "join-fleet-from-advert": entry(
+    "join-fleet-from-advert",
+    "fleet",
+    "Lists fleet-finder adverts visible to you, picks one by optional name filter (or the first if you leave the name blank), and applies to join it. Finishes once you are in a fleet. Distinct from Join a fleet, which only waits for an invite. The server asks before it goes through.",
+    "A fleet advert visible to this character (boss must be advertising)",
+  ),
+  "standing-fleet-boss": entry(
+    "standing-fleet-boss",
+    "fleet",
+    "Forms a fleet if needed, posts a fleet-finder advert with your name and description, and keeps auto-accepting applicants by corporation, alliance, or standings greater than your threshold. Keeps going while the step is left on; a watch or your own hand stops it.",
+    "An advert name, a description, and who to accept",
+  ),
+  "attack-player": entry(
+    "attack-player",
+    "combat",
+    "Camps the spot you parked it at and attacks any player ship that shows up — or one pilot alone, if you pick one. Locks them, holds them still with a warp disruptor or scrambler if you have one fitted, webs them, then sets the drones on them and runs the guns. Keeps watching for as long as it is left on; a watch or your own hand stops it.",
+    "Being in space, with guns fitted or combat drones in the bay",
+  ),
+  "hunt-player": entry(
+    "hunt-player",
+    "combat",
+    "Roams from system to system looking for a player, staying within your jump limit of where it started. Watches local chat for company, sweeps the directional scanner, warps down the hits, and attacks the ship it finds — holding it in place first if you have a warp disruptor or scrambler fitted.",
+    "Being in space, with guns fitted or combat drones in the bay",
+  ),
+  "send-chat": entry(
+    "send-chat",
+    "social",
+    "Says a line you wrote in local or corp chat, once, then moves on. Put it inside an If to announce something only when a check holds — like calling for help when shields drop.",
+    "A message to send",
+  ),
+  "set-destination": entry(
+    "set-destination",
+    "movement",
+    "Sets your destination — a station, or a whole solar system — and starts the autopilot flying there, gate by gate. Finishes as soon as the trip is under way rather than waiting for the arrival, so you can follow it with your own checks. Use Fly to a station and dock instead when you just want to arrive and dock.",
+    "Somewhere to go",
+  ),
+  "dock-at-nearest": entry(
+    "dock-at-nearest",
+    "movement",
+    "Finds the closest station in view and docks there — the get-inside-now block. Works out which one is nearest when it runs, so it is right wherever the ship happens to be.",
+    "Being in space with a station in view",
+  ),
+  "remote-cap": entry(
+    "remote-cap",
+    "fleet",
+    "Finds the fleet-mate on your grid with the emptiest capacitor, locks them, and runs your remote capacitor transmitters into them — the other half of keeping a fleet alive. Finishes when everyone on grid has a healthy capacitor.",
+    "Being in space, with a remote capacitor transmitter fitted",
+  ),
+  "jettison-cargo": entry(
+    "jettison-cargo",
+    "hauling",
+    "Dumps your cargo hold into space as a floating container — the jetcan a miner fills instead of flying home. Pick one item to dump just that, or leave it and the whole hold goes. Anything you jettison is out in the open where another pilot could take it.",
+    "Being in space with something in the cargo hold",
+  ),
+  "jettison-ore": entry(
+    "jettison-ore",
+    "mining",
+    "Dumps your ore hold into space as a floating container — the jetcan a mining loop fills for a hauler to pick up, without ever touching your cargo hold. Pick one item to dump just that, or leave it and the whole hold goes.",
+    "Being in space with something in the ore hold",
+  ),
+  "tidy-hangar": entry(
+    "tidy-hangar",
+    "hauling",
+    "Stacks everything loose in the station hangar into neat piles, so a long run does not leave you with fifty little heaps of the same thing.",
+    "Being docked",
+  ),
+  "compress-ore": entry(
+    "compress-ore",
+    "mining",
+    "Squeezes the ore in your hold down to a fraction of the room it took, using a mining support ship on your grid — your own, or a fleet-mate's, running its industrial core and compression gear. Flies into range first if it has to, then works through your hold one stack at a time. A hold that fits one trip's ore fits a whole session's once it is compressed.",
+    "Being in space, with ore aboard and a support ship on grid running its compression gear",
+  ),
+  "deploy-mtu-and-loot": entry(
+    "deploy-mtu-and-loot",
+    "mining",
+    "For a parked industrial support ship — Orca, Porpoise, or Rorqual. Deploys a Mobile Tractor Unit from cargo if one is not already on grid, then empties that unit and any jetcans already inside loot range. Stays put: it will not approach distant cans.",
+    "Being stationary in space in an industrial support ship, with a Mobile Tractor Unit in cargo or already on grid",
+  ),
+  "wait-while-asteroids-above": entry(
+    "wait-while-asteroids-above",
+    "mining",
+    "Warps to the nearest asteroid belt, then waits while the number of mineable asteroids on grid stays greater than a threshold you set. Done when the count drops to that threshold or below (including an empty belt). Leave the threshold unset to wait while any rocks remain.",
+    "Being in space in a system with belts",
+  ),
+  "empty-belt-cleanup-next": entry(
+    "empty-belt-cleanup-next",
+    "mining",
+    "When the belt is empty (no mineable asteroids): scoops Mobile Tractor Units if the client can, recalls drones, then warps to another belt — nearest or random. While rocks remain, it waits for the belt to empty.",
+    "Being in space at a belt",
+  ),
+  "tractor-loot-jetcans": entry(
+    "tractor-loot-jetcans",
+    "mining",
+    "Activates fitted tractor beams on jetcans, pulls them in, and loots ore into the ore hold (other loot into cargo). Distinct from Deploy a Mobile Tractor Unit and loot — this uses fitted tractor beams on cans, not an MTU.",
+    "Being in space with fitted tractor beams and jetcans on grid",
+  ),
+  "empty-belt-home-tether-wait": entry(
+    "empty-belt-home-tether-wait",
+    "mining",
+    "When the belt is empty (no mineable asteroids): recalls drones, flies to your bot home / starting structure, undocks so a citadel tether can engage, then holds idle. Pair after mining; leave this step running while you wait for the boss to call the fleet.",
+    "A configured bot home or starting structure, and being in space at a belt",
+  ),
+  "fleet-warp-to-me": entry(
+    "fleet-warp-to-me",
+    "fleet",
+    "After you are on grid (compose after wait-while-asteroids-above, or set the asteroid threshold here): sends a fleet location broadcast at your ship so fleet-mates can warp to you. EveJS cannot force a fleet warp yet — this is a broadcast ping, not a forced fleet warp.",
+    "Being in a fleet, in space",
+  ),
+  "fleet-warp-to-broadcast": entry(
+    "fleet-warp-to-broadcast",
+    "fleet",
+    "Miner pair for Broadcast fleet warp to me: waits for the last fleet location broadcast this companion saw from your fleet (InPosition ping), warps to that ship/item, and finishes on arrival. EveJS has no GetBroadcast / WarpToMember — the fork remembers the boss SendBroadcast so miners can warp via CmdWarpToStuff.",
+    "Being in a fleet, in space; a recent boss fleet-warp-to-me broadcast on this companion",
+  ),
+  "command-bursts-on": entry(
+    "command-bursts-on",
+    "fleet",
+    "Switches on every fitted Command Burst module — Shield, Armor, Information, Skirmish, and Mining Foreman bursts. Finishes once they are all running.",
+    "Command Burst modules fitted; being in space",
+  ),
+  "command-bursts-off": entry(
+    "command-bursts-off",
+    "fleet",
+    "Switches off every fitted Command Burst module. Finishes once none are still running.",
+    "Command Burst modules fitted; being in space",
+  ),
+  "industrial-core-on": entry(
+    "industrial-core-on",
+    "mining",
+    "Activates the fitted industrial core (Medium / Large / Capital — Porpoise, Orca, or Rorqual). Does not touch dread Siege or Triage modules.",
+    "An Industrial Core fitted; being in space",
+  ),
+  "industrial-core-off": entry(
+    "industrial-core-off",
+    "mining",
+    "Deactivates the industrial core, then waits until it leaves the ship active-module list (the siege/offline cycle). There is no separate seconds-remaining timer in EveJS beyond that.",
+    "An Industrial Core fitted; being in space",
+  ),
+  "launch-scan-probes": entry(
+    "launch-scan-probes",
+    "exploration",
+    "Launches the probes EveJS reports as loaded and safe for your current ship, stopping when probes are active.",
+    "Being in space, with an online probe launcher loaded",
+  ),
+  "analyze-signatures": entry(
+    "analyze-signatures",
+    "exploration",
+    "Runs one signature analysis using the exact current probe positions and ranges reported by EveJS.",
+    "Active scan probes in a formation",
+  ),
+  "recover-scan-probes": entry(
+    "recover-scan-probes",
+    "exploration",
+    "Recovers every active probe belonging to this session back to the ship.",
+    "Active scan probes in space",
+  )
+};
+
+export const MACRO_CATALOG: Readonly<Record<MacroID, MacroCatalogEntry>> = ENTRIES;
+
+/** The palette list, in menu order. */
+export const MACRO_CATALOG_LIST: readonly MacroCatalogEntry[] = MACRO_IDS.map((id) => ENTRIES[id]);
+
+export function macroEntry(id: MacroID): MacroCatalogEntry {
+  return ENTRIES[id];
+}
+
+/**
+ * The categories that actually have at least one block, in CATEGORY_ORDER — the
+ * chips the palette filter shows. A category with no shipped block yet (Market,
+ * Fleet before their blocks land) is simply absent, so the filter never offers
+ * an empty bucket.
+ */
+export function categoriesInUse(): readonly BlockCategory[] {
+  const present = new Set(MACRO_CATALOG_LIST.map((e) => e.category));
+  return CATEGORY_ORDER.filter((c) => present.has(c));
+}

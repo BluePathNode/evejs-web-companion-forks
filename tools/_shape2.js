@@ -1,0 +1,10 @@
+const fs = require("fs");
+const cs = fs.readFileSync("web/src/store/clientStore.ts","utf8");
+const idx = cs.indexOf('case "station/relocated"');
+console.log(cs.slice(idx, idx+600));
+const idx2 = cs.indexOf('case "flight/status"');
+console.log("---flight---");
+console.log(cs.slice(idx2, idx2+500));
+const idx3 = cs.indexOf('case "flight/location"');
+console.log("---location---");
+console.log(cs.slice(idx3, idx3+400));

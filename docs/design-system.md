@@ -1,0 +1,274 @@
+# The EVE design system
+
+The client's one visual language. It lives in **`web/src/styles.css`** (Tailwind
+v4, CSS-first) and nowhere else. Panels are written in bare semantic elements
+plus the component classes below — a panel gets the whole look by being ordinary
+HTML, which is why restyles stay low-churn and behavior-preserving.
+
+**There is no second styling approach.** Do not add a per-panel `<style>` block
+for anything another panel could want; add it here instead.
+
+## The look
+
+EVE-style dark industrial: near-black backgrounds with a blue cast, cool
+desaturated blue-grey text, one restrained accent, condensed uppercase
+letter-spaced headers, tight scannable data rows, and tabular numerals
+everywhere a number can line up under another number.
+
+## Tokens
+
+All tokens are Tailwind `@theme` variables, so they are usable both as CSS
+custom properties (`var(--color-shield)`) and as Tailwind utilities
+(`text-shield`).
+
+### Surfaces — four depths, darkest first
+
+| Token | Value | Use |
+| --- | --- | --- |
+| `--color-bg` | `#05080d` | the page |
+| `--color-panel` | `#0d131c` | a panel frame |
+| `--color-panel-2` | `#16273a` | a raised control (buttons) |
+| `--color-panel-3` | `#0a1017` | an inset well (meter tracks, zebra rows, reflow cards) |
+| `--color-field` | `#070b11` | an input well — darker than the panel so a field reads as a hole, not a bump |
+
+### Lines
+
+`--color-line` (frames), `--color-line-strong` (control borders, header rules),
+`--color-row-line` (row separators).
+
+Fork polish keeps the same roles but softens the hex values slightly and often mixes
+them with transparency at the frame edge.
+
+### Elevation and spacing (fork polish)
+
+| Token | Role |
+| --- | --- |
+| `--shadow-panel` | Soft lift on panels / dock / workspace header |
+| `--shadow-raised` | Stronger raised surface when needed |
+| `--space-1` ... `--space-4` | Shared rhythm for gaps, panel padding, dividers |
+
+Corners stay **square** (`--radius-frame` / `--radius-control` = `0`, R53).
+
+### Text
+
+| Token | Value | Use |
+| --- | --- | --- |
+| `--color-text` | `#c8d4e2` | body copy |
+| `--color-text-bright` | `#e6f0fa` | emphasis, values you read off |
+| `--color-cell` | `#a9bccd` | table data |
+| `--color-muted` | `#8fa3b8` | labels, secondary copy |
+
+### Accent and state
+
+`--color-accent` `#7fb4d9`, `--color-accent-bright` `#a9d3f0`,
+`--color-accent-dim` `#3d6f96`, with `--color-on-accent` `#06131f` as the ink on
+a filled accent. State: `--color-good` `#6cc79a`, `--color-warn` `#d9a441`,
+`--color-danger` `#e08a8a` (ink `--color-on-danger`).
+
+### Ship resources — the shield / armor / hull triad
+
+First-class palette members, not one-offs. EVE players read these three colours
+as fast as they read the numbers, and the fitting window (R21) leans on them
+heavily.
+
+| Token | Value |
+| --- | --- |
+| `--color-shield` | `#4a9fd8` |
+| `--color-armor` | `#c8a24a` |
+| `--color-hull` | `#c46a5a` |
+| `--color-capacitor` | `#5ab98c` |
+| `--color-cpu` | `#7fb4d9` |
+| `--color-powergrid` | `#b58ad0` |
+| `--color-calibration` | `#9aa8bb` |
+
+## Components
+
+### Chrome
+
+- **`section` / `.panel`** — the panel frame. Thin cool border, lifted surface,
+  a hairline accent along the top edge that fades to the right.
+- **`.panel-head`** — title left, actions right, divided from the body; bleeds
+  to the panel edges. Put an `<h1>`/`<h2>` and a `.controls` row in it.
+- **`section > h2`** — gets a small accent tick so the eye finds each block.
+- **`.divider`** — an `<hr>` between blocks inside one panel.
+- **`section.bulk`** — the bulk-action bar; accent-tinted so it stands apart
+  from the tables it acts on.
+
+### Typography
+
+`h1` / `h2` / `h3` are condensed, uppercase, letter-spaced (`0.14em` / `0.12em` /
+`0.08em`). Body copy stays comfortable and mixed case — the theme is not
+allowed to cost readability.
+
+**Tabular numerals** are on `table.guests`, `.num`, `dl.kv dd`, `.hud-value`,
+`ol.route`, `button.character .detail`, and all form fields. Any new numeric
+readout must set `font-variant-numeric: tabular-nums`.
+
+### Data tables
+
+`table.guests` is the data table. Two shapes use it:
+
+- **record tables** (a `thead` + many columns) — these also take `.reflow`,
+  sit inside `<div class="table-wrap overflow-x-auto">`, and carry a
+  `data-label` on **every** `<td>`;
+- **key/value tables** (a `<th>` row-label + a `<td>` value, no `thead`) —
+  already narrow, unchanged at every width.
+
+Density: tight rows, uppercase column headers on a stronger rule, zebra
+striping and a hover highlight above 640px.
+
+**`.num`** marks a numeric column — right-aligned, tabular, no wrap, bright
+ink. Put it on the `<th>` **and** every `<td>` of that column. Applies to ISK,
+quantities, distances, jumps, efficiencies and percentages.
+
+**`.empty`** is the one "there is nothing here" treatment: calm, inset, centred,
+dashed border — visibly different from `.error`, because an empty result is a
+fact and not a fault.
+
+### Controls
+
+| Class | Role |
+| --- | --- |
+| *(bare `<button>`)* | secondary — the default |
+| `.primary` | the one action the panel most expects you to take |
+| `.minor` | tertiary / ghost |
+| `.danger` | the armed half of a two-step destroy |
+| `.active` | selected (tabs, chat sub-tabs, agent chips) |
+
+`nav.tabs` is the tab strip. `.controls` and `.agent-filter` are the labelled
+control rows; `.row-actions` is the in-row action group.
+
+All targets are **≥40px (2.5rem)** tall — checked at every width.
+
+### Meters
+
+`.hud` > `.hud-gauge.<resource>` > (`.hud-head` > `.hud-label` + `.hud-value`) +
+(`.hud-track` > `.hud-fill`). Add the resource class (`shield`, `armor`, `hull`,
+`capacitor`, `cpu`, `powergrid`, `calibration`) to colour the fill and the
+label. The track carries `role="meter"` plus `aria-valuenow/min/max`.
+
+Every gauge renders its label **and** its value as text next to the bar, so the
+bar is a fast visual summary and never the only way to read the state.
+
+### Item icons (R27)
+
+One component — `web/src/ui/TypeIcon.svelte` — is the **only** thing in the app
+allowed to render an image. A test enforces that (`typeIcon.test.ts`), because
+before R27 the fitting window had its own pair of `<img>` tags and its own
+missing-icon bookkeeping, and that is exactly what must not grow back.
+
+```svelte
+<span class="cell-item">
+  <TypeIcon typeID={row.typeID} name={typeName(row.typeID)} />
+  {typeName(row.typeID)}
+</span>
+```
+
+| prop | meaning |
+| --- | --- |
+| `typeID` | the item's type. `null`, `0`, a negative or a non-integer all go straight to the tile — **no `src` is emitted at all**, so there is never a broken image. |
+| `name` | the item's **already-resolved name**. It is the `alt`, the tile's `aria-label`, and where the tile's letters come from. |
+| `size` | `sm` (1.5rem, table rows) · `md` (2rem) · `lg` (4.5rem, the fitting hull) · `socket` (tracks the fitting socket across the R8 breakpoint). |
+| `fallbackText` | overrides the tile's letters. Only the fitting window passes it, because a socket is the one caller with no name rendered beside it, so its tile has to *be* the label. |
+
+**The fallback is the common case, not the error case.** `data/` is gitignored,
+so a fresh clone and CI have **no icon cache at all** and every icon renders as
+a tile. Design for the tile first; treat the picture as the bonus.
+
+- **`.type-icon`** — the fixed box, and the **only** element carrying a size.
+  The picture and the tile fill it identically, so a row measures the same
+  before, during and after an image loads (R8: no jitter, no reflow reshuffle).
+  Never put a width or height on the `<img>` or the tile.
+- **`.type-icon-tile`** — the fallback plate: inset, dimmed, one or two
+  initials derived from the name (`iconInitials`). An unresolved name (`—`)
+  becomes `?`, never an empty square.
+- **`.cell-item`** — an icon and its name inside **one existing table cell**.
+  Deliberately not a new column: an extra `<td>` would need its own
+  `data-label` and would add a row to every reflow card, so the R8 contract
+  stays untouched.
+
+**Local only.** Icons are `/icon-cache/types/64/icon/<typeID>.png`, served by
+the BFF with `fallthrough: false` above the SPA catch-all — so a type we never
+cached returns a real **404** and `onerror` fires, rather than quietly getting
+`index.html` with a 200. `staticData.getRemoteTypeIconUrl` (images.evetech.net)
+exists but is **not wired to the browser** and must not be: the client makes no
+external requests, so it works offline and leaks nothing about what the player
+is flying.
+
+**R7d.** The typeID in the `src` path is fine — an asset path is not data shown
+to the player (the R21 precedent, and `visibleText()` in the invariant sweeps
+strips `<img>` tags entirely). Everything *rendered or spoken* is the name.
+
+### The fitting window (R21)
+
+The radial fit layout. **The stylesheet owns the look; it never owns the
+layout maths** — socket positions are computed in
+`web/src/ui/fittingGeometry.ts` from the slot counts the server reports and
+arrive as inline `left`/`top` percentages.
+
+- **`.fit-ring-wrap`** > **`.fit-ring`** — a square that is `width: 100%`
+  between `min-width: 26rem` and `max-width: 34rem`. The floor is load-bearing:
+  below about 26rem an eight-socket arc cannot hold 40px touch targets without
+  overlapping them, so the ring stops shrinking and the **wrapper** scrolls
+  (the `.table-wrap` trick), which is why the page still never scrolls sideways
+  at 360px. `.fit-ring-guide` is the dashed guide circle — decoration, and
+  `aria-hidden`.
+- **`.fit-hull`** — the ship at the centre: icon, name, class.
+- **`.fit-socket`** — one slot. Always a `<button>`, always ≥40px (2.5rem at or
+  below the breakpoint, 3.25rem above it). Modifiers: `.empty` (dashed and
+  hollow), `.offline` (dimmed, warn rim), `.armed` (a pending destroy), and
+  `.family-high` / `-mid` / `-low` / `-rig` / `-subsystem` for the rim tint.
+- **`.fit-legend`** — the family key. It repeats each arc's name **and** its
+  filled/total counts as text, so the rim colours are reinforcement and never
+  the only signal.
+- **`.fit-detail`** — the selected socket's name, state and actions, shown
+  beneath the ring so the ring never hosts a popover.
+- **`.fit-views`** — the ship/list view toggle.
+- **`.layer-shield` / `.layer-armor` / `.layer-hull`** — the triad as a text
+  colour on the defence grid's layer names.
+
+**If you change `.fit-socket`'s size or `.fit-ring`'s min/max width, re-run
+`web/src/ui/fittingGeometry.test.ts`.** It measures real pixel spacing at both
+ends of the responsive range and is the only thing standing between a tweak and
+sockets silently stacking on top of one another.
+
+#### `.stat-unavailable` — the honesty rule
+
+A statistic the client could not source renders the **word** "Unavailable"
+(muted, italic) with the reason in its `title`, never `0` and never an empty
+cell. A blank in a stat panel reads as zero, and a wrong zero in a fitting
+window is worse than an absent number. `bridge/shipStats.ts` enforces this at
+the type level: a `Stat` is either `{known: true, value}` or
+`{known: false, why}`, so a caller cannot accidentally render a missing value
+as a number.
+
+### Badges
+
+`.badge` plus an optional `.good` / `.warn` / `.bad` / `.accent`. A badge always
+carries its own text, so colour is reinforcement.
+
+## Invariants this system must not break
+
+- **R7d** — zero visible numeric IDs. Names resolve through `store/names.ts`;
+  an unresolved name renders `—`, never the raw ID. An icon's `src` path is the
+  one exemption (R21/R27): asset paths are not data shown to the player.
+- **R27** — `TypeIcon.svelte` is the only component that renders an image, the
+  size lives on `.type-icon` and nowhere else, and every panel must still look
+  right with `data/icon-cache` absent entirely.
+- **R8** — no horizontal page scroll at 360px; record tables keep `.reflow` +
+  `data-label` and still become labelled cards at ≤640px; targets stay ≥40px.
+- **R9a** — plain player language, no developer jargon in the UI.
+- **`web/src/ui/panelFirstMount.test.ts`** — all 16 panels must still render on
+  first mount.
+
+## Accessibility
+
+Body text aims for **WCAG AA (≥4.5:1)**. Every palette colour was measured
+against `--color-bg`, `--color-panel` and `--color-panel-3`: the floor is
+`--color-hull` at **4.93:1** on `--color-panel`; every other pairing is ≥5:1 and
+most are AAA. Filled controls were measured ink-on-fill (`.primary` 8.42:1,
+`.danger` 7.67:1).
+
+**Nothing critical is conveyed by colour alone.** `.error` carries a leading
+marker, `tr.unread` uses weight, `tr.self` uses weight and brightness, badges
+carry text, and every gauge prints its value.

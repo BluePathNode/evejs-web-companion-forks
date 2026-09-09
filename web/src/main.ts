@@ -1,0 +1,26 @@
+// R2 entry: the first real page on the new stack (view-lib spike: Svelte 5).
+// login form -> character selection -> docked station panel, all state in the
+// framework-agnostic client-state store, all fetch/decode logic in
+// app/flow.ts, the Svelte components pure readers. Replaces the R1b scaffold
+// smoke page per its own note.
+
+// Styling (goal R8): the Tailwind CSS v4 design-system entry. Importing it here
+// makes Vite (via @tailwindcss/vite) compile Tailwind and emit the CSS bundle
+// into public/dist/, and the built index.html links it automatically.
+import "./styles.css";
+import { mount } from "svelte";
+import App from "./ui/App.svelte";
+import { installErrorOverlay } from "./app/errorOverlay.ts";
+
+// Before anything else: a framework-free net for uncaught errors and unhandled
+// rejections, so a throw that wedges the UI still shows a message instead of a
+// silent freeze.
+installErrorOverlay();
+
+// R107 — App owns the pilot roster now: it creates one isolated session per
+// pilot (store + per-session-token flow) and warms each one's health ping
+// itself (app/sessions.ts). There is no single app-wide store/flow any more.
+const target = document.getElementById("app");
+if (target) {
+  mount(App, { target });
+}

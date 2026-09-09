@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>EveJS Web</title>
+    <!--
+      The full design system lives in web/src/styles.css (Tailwind v4),
+      imported from main.ts and emitted into public/dist/ by the build. Only a
+      minimal anti-flash background/color is inlined here so there is no
+      unstyled white flash before the CSS bundle loads.
+    -->
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      body {
+        margin: 0;
+        background: #05080d;
+        color: #c8d4e2;
+        font-family: "Segoe UI", system-ui, sans-serif;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
