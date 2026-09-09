@@ -1,4 +1,4 @@
-﻿import test from "node:test";
+import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
@@ -139,7 +139,31 @@ test("join-fleet-from-advert waits after apply until in fleet", () => {
     {},
   );
   assert.equal(tick.outcome.kind, "acting");
-  assert.equal(tick.action.kind, "wait");
+  // Between retries the miner accepts an invite in case auto-join was ignored.
+  assert.equal(tick.action.kind, "acceptFleetInvite");
+});
+
+test("join-fleet-from-advert re-applies without auto-accept after the first try", () => {
+  const decide = SCRIPT_MACROS["join-fleet-from-advert"];
+  const tick = decide(
+    {
+      id: "s1",
+      kind: "macro",
+      macro: "join-fleet-from-advert",
+      args: { advertName: { kind: "text", text: "Mining" } },
+    },
+    {
+      inFleet: false,
+      availableFleetAds: sampleAds,
+    } as unknown as ScriptObservation,
+    { appliedFleetID: 101, waited: 7 },
+    {},
+  );
+  assert.equal(tick.action.kind, "applyToJoinFleet");
+  if (tick.action.kind === "applyToJoinFleet") {
+    assert.equal(tick.action.fleetID, 101);
+    assert.equal(tick.action.autoAccept, false);
+  }
 });
 
 test("join-fleet-from-advert blocks when no matching advert is visible", () => {
