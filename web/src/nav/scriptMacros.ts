@@ -2453,6 +2453,8 @@ const joinFleet: MacroDecider = (_step, obs, mem) => {
 // ApplyToJoinFleet, then wait until inFleet (or timeout / clear blocked reason).
 // Distinct from join-fleet (invite-wait). Bounded like join-fleet.
 const JOIN_ADVERT_MAX_WAIT_TICKS = JOIN_MAX_WAIT_TICKS;
+/** Re-send ApplyToJoinFleet this often. One shot is not proof the miner joined. */
+const JOIN_ADVERT_RETRY_TICKS = 8;
 const joinFleetFromAdvert: MacroDecider = (step, obs, mem) => {
   const nameArg = step.args["advertName"];
   const advertName =
@@ -2493,34 +2495,39 @@ const joinFleetFromAdvert: MacroDecider = (step, obs, mem) => {
       reason:
         match.joinNeedsApproval
           ? "You applied, but were not accepted into the fleet in time."
-          : "Applying to the fleet advert did not get you in in time.",
+          : "Applying to the fleet advert did not get you in in time. EveJS may have ignored auto-join — run Standing Fleet Boss on the advert owner so a retry can be invited.",
     });
   }
 
   const alreadyApplied = num(mem, "appliedFleetID") === fleetID;
-  if (alreadyApplied) {
-    const waitMsg = match.joinNeedsApproval
-      ? `Waiting for approval to join "${match.fleetName}".`
-      : `Waiting to join "${match.fleetName}".`;
-    return tick(WAIT, waitMsg, label, ACTING, false, { ...mem, waited });
+  const retryApply = !alreadyApplied || waited % JOIN_ADVERT_RETRY_TICKS === 0;
+  if (retryApply) {
+    // First try uses the advert's auto-accept flag. Later tries force a
+    // request (autoAccept false) so Standing Fleet Boss can see and invite.
+    const autoAccept = alreadyApplied ? false : autoAcceptForAdvert(match);
+    const why = alreadyApplied
+      ? `Re-applying to "${match.fleetName}" so a join request can reach the boss.`
+      : `Applying to join "${match.fleetName}".`;
+    return tick(
+      { kind: "applyToJoinFleet", fleetID, autoAccept },
+      why,
+      label,
+      ACTING,
+      false,
+      { ...mem, appliedFleetID: fleetID, waited },
+    );
   }
 
-  const tries = (num(mem, "tries") ?? 0) + 1;
-  if (tries > MAX_BLOCK_ATTEMPTS) {
-    return tick(WAIT, "Could not apply to the fleet advert.", label, {
-      kind: "blocked",
-      reason: "Applying to the fleet advert failed after several tries, so the bot stopped.",
-    });
-  }
-
-  const autoAccept = autoAcceptForAdvert(match);
+  const waitMsg = match.joinNeedsApproval || alreadyApplied
+    ? `Waiting to join "${match.fleetName}" — listening for an invite if auto-join did not take.`
+    : `Waiting to join "${match.fleetName}".`;
   return tick(
-    { kind: "applyToJoinFleet", fleetID, autoAccept },
-    `Applying to join "${match.fleetName}".`,
+    { kind: "acceptFleetInvite" },
+    waitMsg,
     label,
     ACTING,
     false,
-    { ...mem, tries, appliedFleetID: fleetID, waited },
+    { ...mem, waited },
   );
 };
 
