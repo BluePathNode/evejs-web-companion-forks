@@ -19,10 +19,20 @@
 
   const online = $derived($station.online);
   const isDocked = $derived(deriveDocked($flight.status, $station.online));
-  // A SHORT, uniform state word on the chip so every tab is about the same size:
-  // a docked station name (e.g. "Jita IV - Moon 4 - Caldari Navy Assembly Plant")
-  // blew the widths right out. The full location is kept for the hover title.
-  const stateLabel = $derived(isDocked ? "Docked" : "In space");
+  // Short state word plus system when known. The full station name stays on the
+  // hover title so chip widths stay uniform.
+  const systemName = $derived(
+    $station.station?.solarSystemName ?? $flight.solarSystemName ?? null,
+  );
+  const stateLabel = $derived(
+    isDocked
+      ? systemName
+        ? `Docked · ${systemName}`
+        : "Docked"
+      : systemName
+        ? `Space · ${systemName}`
+        : "In space",
+  );
   const where = $derived(
     $station.station?.stationName ??
       $station.station?.solarSystemName ??
