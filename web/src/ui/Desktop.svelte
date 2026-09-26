@@ -97,10 +97,14 @@
     <!-- Only worth saying when the surface really is empty. In space it is a
          view of the grid, and covering that with a tip about windows would hide
          the most useful thing on screen to explain the least useful. -->
-    <p class="desktop-empty">
-      Open a panel from the left — it opens here as a window. They stay side by side, so you never
-      lose sight of what you were doing.
-    </p>
+    <div class="desktop-empty">
+      <p class="desktop-empty-kicker">Station deck</p>
+      <p class="desktop-empty-title">Open a panel from the rail</p>
+      <p>
+        Inventory, market, fitting, mail — each opens here as a window. Keep several up. The
+        station services dock stays on the right.
+      </p>
+    </div>
   {/if}
   {#each shown as win (win.id)}
     <DesktopWindow
