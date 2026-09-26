@@ -8,6 +8,7 @@
 // makes Vite (via @tailwindcss/vite) compile Tailwind and emit the CSS bundle
 // into public/dist/, and the built index.html links it automatically.
 import "./styles.css";
+import "./styles.overhaul.css";
 import { mount } from "svelte";
 import App from "./ui/App.svelte";
 import { installErrorOverlay } from "./app/errorOverlay.ts";
