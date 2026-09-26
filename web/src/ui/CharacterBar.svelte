@@ -25,7 +25,10 @@
 </script>
 
 <div class="char-bar">
-  <span class="char-bar-brand">EVEJS</span>
+  <span class="char-bar-brand">
+    <span class="char-bar-mark">EVEJS</span>
+    <span class="char-bar-product">Companion</span>
+  </span>
   <div class="char-bar-list">
     {#each sessions as session (session.id)}
       <CharacterChip
